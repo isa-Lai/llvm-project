@@ -218,6 +218,14 @@ LLVM_ABI FunctionPass *createInstSimplifyLegacyPass();
 // and scatter intrinsics with scalar code when target doesn't support them.
 //
 LLVM_ABI FunctionPass *createScalarizeMaskedMemIntrinLegacyPass();
+
+//===----------------------------------------------------------------------===//
+//
+// InterStellarAnalysis - Identify memory access patterns in loops for
+// hardware-accelerated prefetching.
+//
+LLVM_ABI FunctionPass *createInterStellarAnalysisPass();
+
 } // End llvm namespace
 
 #endif
