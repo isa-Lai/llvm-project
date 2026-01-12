@@ -105,6 +105,7 @@ private:
   void analyzeLoop(Loop *L);
   void analyzeMemoryAccess(Instruction *I, Loop *L);
   bool tryAnalyzeDirectStream(Value *Ptr, Instruction *MemInst, Loop *L);
+  Value *traceIndexThroughLoads(Value *Index, Loop *L);
   unsigned getOrCreateLoopID(Loop *L);
   unsigned getOrCreateLinkID(Value *V, unsigned SizeInBytes);
   bool isValueDynamic(const SCEV *S);
@@ -140,44 +141,157 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
   // Create loop descriptor
   unsigned LoopID = getOrCreateLoopID(L);
   
-  // Get loop bounds if possible
-  // For now, we focus on simple canonical loops
-  if (PHINode *IndVar = L->getCanonicalInductionVariable()) {
-    LoopDescriptor LD;
-    LD.LoopID = LoopID;
-    LD.L = L;
+  // Strategy: Try multiple approaches to extract loop bounds
+  // 1. Use getBounds() if available (works for well-formed loops)
+  // 2. Fall back to getInductionVariable() + manual SCEV analysis
+  
+  LoopDescriptor LD;  // All fields auto-initialized to defaults
+  LD.LoopID = LoopID;
+  LD.L = L;
+  
+  // Get parent loop ID if it exists
+  Loop *ParentLoop = L->getParentLoop();
+  if (ParentLoop) {
+    LD.ParentLoopID = getOrCreateLoopID(ParentLoop);
+  }
+  
+  bool FoundBounds = false;
+  
+  // Try getBounds() first
+  std::optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
+  
+  if (Bounds) {
+    LLVM_DEBUG(dbgs() << "  Using getBounds() API\n");
     
-    // Get parent loop ID if it exists
-    Loop *ParentLoop = L->getParentLoop();
-    if (ParentLoop) {
-      LD.ParentLoopID = getOrCreateLoopID(ParentLoop);
+    // Extract start value (initial IV value)
+    Value &InitialIV = Bounds->getInitialIVValue();
+    LD.StartValue = SE.getSCEV(&InitialIV);
+    
+    // Extract final value (upper/lower bound)
+    Value &FinalIV = Bounds->getFinalIVValue();
+    LD.EndValue = SE.getSCEV(&FinalIV);
+    
+    // Extract step value
+    if (Value *StepVal = Bounds->getStepValue()) {
+      LD.StepValue = SE.getSCEV(StepVal);
     }
     
-    // Try to extract loop bounds using SCEV
-    const SCEV *BackedgeTakenCount = SE.getBackedgeTakenCount(L);
-    if (!isa<SCEVCouldNotCompute>(BackedgeTakenCount)) {
-      // We have trip count information
-      LD.StartValue = SE.getConstant(IndVar->getType(), 0);
-      LD.EndValue = BackedgeTakenCount;
-      
-      // Check if end value is dynamic
-      if (isValueDynamic(BackedgeTakenCount)) {
-        LD.IsEndLinked = true;
-        LD.EndValueDynamic = extractDynamicValue(BackedgeTakenCount);
-        if (LD.EndValueDynamic) {
-          getOrCreateLinkID(LD.EndValueDynamic, 
-                           getTypeSizeInBytes(LD.EndValueDynamic->getType()));
+    FoundBounds = true;
+  } else {
+    // Fallback: Try getInductionVariable() + analyze PHI directly
+    LLVM_DEBUG(dbgs() << "  getBounds() failed, trying getInductionVariable()\n");
+    
+    PHINode *IndVar = L->getInductionVariable(SE);
+    
+    // If getInductionVariable() fails, try to find any PHI in the header that looks like an IV
+    if (!IndVar) {
+      LLVM_DEBUG(dbgs() << "  getInductionVariable() returned null, scanning header PHIs\n");
+      BasicBlock *Header = L->getHeader();
+      for (PHINode &Phi : Header->phis()) {
+        const SCEV *PhiSCEV = SE.getSCEV(&Phi);
+        if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PhiSCEV)) {
+          if (AR->getLoop() == L && AR->isAffine()) {
+            IndVar = &Phi;
+            LLVM_DEBUG(dbgs() << "  Found affine PHI: " << Phi << "\n");
+            break;
+          }
         }
       }
-      
-      // Get step value
-      const SCEV *IndVarSCEV = SE.getSCEV(IndVar);
-      if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndVarSCEV)) {
-        LD.StepValue = AR->getStepRecurrence(SE);
-      }
-      
-      LoopDescriptors.push_back(LD);
     }
+    
+    if (IndVar) {
+      LLVM_DEBUG(dbgs() << "  Found induction variable: " << *IndVar << "\n");
+      
+      // Get the SCEV for the induction variable
+      const SCEV *IndVarSCEV = SE.getSCEV(IndVar);
+      
+      if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndVarSCEV)) {
+        if (AR->isAffine()) {
+          // Start value is the first operand of the AddRec
+          LD.StartValue = AR->getStart();
+          
+          // Step value
+          LD.StepValue = AR->getStepRecurrence(SE);
+          
+          // For end value, we need to analyze the exit condition
+          // Get backedge-taken count
+          const SCEV *BTC = SE.getBackedgeTakenCount(L);
+          if (!isa<SCEVCouldNotCompute>(BTC)) {
+            // End = Start + BTC * Step (for the last iteration)
+            // But we actually want the upper bound from the comparison
+            // Let's try to get it from the loop exit condition
+            
+            BasicBlock *Latch = L->getLoopLatch();
+            if (Latch) {
+              BranchInst *BI = dyn_cast<BranchInst>(Latch->getTerminator());
+              if (BI && BI->isConditional()) {
+                if (ICmpInst *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+                  // Check which operand is the induction variable
+                  Value *Op0 = Cmp->getOperand(0);
+                  Value *Op1 = Cmp->getOperand(1);
+                  
+                  const SCEV *Op0SCEV = SE.getSCEV(Op0);
+                  const SCEV *Op1SCEV = SE.getSCEV(Op1);
+                  
+                  // Find the non-IV operand - that's likely the bound
+                  if (Op0SCEV == IndVarSCEV) {
+                    LD.EndValue = Op1SCEV;
+                  } else if (Op1SCEV == IndVarSCEV) {
+                    LD.EndValue = Op0SCEV;
+                  }
+                }
+              }
+            }
+            
+            // If we still don't have end value, compute it from backedge-taken count
+            if (!LD.EndValue) {
+              // For "for (i=start; i<end; i++)", BTC = end - start
+              // So end = start + BTC
+              LD.EndValue = SE.getAddExpr(LD.StartValue, BTC);
+            }
+            
+            FoundBounds = true;
+          }
+        }
+      }
+    }
+  }
+  
+  if (FoundBounds) {
+    LLVM_DEBUG({
+      dbgs() << "  Loop Bounds Analysis:\n";
+      dbgs() << "    Start: " << *LD.StartValue << "\n";
+      dbgs() << "    End: " << *LD.EndValue << "\n";
+      if (LD.StepValue) {
+        dbgs() << "    Step: " << *LD.StepValue << "\n";
+      }
+      dbgs() << "    Is Start Dynamic: " << isValueDynamic(LD.StartValue) << "\n";
+      dbgs() << "    Is End Dynamic: " << isValueDynamic(LD.EndValue) << "\n";
+    });
+    
+    // Check if start value is dynamic (e.g., function parameter, outer loop variable)
+    if (isValueDynamic(LD.StartValue)) {
+      LD.IsStartLinked = true;
+      LD.StartValueDynamic = extractDynamicValue(LD.StartValue);
+      if (LD.StartValueDynamic) {
+        getOrCreateLinkID(LD.StartValueDynamic, 
+                         getTypeSizeInBytes(LD.StartValueDynamic->getType()));
+      }
+    }
+    
+    // Check if end value is dynamic
+    if (isValueDynamic(LD.EndValue)) {
+      LD.IsEndLinked = true;
+      LD.EndValueDynamic = extractDynamicValue(LD.EndValue);
+      if (LD.EndValueDynamic) {
+        getOrCreateLinkID(LD.EndValueDynamic, 
+                         getTypeSizeInBytes(LD.EndValueDynamic->getType()));
+      }
+    }
+    
+    LoopDescriptors.push_back(LD);
+  } else {
+    LLVM_DEBUG(dbgs() << "  Could not extract loop bounds\n");
   }
   
   // Analyze memory accesses in the loop
@@ -209,58 +323,163 @@ void InterStellarStreamAnalyzer::analyzeMemoryAccess(Instruction *I, Loop *L) {
 bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
                                                          Instruction *MemInst,
                                                          Loop *L) {
-  // Get the SCEV for the pointer
-  const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+  // Strategy: Handle both optimized and unoptimized IR
+  // 1. Check if Ptr is a GEP instruction - this is the array indexing
+  // 2. If so, analyze the index operand
+  // 3. Trace the index through loads to find the actual induction variable
+  // 4. Get SCEV of the induction variable to check for AddRec pattern
   
-  // Check if it's an AddRecExpr (affine recurrence)
-  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
+  GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+  if (!GEP) {
+    // Ptr might be the result of a GEP that's already computed
+    // Try to get SCEV directly (optimized code path)
+    const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+    const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
+    
+    if (!AR) {
+      LLVM_DEBUG(dbgs() << "  Not a GEP and not an AddRec: " << *Ptr << "\n");
+      return false;
+    }
+    
+    // Direct AddRec case (optimized code)
+    if (AR->getLoop() != L || !AR->isAffine()) {
+      return false;
+    }
+    
+    const SCEV *Base = AR->getStart();
+    const SCEV *Step = AR->getStepRecurrence(SE);
+    const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(Step);
+    
+    if (!StepConst) {
+      return false;
+    }
+    
+    int64_t Stride = StepConst->getAPInt().getSExtValue();
+    
+    // Create direct stream descriptor
+    DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
+    DS.StreamID = NextStreamID++;
+    DS.LoopID = getOrCreateLoopID(L);
+    DS.BaseAddress = Base;
+    DS.Stride = Stride;
+    DS.IsBaseLinked = isValueDynamic(Base);
+    DS.MemInst = MemInst;
+    
+    if (DS.IsBaseLinked) {
+      if (Value *BaseVal = extractDynamicValue(Base)) {
+        Type *BaseTy = BaseVal->getType();
+        unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+        DS.LinkID = getOrCreateLinkID(BaseVal, Size);
+        ++NumDynamicBases;
+      }
+    }
+    
+    DirectStreams.push_back(DS);
+    InstToStreamIDMap[MemInst] = DS.StreamID;
+    ++NumDirectStreams;
+    
+    LLVM_DEBUG({
+      dbgs() << "  Found Direct Stream (optimized path):\n";
+      dbgs() << "    Stream ID: " << DS.StreamID << "\n";
+      dbgs() << "    Loop ID: " << DS.LoopID << "\n";
+      dbgs() << "    Base: " << *Base << "\n";
+      dbgs() << "    Stride: " << Stride << " bytes\n";
+    });
+    
+    return true;
+  }
+  
+  // GEP-based analysis (handles unoptimized IR)
+  // GEP format: getelementptr base_type, ptr base, indices...
+  // For array access A[i], we have: getelementptr i32, ptr %A, i64 %index
+  
+  // Get the base pointer
+  Value *BasePtr = GEP->getPointerOperand();
+  
+  // Get the last index (for simple 1D array access)
+  if (GEP->getNumIndices() == 0) {
+    return false;
+  }
+  
+  // For 1D arrays: GEP has 1 index
+  // For multi-dim or complex: GEP might have multiple indices
+  // We focus on the last index which represents the actual array subscript
+  Value *Index = nullptr;
+  for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
+    Index = IdxIt->get(); // Get the last index
+  }
+  
+  if (!Index) {
+    return false;
+  }
+  
+  // Trace through loads to find the actual induction variable
+  Value *IndVar = traceIndexThroughLoads(Index, L);
+  if (!IndVar) {
+    LLVM_DEBUG(dbgs() << "  Could not trace index to induction variable\n");
+    return false;
+  }
+  
+  // Now get the SCEV of the induction variable
+  const SCEV *IndVarSCEV = SE.getSCEV(IndVar);
+  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndVarSCEV);
   
   if (!AR) {
-    LLVM_DEBUG(dbgs() << "  Not an AddRec: " << *PtrSCEV << "\n");
+    LLVM_DEBUG(dbgs() << "  Index not an AddRec: " << *IndVarSCEV << "\n");
     return false;
   }
   
   // Check if it belongs to this loop
   if (AR->getLoop() != L) {
-    LLVM_DEBUG(dbgs() << "  AddRec for different loop\n");
+    LLVM_DEBUG(dbgs() << "  AddRec not for this loop\n");
     return false;
   }
   
-  // Check if it's affine (linear: base + stride * i)
+  // Check if it's affine (linear: start + stride * i)
   if (!AR->isAffine()) {
-    LLVM_DEBUG(dbgs() << "  Not affine (non-linear recurrence)\n");
+    LLVM_DEBUG(dbgs() << "  AddRec not affine\n");
     return false;
   }
   
-  // Extract base and stride
-  const SCEV *Base = AR->getStart();
-  const SCEV *Step = AR->getStepRecurrence(SE);
+  // Extract step for the index (start not used for stride calculation)
+  const SCEV *IndexStep = AR->getStepRecurrence(SE);
   
-  // Stride must be constant
-  const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(Step);
-  if (!StepConst) {
-    LLVM_DEBUG(dbgs() << "  Non-constant stride\n");
+  // Index step must be constant (e.g., i += 1)
+  const SCEVConstant *IndexStepConst = dyn_cast<SCEVConstant>(IndexStep);
+  if (!IndexStepConst) {
+    LLVM_DEBUG(dbgs() << "  Non-constant index step\n");
     return false;
   }
   
-  int64_t Stride = StepConst->getAPInt().getSExtValue();
+  // Calculate memory stride: index_step * element_size
+  Type *ElementType = GEP->getSourceElementType();
+  // For array types like [1000 x i32], get the actual element type
+  if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
+    ElementType = ArrTy->getElementType();
+  }
+  int64_t ElementSize = getTypeSizeInBytes(ElementType);
+  int64_t IndexStepVal = IndexStepConst->getAPInt().getSExtValue();
+  int64_t MemoryStride = IndexStepVal * ElementSize;
+  
+  // Get base address SCEV
+  const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
   
   // Create direct stream descriptor
-  DirectStreamDescriptor DS;
+  DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
   DS.StreamID = NextStreamID++;
   DS.LoopID = getOrCreateLoopID(L);
-  DS.BaseAddress = Base;
-  DS.Stride = Stride;
+  DS.BaseAddress = BaseSCEV;
+  DS.Stride = MemoryStride;
+  DS.IsBaseLinked = isValueDynamic(BaseSCEV);
   DS.MemInst = MemInst;
   
-  // Check if base is dynamic (runtime variable)
-  DS.IsBaseLinked = isValueDynamic(Base);
+  // Check if base is dynamic
   if (DS.IsBaseLinked) {
-    DS.BaseAddressValue = extractDynamicValue(Base);
+    DS.BaseAddressValue = extractDynamicValue(BaseSCEV);
     if (DS.BaseAddressValue) {
-      Type *PtrTy = Ptr->getType();
-      unsigned PtrSize = getTypeSizeInBytes(PtrTy);
-      getOrCreateLinkID(DS.BaseAddressValue, PtrSize);
+      Type *BaseTy = DS.BaseAddressValue->getType();
+      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+      DS.LinkID = getOrCreateLinkID(DS.BaseAddressValue, Size);
       ++NumDynamicBases;
     }
   }
@@ -270,18 +489,88 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   ++NumDirectStreams;
   
   LLVM_DEBUG({
-    dbgs() << "  Direct Stream found:\n";
+    dbgs() << "  Found Direct Stream (GEP path):\n";
     dbgs() << "    Stream ID: " << DS.StreamID << "\n";
     dbgs() << "    Loop ID: " << DS.LoopID << "\n";
-    dbgs() << "    Base: " << *Base << "\n";
-    dbgs() << "    Stride: " << Stride << "\n";
-    dbgs() << "    Base Linked: " << (DS.IsBaseLinked ? "Yes" : "No") << "\n";
-    if (DS.BaseAddressValue) {
-      dbgs() << "    Base Value: " << *DS.BaseAddressValue << "\n";
-    }
+    dbgs() << "    Base: " << *BaseSCEV << "\n";
+    dbgs() << "    Element Size: " << ElementSize << " bytes\n";
+    dbgs() << "    Index Step: " << IndexStepVal << "\n";
+    dbgs() << "    Memory Stride: " << MemoryStride << " bytes\n";
+    dbgs() << "    Base Linked: " << DS.IsBaseLinked << "\n";
   });
   
   return true;
+}
+
+Value *InterStellarStreamAnalyzer::traceIndexThroughLoads(Value *Index, Loop *L) {
+  // Trace through loads, casts, and sign extensions to find the underlying
+  // induction variable (PHI node)
+  // This handles unoptimized IR where loop variables are in stack slots
+  
+  Value *Current = Index;
+  SmallPtrSet<Value *, 8> Visited;
+  
+  while (Current && Visited.insert(Current).second) {
+    // If we found a PHI node in this loop, that's our induction variable
+    if (PHINode *PHI = dyn_cast<PHINode>(Current)) {
+      if (L->contains(PHI->getParent())) {
+        return PHI;
+      }
+    }
+    
+    // Trace through casts (sext, zext, trunc, bitcast)
+    if (CastInst *Cast = dyn_cast<CastInst>(Current)) {
+      Current = Cast->getOperand(0);
+      continue;
+    }
+    
+    // Trace through loads (for unoptimized code: load from alloca)
+    if (LoadInst *Load = dyn_cast<LoadInst>(Current)) {
+      Value *Ptr = Load->getPointerOperand();
+      
+      // Check if this load is loading from an alloca that's updated in the loop
+      // We need to find the store that updates it
+      if (AllocaInst *Alloca = dyn_cast<AllocaInst>(Ptr)) {
+        // Look for PHI-like pattern: load, increment, store
+        // Find all stores to this alloca in the loop
+        for (User *U : Alloca->users()) {
+          if (StoreInst *Store = dyn_cast<StoreInst>(U)) {
+            if (L->contains(Store->getParent())) {
+              Value *StoredVal = Store->getValueOperand();
+              // Check if the stored value is an increment (add)
+              if (BinaryOperator *BinOp = dyn_cast<BinaryOperator>(StoredVal)) {
+                if (BinOp->getOpcode() == Instruction::Add) {
+                  // Check if one operand is a load from the same alloca
+                  for (unsigned i = 0; i < BinOp->getNumOperands(); ++i) {
+                    if (LoadInst *OpLoad = dyn_cast<LoadInst>(BinOp->getOperand(i))) {
+                      if (OpLoad->getPointerOperand() == Alloca) {
+                        // This is an induction pattern: i = i + step
+                        // Create a pseudo-value representing this induction
+                        // For now, return the Load instruction itself
+                        // SCEV can analyze simple patterns even from loads
+                        return Load;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      
+      // If we can't find the pattern, try the loaded value
+      Current = Ptr;
+      continue;
+    }
+    
+    // Can't trace further
+    break;
+  }
+  
+  // If we couldn't find a PHI, return the original value
+  // Sometimes SCEV can still analyze it
+  return Index;
 }
 
 unsigned InterStellarStreamAnalyzer::getOrCreateLoopID(Loop *L) {
@@ -329,7 +618,12 @@ bool InterStellarStreamAnalyzer::isValueDynamic(const SCEV *S) {
   }
   
   // If it contains any SCEVUnknown, it's potentially dynamic
-  if (isa<SCEVUnknown>(S)) {
+  if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(S)) {
+    Value *V = Unknown->getValue();
+    // Global variables and constants are not dynamic
+    if (isa<GlobalVariable>(V) || isa<Constant>(V)) {
+      return false;
+    }
     return true;
   }
   
@@ -375,69 +669,114 @@ int64_t InterStellarStreamAnalyzer::getTypeSizeInBytes(Type *Ty) {
 }
 
 void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
-  OS << "InterStellar Stream Analysis Results:\n";
-  OS << "=====================================\n\n";
+  OS << "\n";
+  OS << "╔═══════════════════════════════════════════════════════════════╗\n";
+  OS << "║     InterStellar Stream Analysis Results                     ║\n";
+  OS << "╚═══════════════════════════════════════════════════════════════╝\n\n";
   
-  OS << "Statistics:\n";
-  OS << "  Loops analyzed: " << LoopDescriptors.size() << "\n";
-  OS << "  Direct streams: " << DirectStreams.size() << "\n";
-  OS << "  Link variables: " << LinkVariables.size() << "\n\n";
+  OS << " Statistics:\n";
+  OS << "   • Loops analyzed: " << LoopDescriptors.size() << "\n";
+  OS << "   • Direct streams: " << DirectStreams.size() << "\n";
+  OS << "   • Link variables: " << LinkVariables.size() << "\n\n";
   
   if (!LoopDescriptors.empty()) {
-    OS << "Loop Descriptors:\n";
-    OS << "-----------------\n";
+    OS << " Loop Descriptors (Hardware CSR Format):\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     for (const auto &LD : LoopDescriptors) {
-      OS << "Loop ID: " << LD.LoopID << "\n";
-      OS << "  Parent Loop ID: " << LD.ParentLoopID << "\n";
-      if (LD.StartValue) {
-        OS << "  Start: " << *LD.StartValue << "\n";
-      }
-      if (LD.EndValue) {
-        OS << "  End: " << *LD.EndValue;
-        if (LD.IsEndLinked) {
-          OS << " (Linked)";
-        }
-        OS << "\n";
-      }
-      if (LD.StepValue) {
-        OS << "  Step: " << *LD.StepValue << "\n";
+      OS << "Loop ID: " << LD.LoopID;
+      if (LD.ParentLoopID > 0) {
+        OS << " (nested in Loop " << LD.ParentLoopID << ")";
       }
       OS << "\n";
+      
+      // Start Value
+      OS << "  ├─ Start Value: ";
+      if (LD.StartValue) {
+        OS << *LD.StartValue;
+        if (LD.IsStartLinked) {
+          OS << "   [SL=1, Dynamic, LinkID needed]";
+          if (LD.StartValueDynamic) {
+            OS << " = " << *LD.StartValueDynamic;
+          }
+        } else {
+          OS << "  [SL=0, Constant]";
+        }
+      } else {
+        OS << "(unknown)";
+      }
+      OS << "\n";
+      
+      // End Value
+      OS << "  ├─ End Value:   ";
+      if (LD.EndValue) {
+        OS << *LD.EndValue;
+        if (LD.IsEndLinked) {
+          OS << "   [EL=1, Dynamic, LinkID needed]";
+          if (LD.EndValueDynamic) {
+            OS << " = " << *LD.EndValueDynamic;
+          }
+        } else {
+          OS << "  [EL=0, Constant]";
+        }
+      } else {
+        OS << "(unknown)";
+      }
+      OS << "\n";
+      
+      // Step Value
+      OS << "  └─ Step Value:  ";
+      if (LD.StepValue) {
+        OS << *LD.StepValue;
+      } else {
+        OS << "(unknown)";
+      }
+      OS << "\n\n";
     }
   }
   
   if (!DirectStreams.empty()) {
-    OS << "Direct Streams:\n";
-    OS << "---------------\n";
+    OS << "  Direct Streams (Constant Stride Patterns):\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     for (const auto &DS : DirectStreams) {
-      OS << "Stream ID: " << DS.StreamID << "\n";
-      OS << "  Loop ID: " << DS.LoopID << "\n";
-      OS << "  Base: " << *DS.BaseAddress;
+      OS << "Stream ID: " << DS.StreamID << " (Loop " << DS.LoopID << ")\n";
+      
+      // Base Address
+      OS << "  ├─ Base Address: " << *DS.BaseAddress;
       if (DS.IsBaseLinked) {
-        OS << " (Linked: ";
+        OS << "   [BL=1, Dynamic, LinkID=" << DS.LinkID << "]";
         if (DS.BaseAddressValue) {
-          OS << *DS.BaseAddressValue;
+          OS << "\n  │              = " << *DS.BaseAddressValue;
         }
-        OS << ")";
+      } else {
+        OS << "  [BL=0, Static]";
       }
       OS << "\n";
-      OS << "  Stride: " << DS.Stride << " bytes\n";
+      
+      // Stride
+      OS << "  ├─ Stride:       " << DS.Stride << " bytes\n";
+      
+      // Shared flag
+      OS << "  ├─ Shared:       " << (DS.IsShared ? "Yes [S=1]" : "No [S=0]") << "\n";
+      
+      // Source instruction
       if (DS.MemInst) {
-        OS << "  Instruction: " << *DS.MemInst << "\n";
+        OS << "  └─ Source:       " << *DS.MemInst << "\n";
       }
       OS << "\n";
     }
   }
   
   if (!LinkVariables.empty()) {
-    OS << "Link Variables:\n";
-    OS << "---------------\n";
+    OS << "  Link Variable Descriptors (Dynamic Runtime Values):\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     for (const auto &LV : LinkVariables) {
       OS << "Link ID: " << LV.LinkID << "\n";
-      OS << "  Value: " << *LV.DynamicValue << "\n";
-      OS << "  Size: " << LV.SizeInBytes << " bytes\n\n";
+      OS << "  ├─ IR Value:  " << *LV.DynamicValue << "\n";
+      OS << "  └─ Size:      " << LV.SizeInBytes << " bytes\n";
     }
   }
+  
+  OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
 }
 
 } // anonymous namespace
@@ -464,8 +803,8 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
   InterStellarStreamAnalyzer Analyzer(F, LI, SE, DT);
   Analyzer.analyze();
   
-  // Print results to stderr (always visible)
-  Analyzer.print(errs());
+  // Print results only in LLVM debugger
+  LLVM_DEBUG(Analyzer.print(dbgs()));
   
   // This is an analysis pass, it doesn't modify the IR
   return PreservedAnalyses::all();

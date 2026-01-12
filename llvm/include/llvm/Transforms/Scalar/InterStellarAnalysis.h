@@ -31,40 +31,44 @@ class Value;
 
 /// Data structure to represent a direct stream descriptor
 struct DirectStreamDescriptor {
-  unsigned StreamID;
-  unsigned LoopID;
-  const SCEV *BaseAddress;
-  Value *BaseAddressValue;
-  int64_t Stride;
-  bool IsBaseLinked;
-  Instruction *MemInst;
+  unsigned StreamID = 0;
+  unsigned LoopID = 0;
+  const SCEV *BaseAddress = nullptr;
+  Value *BaseAddressValue = nullptr;
+  int64_t Stride = 0;
+  bool IsBaseLinked = false;  // Base Linked (BL) flag
+  bool IsShared = false;      // Shared (S) flag - for multi-core
+  unsigned LinkID = 0;        // ID of the Link Variable Descriptor if base is dynamic
+  Instruction *MemInst = nullptr;
 };
 
 /// Data structure to represent an indirect stream descriptor
 struct IndirectStreamDescriptor {
-  unsigned StreamID;
-  unsigned LoopID;
-  unsigned BaseStreamID;
-  const SCEV *IndexExpression;
+  unsigned StreamID = 0;
+  unsigned LoopID = 0;
+  unsigned BaseStreamID = 0;
+  const SCEV *IndexExpression = nullptr;
 };
 
 /// Data structure to represent a loop descriptor
 struct LoopDescriptor {
-  unsigned LoopID;
-  unsigned ParentLoopID;
-  Loop *L;
-  const SCEV *StartValue;
-  const SCEV *EndValue;
-  const SCEV *StepValue;
-  Value *EndValueDynamic;
-  bool IsEndLinked;
+  unsigned LoopID = 0;
+  unsigned ParentLoopID = 0;
+  Loop *L = nullptr;
+  const SCEV *StartValue = nullptr;
+  const SCEV *EndValue = nullptr;
+  const SCEV *StepValue = nullptr;
+  Value *StartValueDynamic = nullptr;  // IR Value if start is dynamic
+  Value *EndValueDynamic = nullptr;    // IR Value if end is dynamic
+  bool IsStartLinked = false;          // Start Linked (SL) flag
+  bool IsEndLinked = false;            // End Linked (EL) flag
 };
 
 /// Data structure to represent a link variable descriptor
 struct LinkVariableDescriptor {
-  unsigned LinkID;
-  Value *DynamicValue;
-  unsigned SizeInBytes;
+  unsigned LinkID = 0;
+  Value *DynamicValue = nullptr;
+  unsigned SizeInBytes = 0;
 };
 
 /// InterStellar Analysis Pass for New Pass Manager
