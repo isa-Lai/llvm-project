@@ -245,9 +245,17 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
             
             // If we still don't have end value, compute it from backedge-taken count
             if (!LD.EndValue) {
-              // For "for (i=start; i<end; i++)", BTC = end - start
-              // So end = start + BTC
-              LD.EndValue = SE.getAddExpr(LD.StartValue, BTC);
+              // For "for (i=start; i<end; i+=step)", BTC = (end - start) / step
+              // So end = start + (BTC * step)
+              // For unit step (step=1), this simplifies to: end = start + BTC
+              if (LD.StepValue) {
+                // end = start + (BTC * step)
+                const SCEV *BTCTimesStep = SE.getMulExpr(BTC, LD.StepValue);
+                LD.EndValue = SE.getAddExpr(LD.StartValue, BTCTimesStep);
+              } else {
+                // No step value found, assume step=1
+                LD.EndValue = SE.getAddExpr(LD.StartValue, BTC);
+              }
             }
             
             FoundBounds = true;
