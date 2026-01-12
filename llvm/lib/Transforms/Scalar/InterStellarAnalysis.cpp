@@ -110,6 +110,7 @@ private:
   unsigned getOrCreateLinkID(Value *V, unsigned SizeInBytes);
   bool isValueDynamic(const SCEV *S);
   Value *extractDynamicValue(const SCEV *S);
+  void extractAllDynamicValues(const SCEV *S, SmallVectorImpl<Value *> &Values);
   int64_t getTypeSizeInBytes(Type *Ty);
 };
 
@@ -290,10 +291,35 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
     // Check if end value is dynamic
     if (isValueDynamic(LD.EndValue)) {
       LD.IsEndLinked = true;
-      LD.EndValueDynamic = extractDynamicValue(LD.EndValue);
-      if (LD.EndValueDynamic) {
-        LD.EndLinkID = getOrCreateLinkID(LD.EndValueDynamic, 
-                                          getTypeSizeInBytes(LD.EndValueDynamic->getType()));
+      
+      // Extract ALL dynamic values from the end expression
+      SmallVector<Value *, 4> DynamicValues;
+      extractAllDynamicValues(LD.EndValue, DynamicValues);
+      
+      // Create link variables for all dynamic values
+      for (Value *V : DynamicValues) {
+        getOrCreateLinkID(V, getTypeSizeInBytes(V->getType()));
+      }
+      
+      // Choose the primary bound for the Loop Descriptor
+      // Strategy: Prefer the value that's NOT the start value
+      Value *PrimaryBound = nullptr;
+      for (Value *V : DynamicValues) {
+        if (V != LD.StartValueDynamic) {
+          PrimaryBound = V;
+          break;
+        }
+      }
+      
+      // If all values are the same as start (edge case), use the first one
+      if (!PrimaryBound && !DynamicValues.empty()) {
+        PrimaryBound = DynamicValues[0];
+      }
+      
+      if (PrimaryBound) {
+        LD.EndValueDynamic = PrimaryBound;
+        LD.EndLinkID = getOrCreateLinkID(PrimaryBound, 
+                                          getTypeSizeInBytes(PrimaryBound->getType()));
       }
     }
     
@@ -689,6 +715,31 @@ Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S) {
   }
   
   return nullptr;
+}
+
+void InterStellarStreamAnalyzer::extractAllDynamicValues(const SCEV *S, 
+                                                         SmallVectorImpl<Value *> &Values) {
+  // Extract SCEVUnknown values
+  if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(S)) {
+    Value *V = Unknown->getValue();
+    // Avoid duplicates and only add if not already in the list
+    if (V && !is_contained(Values, V)) {
+      Values.push_back(V);
+    }
+    return;
+  }
+  
+  // Recursively process composite expressions
+  if (const SCEVNAryExpr *NAry = dyn_cast<SCEVNAryExpr>(S)) {
+    for (const SCEV *Op : NAry->operands()) {
+      extractAllDynamicValues(Op, Values);
+    }
+  } else if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
+    extractAllDynamicValues(Cast->getOperand(), Values);
+  } else if (const SCEVUDivExpr *UDiv = dyn_cast<SCEVUDivExpr>(S)) {
+    extractAllDynamicValues(UDiv->getLHS(), Values);
+    extractAllDynamicValues(UDiv->getRHS(), Values);
+  }
 }
 
 int64_t InterStellarStreamAnalyzer::getTypeSizeInBytes(Type *Ty) {
