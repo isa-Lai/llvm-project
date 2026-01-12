@@ -24,6 +24,7 @@ class Function;
 class FunctionPass;
 class Loop;
 class ScalarEvolution;
+class SCEV;
 class DominatorTree;
 class Instruction;
 class Value;
@@ -81,10 +82,7 @@ class InterStellarAnalysisLegacyPass : public FunctionPass {
 public:
   static char ID;
   
-  InterStellarAnalysisLegacyPass() : FunctionPass(ID) {
-    initializeInterStellarAnalysisLegacyPassPass(
-        *PassRegistry::getPassRegistry());
-  }
+  InterStellarAnalysisLegacyPass();
   
   bool runOnFunction(Function &F) override;
   

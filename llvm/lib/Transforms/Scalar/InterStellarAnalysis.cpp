@@ -481,6 +481,11 @@ void InterStellarAnalysisPass::printResults(raw_ostream &OS) const {
 
 char InterStellarAnalysisLegacyPass::ID = 0;
 
+InterStellarAnalysisLegacyPass::InterStellarAnalysisLegacyPass()
+    : FunctionPass(ID) {
+  initializeInterStellarAnalysisLegacyPassPass(*PassRegistry::getPassRegistry());
+}
+
 bool InterStellarAnalysisLegacyPass::runOnFunction(Function &F) {
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
