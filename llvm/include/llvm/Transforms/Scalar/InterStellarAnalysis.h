@@ -62,6 +62,8 @@ struct LoopDescriptor {
   Value *EndValueDynamic = nullptr;    // IR Value if end is dynamic
   bool IsStartLinked = false;          // Start Linked (SL) flag
   bool IsEndLinked = false;            // End Linked (EL) flag
+  unsigned StartLinkID = 0;            // Link Descriptor ID if SL=1
+  unsigned EndLinkID = 0;              // Link Descriptor ID if EL=1
 };
 
 /// Data structure to represent a link variable descriptor

@@ -282,8 +282,8 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
       LD.IsStartLinked = true;
       LD.StartValueDynamic = extractDynamicValue(LD.StartValue);
       if (LD.StartValueDynamic) {
-        getOrCreateLinkID(LD.StartValueDynamic, 
-                         getTypeSizeInBytes(LD.StartValueDynamic->getType()));
+        LD.StartLinkID = getOrCreateLinkID(LD.StartValueDynamic, 
+                                            getTypeSizeInBytes(LD.StartValueDynamic->getType()));
       }
     }
     
@@ -292,8 +292,8 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
       LD.IsEndLinked = true;
       LD.EndValueDynamic = extractDynamicValue(LD.EndValue);
       if (LD.EndValueDynamic) {
-        getOrCreateLinkID(LD.EndValueDynamic, 
-                         getTypeSizeInBytes(LD.EndValueDynamic->getType()));
+        LD.EndLinkID = getOrCreateLinkID(LD.EndValueDynamic, 
+                                          getTypeSizeInBytes(LD.EndValueDynamic->getType()));
       }
     }
     
@@ -664,6 +664,26 @@ Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S) {
         return V;
       }
     }
+  } else if (const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(S)) {
+    for (const SCEV *Op : Mul->operands()) {
+      if (Value *V = extractDynamicValue(Op)) {
+        return V;
+      }
+    }
+  } else if (const SCEVSMaxExpr *SMax = dyn_cast<SCEVSMaxExpr>(S)) {
+    // For smax(a, b), extract the dynamic operand
+    for (const SCEV *Op : SMax->operands()) {
+      if (Value *V = extractDynamicValue(Op)) {
+        return V;
+      }
+    }
+  } else if (const SCEVUMaxExpr *UMax = dyn_cast<SCEVUMaxExpr>(S)) {
+    // For umax(a, b), extract the dynamic operand
+    for (const SCEV *Op : UMax->operands()) {
+      if (Value *V = extractDynamicValue(Op)) {
+        return V;
+      }
+    }
   } else if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
     return extractDynamicValue(Cast->getOperand());
   }
@@ -702,9 +722,9 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
       if (LD.StartValue) {
         OS << *LD.StartValue;
         if (LD.IsStartLinked) {
-          OS << "   [SL=1, Dynamic, LinkID needed]";
+          OS << "   [SL=1, Dynamic, LinkID=" << LD.StartLinkID << "]";
           if (LD.StartValueDynamic) {
-            OS << " = " << *LD.StartValueDynamic;
+            OS << "\n  │              = " << *LD.StartValueDynamic;
           }
         } else {
           OS << "  [SL=0, Constant]";
@@ -719,9 +739,9 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
       if (LD.EndValue) {
         OS << *LD.EndValue;
         if (LD.IsEndLinked) {
-          OS << "   [EL=1, Dynamic, LinkID needed]";
+          OS << "   [EL=1, Dynamic, LinkID=" << LD.EndLinkID << "]";
           if (LD.EndValueDynamic) {
-            OS << " = " << *LD.EndValueDynamic;
+            OS << "\n  │              = " << *LD.EndValueDynamic;
           }
         } else {
           OS << "  [EL=0, Constant]";
