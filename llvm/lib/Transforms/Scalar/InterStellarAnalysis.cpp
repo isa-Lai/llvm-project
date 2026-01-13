@@ -154,6 +154,7 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
   Loop *ParentLoop = L->getParentLoop();
   if (ParentLoop) {
     LD.ParentLoopID = getOrCreateLoopID(ParentLoop);
+    LLVM_DEBUG(dbgs() << "  Loop is nested in parent Loop ID: " << LD.ParentLoopID << "\n");
   }
   
   bool FoundBounds = false;
@@ -766,10 +767,17 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
     OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     for (const auto &LD : LoopDescriptors) {
       OS << "Loop ID: " << LD.LoopID;
-      if (LD.ParentLoopID > 0) {
-        OS << " (nested in Loop " << LD.ParentLoopID << ")";
+      // Check if this loop actually has a parent (not just ParentLoopID value)
+      bool hasParent = LD.L && LD.L->getParentLoop();
+      if (hasParent) {
+        OS << " (nested inside Loop " << LD.ParentLoopID << ")";
       }
       OS << "\n";
+      
+      // Parent Loop ID (if nested)
+      if (hasParent) {
+        OS << "  ├─ Parent Loop: " << LD.ParentLoopID << " [Nesting Level]\n";
+      }
       
       // Start Value
       OS << "  ├─ Start Value: ";
