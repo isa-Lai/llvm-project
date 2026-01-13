@@ -672,6 +672,9 @@ bool InterStellarStreamAnalyzer::isValueDynamic(const SCEV *S) {
     }
   } else if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
     HasDynamic = isValueDynamic(Cast->getOperand());
+  } else if (const SCEVUDivExpr *UDiv = dyn_cast<SCEVUDivExpr>(S)) {
+    // Check UDiv operands (e.g., "X /u 2" in the bound calculation)
+    HasDynamic = isValueDynamic(UDiv->getLHS()) || isValueDynamic(UDiv->getRHS());
   }
   
   return HasDynamic;
