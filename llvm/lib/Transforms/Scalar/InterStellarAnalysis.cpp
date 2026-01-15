@@ -363,6 +363,23 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // 2. If so, analyze the index operand
   // 3. Trace the index through loads to find the actual induction variable
   // 4. Get SCEV of the induction variable to check for AddRec pattern
+  //
+  // IMPORTANT: For nested loops with access pattern A[i*M + j]:
+  // - The SCEV will be a nested AddRec: {{0,+,M}<%outer>,+,1}<%inner>
+  // - For the inner loop, this IS a direct stream with:
+  //   * Base: the outer AddRec {0,+,M}<%outer> (becomes a link variable)
+  //   * Stride: 1 * element_size
+  // - This allows hardware to prefetch the inner loop's sequential access
+  //   while understanding that the base address changes with each outer iteration
+  
+  LLVM_DEBUG({
+    dbgs() << "Start analyzeDirectStream on instruction: ";
+    if (MemInst) {
+      dbgs() << *MemInst << "\n";
+    } else {
+      dbgs() << "(null)\n";
+    }
+  });
   
   GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr);
   if (!GEP) {
@@ -457,6 +474,12 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   
   // Now get the SCEV of the induction variable
   const SCEV *IndVarSCEV = SE.getSCEV(IndVar);
+  
+  // Handle cast expressions (sext, zext, etc.) - unwrap to get the underlying AddRec
+  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(IndVarSCEV)) {
+    IndVarSCEV = Cast->getOperand();
+  }
+  
   const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndVarSCEV);
   
   if (!AR) {
@@ -486,6 +509,10 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     return false;
   }
   
+  // Get the base/start of this AddRec - this is important for nested loops
+  // For nested AddRec like {{0,+,%M}<%outer>,+,1}<%inner>, the start is {0,+,%M}<%outer>
+  const SCEV *IndexBase = AR->getStart();
+  
   // Calculate memory stride: index_step * element_size
   Type *ElementType = GEP->getSourceElementType();
   // For array types like [1000 x i32], get the actual element type
@@ -496,8 +523,36 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   int64_t IndexStepVal = IndexStepConst->getAPInt().getSExtValue();
   int64_t MemoryStride = IndexStepVal * ElementSize;
   
-  // Get base address SCEV
-  const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
+  // Get base address SCEV - this is the pointer to the array
+  const SCEV *BasePtrSCEV = SE.getSCEV(BasePtr);
+  
+  // The complete base address for the stream is: BasePtr + IndexBase * ElementSize
+  // For nested loops like A[i*M + j], IndexBase is {0,+,M}<%outer> (represents i*M)
+  // This becomes a new "base" for the inner loop's stream
+  const SCEV *BaseSCEV;
+  if (isa<SCEVConstant>(IndexBase) && 
+      cast<SCEVConstant>(IndexBase)->getValue()->isNullValue()) {
+    // IndexBase is 0, so base is just the pointer
+    BaseSCEV = BasePtrSCEV;
+  } else {
+    // IndexBase is non-zero (e.g., another AddRec from outer loop)
+    // We need to construct a GEP-like SCEV expression
+    // Use getGEPExpr if available, otherwise compute manually with proper types
+    
+    // For proper type handling, we need to extend IndexBase to pointer-sized integer
+    Type *PtrIntTy = SE.getEffectiveSCEVType(BasePtrSCEV->getType());
+    const SCEV *IndexBaseSized;
+    if (ElementSize == 1) {
+      IndexBaseSized = SE.getTruncateOrSignExtend(IndexBase, PtrIntTy);
+    } else {
+      const SCEV *ElemSizeSCEV = SE.getConstant(PtrIntTy, ElementSize);
+      const SCEV *IndexBaseExt = SE.getTruncateOrSignExtend(IndexBase, PtrIntTy);
+      IndexBaseSized = SE.getMulExpr(IndexBaseExt, ElemSizeSCEV);
+    }
+    
+    // Now add to the pointer - use getAddExpr for pointer arithmetic
+    BaseSCEV = SE.getAddExpr(BasePtrSCEV, IndexBaseSized);
+  }
   
   // Create direct stream descriptor
   DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
@@ -510,11 +565,21 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   
   // Check if base is dynamic
   if (DS.IsBaseLinked) {
+    // Extract ALL dynamic values from the base expression
+    SmallVector<Value *, 4> DynamicValues;
+    extractAllDynamicValues(BaseSCEV, DynamicValues);
+    
+    // Create link variables for all dynamic values
+    for (Value *V : DynamicValues) {
+      Type *VTy = V->getType();
+      unsigned Size = VTy->isPointerTy() ? 8 : getTypeSizeInBytes(VTy);
+      getOrCreateLinkID(V, Size);
+    }
+    
+    // Set the primary base value (for backwards compatibility)
     DS.BaseAddressValue = extractDynamicValue(BaseSCEV);
     if (DS.BaseAddressValue) {
-      Type *BaseTy = DS.BaseAddressValue->getType();
-      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
-      DS.LinkID = getOrCreateLinkID(DS.BaseAddressValue, Size);
+      DS.LinkID = ValueToLinkIDMap[DS.BaseAddressValue];
       ++NumDynamicBases;
     }
   }
@@ -528,6 +593,9 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     dbgs() << "    Stream ID: " << DS.StreamID << "\n";
     dbgs() << "    Loop ID: " << DS.LoopID << "\n";
     dbgs() << "    Base: " << *BaseSCEV << "\n";
+    if (isa<SCEVAddRecExpr>(IndexBase)) {
+      dbgs() << "    Index Base (nested AddRec): " << *IndexBase << "\n";
+    }
     dbgs() << "    Element Size: " << ElementSize << " bytes\n";
     dbgs() << "    Index Step: " << IndexStepVal << "\n";
     dbgs() << "    Memory Stride: " << MemoryStride << " bytes\n";

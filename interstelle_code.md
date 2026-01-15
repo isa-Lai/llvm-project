@@ -2380,3 +2380,153 @@ Hardware needs to know:
 **Files Modified:** 
 - `llvm/lib/Transforms/Scalar/InterStellarAnalysis.cpp` (analyzeLoop, print)
 - Enhanced display with parent loop indicators
+
+---
+
+### January 15, 2026 - Critical Enhancement: Nested AddRec Support for Multi-Dimensional Arrays
+
+**Issue Identified:**
+The direct stream detection was failing for nested loop patterns with multi-dimensional array access like `A[i * M + j]`. The SCEV for such patterns is a **nested AddRecExpr**: `{{0,+,M}<%outer>,+,1}<%inner>`, which represents the mathematical expression `(i * M) + j`. The original implementation only handled simple AddRec patterns for single loops and rejected nested AddRec expressions, resulting in:
+
+```
+Statistics:
+   • Loops analyzed: 2
+   • Direct streams: 0  ❌ (Should be 1 for inner loop)
+   • Link variables: 2
+```
+
+**Test Case:**
+```c
+void nested_loops(int *A, int N, int M) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < M; j++) {
+            A[i * M + j] = 0;  // Should be detected as direct stream
+        }
+    }
+}
+```
+
+**SCEV Analysis:**
+- Full index SCEV: `(sext i32 {{0,+,%M}<%for.cond>,+,1}<nw><%for.cond1> to i64)`
+- Unwrapped nested AddRec: `{{0,+,%M}<%for.cond>,+,1}<%for.cond1>`
+- Outer AddRec `{0,+,%M}<%for.cond>`: Represents `i * M` (base for inner loop)
+- Inner AddRec `{...,+,1}<%for.cond1>`: Adds `j` with stride 1
+
+**Root Cause:**
+Three specific issues prevented detection:
+
+1. **Cast Expression Barrier:** The SCEV was wrapped in `SCEVCastExpr` (sext), and the code didn't unwrap it
+2. **No Nested AddRec Handling:** Code checked `AR->getLoop() != L` and rejected AddRec from outer loops
+3. **Incorrect Base Calculation:** Didn't account for the outer loop's contribution to the base address
+
+**Solution Implemented:**
+
+#### Fix 1: Unwrap Cast Expressions
+```cpp
+// Now get the SCEV of the induction variable
+const SCEV *IndVarSCEV = SE.getSCEV(IndVar);
+
+// Handle cast expressions (sext, zext, etc.) - unwrap to get the underlying AddRec
+while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(IndVarSCEV)) {
+    IndVarSCEV = Cast->getOperand();
+}
+
+const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndVarSCEV);
+```
+
+**Rationale:** LLVM often wraps AddRec expressions in sign/zero extension casts for type correctness. We need to peel these away to access the underlying recurrence pattern.
+
+#### Fix 2: Extract IndexBase from Nested AddRec
+```cpp
+// Get the base/start of this AddRec - this is important for nested loops
+// For nested AddRec like {{0,+,%M}<%outer>,+,1}<%inner>, the start is {0,+,%M}<%outer>
+const SCEV *IndexBase = AR->getStart();
+```
+
+**Key Insight:** For nested AddRec, `AR->getStart()` returns the **outer AddRec**, which represents the contribution from outer loop iterations. This becomes our new "base" for the inner loop stream.
+
+#### Fix 3: Compute Complete Base Address with Type Safety
+```cpp
+// The complete base address for the stream is: BasePtr + IndexBase * ElementSize
+// For nested loops like A[i*M + j], IndexBase is {0,+,M}<%outer> (represents i*M)
+const SCEV *BaseSCEV;
+if (isa<SCEVConstant>(IndexBase) && 
+    cast<SCEVConstant>(IndexBase)->getValue()->isNullValue()) {
+    BaseSCEV = BasePtrSCEV;
+} else {
+    // For proper type handling, we need to extend IndexBase to pointer-sized integer
+    Type *PtrIntTy = SE.getEffectiveSCEVType(BasePtrSCEV->getType());
+    const SCEV *IndexBaseSized;
+    if (ElementSize == 1) {
+        IndexBaseSized = SE.getTruncateOrSignExtend(IndexBase, PtrIntTy);
+    } else {
+        const SCEV *ElemSizeSCEV = SE.getConstant(PtrIntTy, ElementSize);
+        const SCEV *IndexBaseExt = SE.getTruncateOrSignExtend(IndexBase, PtrIntTy);
+        IndexBaseSized = SE.getMulExpr(IndexBaseExt, ElemSizeSCEV);
+    }
+    BaseSCEV = SE.getAddExpr(BasePtrSCEV, IndexBaseSized);
+}
+```
+
+**Critical Type Safety:** SCEV operations require type compatibility. We use `getTruncateOrSignExtend` to convert integer types to pointer-sized integers before arithmetic operations, preventing LLVM assertions about type mismatches.
+
+#### Fix 4: Extract All Dynamic Values from Base
+```cpp
+if (DS.IsBaseLinked) {
+    // Extract ALL dynamic values from the base expression
+    SmallVector<Value *, 4> DynamicValues;
+    extractAllDynamicValues(BaseSCEV, DynamicValues);
+    
+    // Create link variables for all dynamic values
+    for (Value *V : DynamicValues) {
+        Type *VTy = V->getType();
+        unsigned Size = VTy->isPointerTy() ? 8 : getTypeSizeInBytes(VTy);
+        getOrCreateLinkID(V, Size);
+    }
+}
+```
+
+**Rationale:** The base expression for nested loops contains multiple dynamic values (A, M) that all need link variables.
+
+**Testing Results After Fix:**
+
+✅ **nested_loops test:**
+```
+Statistics:
+   • Loops analyzed: 2
+   • Direct streams: 1  ✅ (Fixed!)
+   • Link variables: 3  ✅ (A, N, M)
+
+Direct Streams:
+Stream ID: 0 (Loop 1)
+  ├─ Base Address: ((4 * (sext i32 {0,+,%M}<%for.cond> to i64))<nsw> + %A)
+  │              = ptr %A
+  ├─ Stride:       4 bytes
+  └─ Source:       store i32 0, ptr %arrayidx, align 4
+```
+
+**Hardware Interpretation:**
+
+For the inner loop, the hardware sees:
+- **Stream Type:** Direct stream (constant stride)
+- **Base Address:** Dynamic, computed as `A + (i * M * 4)` where A and M come from link variables
+- **Stride:** 4 bytes (sequential access in inner loop)
+- **Base Update:** Changes with each outer loop iteration
+
+**Semantic Understanding:**
+
+The fix correctly models the memory access pattern:
+- **From inner loop perspective:** Sequential access with stride 4 bytes (IS a direct stream)
+- **Base address dependency:** Inner loop's base address is a function of outer loop's induction variable
+
+This is exactly the insight needed for hardware optimization: the inner loop performs sequential accesses, but the base changes per outer iteration.
+
+**Files Modified:**
+- `llvm/lib/Transforms/Scalar/InterStellarAnalysis.cpp` (tryAnalyzeDirectStream function)
+
+**Impact:** Nested loop patterns now work correctly, enabling optimization of common patterns like matrix traversal.
+
+**Date:** January 15, 2026  
+**Severity:** High (critical for multi-dimensional array support)  
+**Testing:** Verified with nested_loops test showing 1 direct stream detected  
+**Author:** IQ 170 Senior LLVM Engineer
