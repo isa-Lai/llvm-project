@@ -109,7 +109,7 @@ private:
   unsigned getOrCreateLoopID(Loop *L);
   unsigned getOrCreateLinkID(Value *V, unsigned SizeInBytes);
   bool isValueDynamic(const SCEV *S);
-  Value *extractDynamicValue(const SCEV *S);
+  Value *extractDynamicValue(const SCEV *S, Loop *L);
   void extractAllDynamicValues(const SCEV *S, SmallVectorImpl<Value *> &Values);
   int64_t getTypeSizeInBytes(Type *Ty);
 };
@@ -223,9 +223,14 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
             // But we actually want the upper bound from the comparison
             // Let's try to get it from the loop exit condition
             
+            // Check both the header and latch for the exit comparison
+            // After loop-simplify, the comparison is usually in the header
+            BasicBlock *Header = L->getHeader();
             BasicBlock *Latch = L->getLoopLatch();
-            if (Latch) {
-              BranchInst *BI = dyn_cast<BranchInst>(Latch->getTerminator());
+            
+            auto extractBoundFromBlock = [&](BasicBlock *BB) -> bool {
+              if (!BB) return false;
+              BranchInst *BI = dyn_cast<BranchInst>(BB->getTerminator());
               if (BI && BI->isConditional()) {
                 if (ICmpInst *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
                   // Check which operand is the induction variable
@@ -235,14 +240,27 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
                   const SCEV *Op0SCEV = SE.getSCEV(Op0);
                   const SCEV *Op1SCEV = SE.getSCEV(Op1);
                   
-                  // Find the non-IV operand - that's likely the bound
+                  // Find the non-IV operand - that's the bound value
+                  // Save both the SCEV and the actual IR Value
                   if (Op0SCEV == IndVarSCEV) {
                     LD.EndValue = Op1SCEV;
+                    LD.EndValueDynamic = Op1;  // Save the actual IR value
+                    LLVM_DEBUG(dbgs() << "    Captured end bound from comparison Op1: " << *Op1 << "\n");
+                    return true;
                   } else if (Op1SCEV == IndVarSCEV) {
                     LD.EndValue = Op0SCEV;
+                    LD.EndValueDynamic = Op0;  // Save the actual IR value
+                    LLVM_DEBUG(dbgs() << "    Captured end bound from comparison Op0: " << *Op0 << "\n");
+                    return true;
                   }
                 }
               }
+              return false;
+            };
+            
+            // Try header first (most common after loop-simplify), then latch
+            if (!extractBoundFromBlock(Header)) {
+              extractBoundFromBlock(Latch);
             }
             
             // If we still don't have end value, compute it from backedge-taken count
@@ -282,7 +300,7 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
     // Check if start value is dynamic (e.g., function parameter, outer loop variable)
     if (isValueDynamic(LD.StartValue)) {
       LD.IsStartLinked = true;
-      LD.StartValueDynamic = extractDynamicValue(LD.StartValue);
+      LD.StartValueDynamic = extractDynamicValue(LD.StartValue, L);
       if (LD.StartValueDynamic) {
         LD.StartLinkID = getOrCreateLinkID(LD.StartValueDynamic, 
                                             getTypeSizeInBytes(LD.StartValueDynamic->getType()));
@@ -293,34 +311,19 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
     if (isValueDynamic(LD.EndValue)) {
       LD.IsEndLinked = true;
       
-      // Extract ALL dynamic values from the end expression
-      SmallVector<Value *, 4> DynamicValues;
-      extractAllDynamicValues(LD.EndValue, DynamicValues);
+      // Use the IR value directly if we captured it from the comparison
+      // This is the actual value used at runtime (e.g., the result of N-M computation)
+      Value *EndVal = LD.EndValueDynamic;
       
-      // Create link variables for all dynamic values
-      for (Value *V : DynamicValues) {
-        getOrCreateLinkID(V, getTypeSizeInBytes(V->getType()));
+      // If we didn't capture it from comparison, try to extract it from SCEV
+      if (!EndVal) {
+        EndVal = extractDynamicValue(LD.EndValue, L);
       }
       
-      // Choose the primary bound for the Loop Descriptor
-      // Strategy: Prefer the value that's NOT the start value
-      Value *PrimaryBound = nullptr;
-      for (Value *V : DynamicValues) {
-        if (V != LD.StartValueDynamic) {
-          PrimaryBound = V;
-          break;
-        }
-      }
-      
-      // If all values are the same as start (edge case), use the first one
-      if (!PrimaryBound && !DynamicValues.empty()) {
-        PrimaryBound = DynamicValues[0];
-      }
-      
-      if (PrimaryBound) {
-        LD.EndValueDynamic = PrimaryBound;
-        LD.EndLinkID = getOrCreateLinkID(PrimaryBound, 
-                                          getTypeSizeInBytes(PrimaryBound->getType()));
+      if (EndVal) {
+        LD.EndValueDynamic = EndVal;
+        LD.EndLinkID = getOrCreateLinkID(EndVal, 
+                                          getTypeSizeInBytes(EndVal->getType()));
       }
     }
     
@@ -418,7 +421,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     DS.MemInst = MemInst;
     
     if (DS.IsBaseLinked) {
-      if (Value *BaseVal = extractDynamicValue(Base)) {
+      if (Value *BaseVal = extractDynamicValue(Base, L)) {
         Type *BaseTy = BaseVal->getType();
         unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
         DS.LinkID = getOrCreateLinkID(BaseVal, Size);
@@ -480,6 +483,48 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     IndVarSCEV = Cast->getOperand();
   }
   
+  // Handle add expressions with offsets (e.g., i+2 becomes {start+2, +, step})
+  // The SCEV might be: (constant + (sext {start,+,step}))
+  // We need to extract the AddRec and account for the constant offset
+  const SCEV *ConstantOffset = nullptr;
+  if (const SCEVAddExpr *AddExpr = dyn_cast<SCEVAddExpr>(IndVarSCEV)) {
+    // Try to find an AddRec operand in the add expression
+    const SCEVAddRecExpr *FoundAR = nullptr;
+    SmallVector<const SCEV *, 4> OtherOperands;
+    
+    for (const SCEV *Op : AddExpr->operands()) {
+      // Unwrap casts on operands
+      const SCEV *UnwrappedOp = Op;
+      while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(UnwrappedOp)) {
+        UnwrappedOp = Cast->getOperand();
+      }
+      
+      if (const SCEVAddRecExpr *OpAR = dyn_cast<SCEVAddRecExpr>(UnwrappedOp)) {
+        if (!FoundAR) {
+          FoundAR = OpAR;
+        } else {
+          // Multiple AddRecs in the same expression - too complex
+          FoundAR = nullptr;
+          break;
+        }
+      } else {
+        OtherOperands.push_back(Op);
+      }
+    }
+    
+    if (FoundAR) {
+      IndVarSCEV = FoundAR;
+      // Compute the constant offset from other operands
+      if (!OtherOperands.empty()) {
+        if (OtherOperands.size() == 1) {
+          ConstantOffset = OtherOperands[0];
+        } else {
+          ConstantOffset = SE.getAddExpr(OtherOperands);
+        }
+      }
+    }
+  }
+  
   const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndVarSCEV);
   
   if (!AR) {
@@ -513,6 +558,16 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // For nested AddRec like {{0,+,%M}<%outer>,+,1}<%inner>, the start is {0,+,%M}<%outer>
   const SCEV *IndexBase = AR->getStart();
   
+  // If we extracted a constant offset (e.g., from i+2), add it to the index base
+  if (ConstantOffset) {
+    // Combine the AddRec's start with the constant offset
+    // This handles cases like A[i+2] where the SCEV is (2 + {0,+,1})
+    // We want IndexBase to be (start + 2) so that the base address is correct
+    Type *IndexTy = SE.getEffectiveSCEVType(IndexBase->getType());
+    const SCEV *OffsetSized = SE.getTruncateOrSignExtend(ConstantOffset, IndexTy);
+    IndexBase = SE.getAddExpr(IndexBase, OffsetSized);
+  }
+  
   // Calculate memory stride: index_step * element_size
   Type *ElementType = GEP->getSourceElementType();
   // For array types like [1000 x i32], get the actual element type
@@ -526,33 +581,19 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // Get base address SCEV - this is the pointer to the array
   const SCEV *BasePtrSCEV = SE.getSCEV(BasePtr);
   
-  // The complete base address for the stream is: BasePtr + IndexBase * ElementSize
-  // For nested loops like A[i*M + j], IndexBase is {0,+,M}<%outer> (represents i*M)
-  // This becomes a new "base" for the inner loop's stream
-  const SCEV *BaseSCEV;
-  if (isa<SCEVConstant>(IndexBase) && 
-      cast<SCEVConstant>(IndexBase)->getValue()->isNullValue()) {
-    // IndexBase is 0, so base is just the pointer
-    BaseSCEV = BasePtrSCEV;
-  } else {
-    // IndexBase is non-zero (e.g., another AddRec from outer loop)
-    // We need to construct a GEP-like SCEV expression
-    // Use getGEPExpr if available, otherwise compute manually with proper types
-    
-    // For proper type handling, we need to extend IndexBase to pointer-sized integer
-    Type *PtrIntTy = SE.getEffectiveSCEVType(BasePtrSCEV->getType());
-    const SCEV *IndexBaseSized;
-    if (ElementSize == 1) {
-      IndexBaseSized = SE.getTruncateOrSignExtend(IndexBase, PtrIntTy);
-    } else {
-      const SCEV *ElemSizeSCEV = SE.getConstant(PtrIntTy, ElementSize);
-      const SCEV *IndexBaseExt = SE.getTruncateOrSignExtend(IndexBase, PtrIntTy);
-      IndexBaseSized = SE.getMulExpr(IndexBaseExt, ElemSizeSCEV);
-    }
-    
-    // Now add to the pointer - use getAddExpr for pointer arithmetic
-    BaseSCEV = SE.getAddExpr(BasePtrSCEV, IndexBaseSized);
-  }
+  // For the stream descriptor, we use ONLY the base pointer, not the initial offset
+  // The loop descriptor already describes how the induction variable evolves
+  // (e.g., i starts at N+M, ends at N+M*2, step=2)
+  // The hardware will compute: Address = StreamBase + (CurrentIV - StartIV) * Stride
+  // 
+  // Example: for (i = N+M; i < N+M*2; i+=2) A[i] = ...
+  //   Loop: start=N+M, end=N+M*2, step=2
+  //   Stream: base=A, stride=8 (assuming int)
+  //   Hardware computes: A + (i - (N+M)) * 4 = A[i] correctly
+  //
+  // If we included IndexBase in the stream base, we'd have:
+  //   Stream: base=A+(N+M)*4, which is redundant and creates extra link variables
+  const SCEV *BaseSCEV = BasePtrSCEV;
   
   // Create direct stream descriptor
   DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
@@ -563,23 +604,14 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   DS.IsBaseLinked = isValueDynamic(BaseSCEV);
   DS.MemInst = MemInst;
   
-  // Check if base is dynamic
+  // Check if base is dynamic (i.e., if the array pointer itself is dynamic)
+  // We only care if the pointer is a function argument or other runtime value
   if (DS.IsBaseLinked) {
-    // Extract ALL dynamic values from the base expression
-    SmallVector<Value *, 4> DynamicValues;
-    extractAllDynamicValues(BaseSCEV, DynamicValues);
-    
-    // Create link variables for all dynamic values
-    for (Value *V : DynamicValues) {
-      Type *VTy = V->getType();
-      unsigned Size = VTy->isPointerTy() ? 8 : getTypeSizeInBytes(VTy);
-      getOrCreateLinkID(V, Size);
-    }
-    
-    // Set the primary base value (for backwards compatibility)
-    DS.BaseAddressValue = extractDynamicValue(BaseSCEV);
+    DS.BaseAddressValue = extractDynamicValue(BaseSCEV, L);
     if (DS.BaseAddressValue) {
-      DS.LinkID = ValueToLinkIDMap[DS.BaseAddressValue];
+      Type *BaseTy = DS.BaseAddressValue->getType();
+      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+      DS.LinkID = getOrCreateLinkID(DS.BaseAddressValue, Size);
       ++NumDynamicBases;
     }
   }
@@ -749,41 +781,145 @@ bool InterStellarStreamAnalyzer::isValueDynamic(const SCEV *S) {
   return HasDynamic;
 }
 
-Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S) {
-  // Extract the underlying IR Value from SCEVUnknown
+Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {
+  // Strategy: For a dynamic SCEV expression like (N+M), find the instruction
+  // that computes this value. This instruction will be materialized into a
+  // register during code generation.
+  
+  // Unwrap any cast expressions
+  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
+    S = Cast->getOperand();
+  }
+  
+  // If it's a simple unknown (single variable), return it directly
   if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(S)) {
     return Unknown->getValue();
   }
   
-  // For composite expressions, try to find the base unknown value
+  // For composite expressions (e.g., N+M, i*j), we need to find the instruction
+  // that computes this expression. Search in loop preheader and header.
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Header = L->getHeader();
+  
+  // Lambda to search for an instruction whose SCEV matches or contains the target
+  auto findMatchingInstruction = [&](BasicBlock *BB, const SCEV *Target) -> Value * {
+    if (!BB) return nullptr;
+    for (Instruction &I : *BB) {
+      // Skip PHI nodes in header (they're induction variables)
+      if (isa<PHINode>(I) && BB == Header)
+        continue;
+      
+      // Skip instructions with non-SCEVable types (void, i1, etc.)
+      if (!SE.isSCEVable(I.getType()))
+        continue;
+      
+      const SCEV *InstSCEV = SE.getSCEV(&I);
+      
+      // Unwrap casts from InstSCEV for comparison
+      while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(InstSCEV)) {
+        InstSCEV = Cast->getOperand();
+      }
+      
+      if (InstSCEV == Target) {
+        LLVM_DEBUG(dbgs() << "  Found instruction for SCEV: " << I << "\n");
+        return &I;
+      }
+    }
+    return nullptr;
+  };
+  
+  // Try to find an instruction computing the exact SCEV
+  if (Value *V = findMatchingInstruction(Preheader, S))
+    return V;
+  if (Value *V = findMatchingInstruction(Header, S))
+    return V;
+  
+  // If the SCEV is complex (contains constants, casts, etc.), try to find
+  // the "core" dynamic expression within it.
+  // For example, from "(1 + (2 * ((1 smax (N+M)) /u 2)))", extract "(N+M)"
+  
+  // Recursively search for SCEVAddExpr or SCEVMulExpr containing only dynamic values
+  std::function<const SCEV*(const SCEV*)> findDynamicCore = [&](const SCEV *Current) -> const SCEV* {
+    // If it's a simple unknown, that's a dynamic value
+    if (isa<SCEVUnknown>(Current))
+      return Current;
+    
+    // For Add/Mul expressions, check if they contain multiple dynamic operands
+    if (const SCEVAddExpr *Add = dyn_cast<SCEVAddExpr>(Current)) {
+      // Count dynamic operands
+      SmallVector<const SCEV *, 4> DynamicOps;
+      for (const SCEV *Op : Add->operands()) {
+        while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Op))
+          Op = Cast->getOperand();
+        if (isa<SCEVUnknown>(Op))
+          DynamicOps.push_back(Op);
+      }
+      
+      // If we have multiple dynamic operands (e.g., N+M), this is our target
+      if (DynamicOps.size() >= 2) {
+        // Try to find an instruction computing this Add expression
+        if (Value *V = findMatchingInstruction(Preheader, Add))
+          return SE.getSCEV(V);
+        if (Value *V = findMatchingInstruction(Header, Add))
+          return SE.getSCEV(V);
+      }
+    }
+    
+    // Recursively search operands
+    if (const SCEVNAryExpr *NAry = dyn_cast<SCEVNAryExpr>(Current)) {
+      for (const SCEV *Op : NAry->operands()) {
+        if (const SCEV *Core = findDynamicCore(Op))
+          return Core;
+      }
+    } else if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Current)) {
+      return findDynamicCore(Cast->getOperand());
+    } else if (const SCEVUDivExpr *UDiv = dyn_cast<SCEVUDivExpr>(Current)) {
+      if (const SCEV *Core = findDynamicCore(UDiv->getLHS()))
+        return Core;
+      if (const SCEV *Core = findDynamicCore(UDiv->getRHS()))
+        return Core;
+    }
+    
+    return nullptr;
+  };
+  
+  // Try to find the core dynamic expression
+  if (const SCEV *Core = findDynamicCore(S)) {
+    if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(Core))
+      return U->getValue();
+    
+    // Try to find an instruction computing this core expression
+    if (Value *V = findMatchingInstruction(Preheader, Core))
+      return V;
+    if (Value *V = findMatchingInstruction(Header, Core))
+      return V;
+  }
+  
+  // If we still can't find it, fall back to extracting the first
+  // dynamic operand (leaf value). This is suboptimal but prevents crashes.
+  LLVM_DEBUG(dbgs() << "  Warning: Could not find instruction for SCEV, "
+                    << "falling back to leaf value extraction\n");
+  
   if (const SCEVAddExpr *Add = dyn_cast<SCEVAddExpr>(S)) {
     for (const SCEV *Op : Add->operands()) {
-      if (Value *V = extractDynamicValue(Op)) {
+      if (Value *V = extractDynamicValue(Op, L))
         return V;
-      }
     }
   } else if (const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(S)) {
     for (const SCEV *Op : Mul->operands()) {
-      if (Value *V = extractDynamicValue(Op)) {
+      if (Value *V = extractDynamicValue(Op, L))
         return V;
-      }
     }
   } else if (const SCEVSMaxExpr *SMax = dyn_cast<SCEVSMaxExpr>(S)) {
-    // For smax(a, b), extract the dynamic operand
     for (const SCEV *Op : SMax->operands()) {
-      if (Value *V = extractDynamicValue(Op)) {
+      if (Value *V = extractDynamicValue(Op, L))
         return V;
-      }
     }
   } else if (const SCEVUMaxExpr *UMax = dyn_cast<SCEVUMaxExpr>(S)) {
-    // For umax(a, b), extract the dynamic operand
     for (const SCEV *Op : UMax->operands()) {
-      if (Value *V = extractDynamicValue(Op)) {
+      if (Value *V = extractDynamicValue(Op, L))
         return V;
-      }
     }
-  } else if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
-    return extractDynamicValue(Cast->getOperand());
   }
   
   return nullptr;
