@@ -754,9 +754,17 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   IndirectStreams.push_back(IDS);
   InstToStreamIDMap[MemInst] = IDS.StreamID;
   
-  // Also map the IndexLoad to this stream for recursive chaining
-  // This allows A[B[C[i]]] patterns where B's load drives A's indirect access
-  InstToStreamIDMap[IndexLoad] = IDS.StreamID;
+  // IMPORTANT: Do NOT map IndexLoad here!
+  // The IndexLoad is already mapped to its own stream (either direct or indirect).
+  // Overwriting it would break shared-index patterns like:
+  //   A[B[i]] and C[B[i]] - both should use the same B[i] stream
+  // And would also break nested patterns like:
+  //   A[B[C[i]]] - C[i] should stay mapped to its direct stream, not B's indirect stream
+  //
+  // The recursive chaining works because:
+  // 1. Each load instruction gets analyzed and mapped to its own stream
+  // 2. When analyzing a dependent access, we look up the load's existing mapping
+  // 3. We don't need to (and shouldn't) overwrite that mapping
   
   LLVM_DEBUG({
     dbgs() << "  Found Indirect Stream:\n";
