@@ -702,17 +702,81 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   LLVM_DEBUG(dbgs() << "    GEP Index: " << *Index << "\n");
   
   // Step 3: Check if the index comes from a LoadInst
-  // Handle casts and other simple operations that might wrap the load
+  // We need to trace through:
+  // - Casts (sext, zext, trunc, bitcast)
+  // - Arithmetic operations (add, sub, mul, div, shl, shr, etc.)
+  // to find the underlying LoadInst that provides the base index value
+  //
+  // Example: A[B[C[i] + 1] * 2]
+  //   Index = mul (add (load C[i]), 1), 2
+  //   We need to find the "load C[i]" buried inside
+  
   Value *IndexSource = Index;
+  LoadInst *IndexLoad = nullptr;
+  SmallPtrSet<Value *, 8> Visited;
   
-  // Unwrap casts (sext, zext, trunc)
-  while (CastInst *Cast = dyn_cast<CastInst>(IndexSource)) {
-    IndexSource = Cast->getOperand(0);
-  }
+  // Helper function to recursively search for a LoadInst
+  std::function<LoadInst*(Value*)> findIndexLoad = [&](Value *V) -> LoadInst* {
+    if (!V || !Visited.insert(V).second) {
+      return nullptr;  // Already visited or null
+    }
+    
+    // Found a load - this is our index source
+    if (LoadInst *Load = dyn_cast<LoadInst>(V)) {
+      return Load;
+    }
+    
+    // Unwrap casts
+    if (CastInst *Cast = dyn_cast<CastInst>(V)) {
+      return findIndexLoad(Cast->getOperand(0));
+    }
+    
+    // Unwrap binary operations (add, mul, sub, etc.)
+    // For operations like (C[i] + 1) or (B[idx1] * 2), we want to find
+    // the load instruction that provides the dynamic index value
+    if (BinaryOperator *BinOp = dyn_cast<BinaryOperator>(V)) {
+      // Try both operands - prioritize non-constant operands
+      for (unsigned i = 0; i < BinOp->getNumOperands(); ++i) {
+        Value *Operand = BinOp->getOperand(i);
+        
+        // Skip constants - they don't provide index streams
+        if (isa<Constant>(Operand)) {
+          continue;
+        }
+        
+        // Recursively search this operand
+        if (LoadInst *Load = findIndexLoad(Operand)) {
+          return Load;
+        }
+      }
+    }
+    
+    // Unwrap select instructions (for conditional indexing)
+    if (SelectInst *Select = dyn_cast<SelectInst>(V)) {
+      // Try the true value first, then false value
+      if (LoadInst *Load = findIndexLoad(Select->getTrueValue())) {
+        return Load;
+      }
+      return findIndexLoad(Select->getFalseValue());
+    }
+    
+    // Unwrap phi nodes (for complex control flow)
+    if (PHINode *Phi = dyn_cast<PHINode>(V)) {
+      // Try all incoming values
+      for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
+        if (LoadInst *Load = findIndexLoad(Phi->getIncomingValue(i))) {
+          return Load;
+        }
+      }
+    }
+    
+    return nullptr;
+  };
   
-  LoadInst *IndexLoad = dyn_cast<LoadInst>(IndexSource);
+  IndexLoad = findIndexLoad(IndexSource);
+  
   if (!IndexLoad) {
-    LLVM_DEBUG(dbgs() << "    Index is not (directly) from a LoadInst\n");
+    LLVM_DEBUG(dbgs() << "    Index does not contain a LoadInst from a stream\n");
     return false;
   }
   
