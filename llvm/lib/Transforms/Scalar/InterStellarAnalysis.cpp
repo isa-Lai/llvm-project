@@ -105,6 +105,8 @@ private:
   void analyzeLoop(Loop *L);
   void analyzeMemoryAccess(Instruction *I, Loop *L);
   bool tryAnalyzeDirectStream(Value *Ptr, Instruction *MemInst, Loop *L);
+  bool tryAnalyzeIndirectStream(Value *Ptr, Instruction *MemInst, Loop *L);
+  std::optional<unsigned> getStreamSource(Value *V, Loop *L);
   Value *traceIndexThroughLoads(Value *Index, Loop *L);
   unsigned getOrCreateLoopID(Loop *L);
   unsigned getOrCreateLinkID(Value *V, unsigned SizeInBytes);
@@ -190,6 +192,12 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
       LLVM_DEBUG(dbgs() << "  getInductionVariable() returned null, scanning header PHIs\n");
       BasicBlock *Header = L->getHeader();
       for (PHINode &Phi : Header->phis()) {
+        // Only analyze PHI nodes with SCEVable types (integer types)
+        if (!SE.isSCEVable(Phi.getType())) {
+          LLVM_DEBUG(dbgs() << "    Skipping non-SCEVable PHI: " << Phi << "\n");
+          continue;
+        }
+        
         const SCEV *PhiSCEV = SE.getSCEV(&Phi);
         if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PhiSCEV)) {
           if (AR->getLoop() == L && AR->isAffine()) {
@@ -354,8 +362,13 @@ void InterStellarStreamAnalyzer::analyzeMemoryAccess(Instruction *I, Loop *L) {
   if (!Ptr)
     return;
   
-  // Try to analyze as a direct stream
-  tryAnalyzeDirectStream(Ptr, I, L);
+  // Try to analyze as a direct stream first
+  if (tryAnalyzeDirectStream(Ptr, I, L)) {
+    return;  // Successfully identified as direct stream
+  }
+  
+  // If not a direct stream, try indirect stream analysis
+  tryAnalyzeIndirectStream(Ptr, I, L);
 }
 
 bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
@@ -635,6 +648,189 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   });
   
   return true;
+}
+
+bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
+                                                           Instruction *MemInst,
+                                                           Loop *L) {
+  // Indirect Stream Analysis: Detect patterns like A[B[i]], A[B[C[i]]], etc.
+  //
+  // Algorithm:
+  // 1. Check if Ptr is a GEP (GetElementPtr) instruction
+  // 2. Extract the index operand from the GEP
+  // 3. Check if the index comes from a LoadInst (this is the "B[i]" part)
+  // 4. Determine if that LoadInst is part of a known stream (direct or indirect)
+  // 5. If yes, create an indirect stream descriptor linking to the index stream
+  //
+  // Example: A[B[i]]
+  //   - B[i] is detected as a direct stream (Stream #1)
+  //   - When analyzing A[...], we see the index is "Load from B[i]"
+  //   - We create an indirect stream (Stream #2) with BaseStreamID = 1
+  //
+  // Example: A[B[C[i]]] (nested/chained indirect)
+  //   - C[i] is detected as direct stream #1
+  //   - B[...] index is "Load from C[i]", so B becomes indirect stream #2 (driven by #1)
+  //   - A[...] index is "Load from B[...]", so A becomes indirect stream #3 (driven by #2)
+  
+  LLVM_DEBUG(dbgs() << "  Trying indirect stream analysis for: " << *MemInst << "\n");
+  
+  // Step 1: Check if Ptr is a GEP
+  GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+  if (!GEP) {
+    LLVM_DEBUG(dbgs() << "    Not a GEP instruction\n");
+    return false;
+  }
+  
+  // Step 2: Extract the index operand(s)
+  // For simple arrays: GEP has one index
+  // For multi-dimensional: GEP might have multiple indices
+  // We focus on the last index which represents the actual array subscript
+  if (GEP->getNumIndices() == 0) {
+    LLVM_DEBUG(dbgs() << "    GEP has no indices\n");
+    return false;
+  }
+  
+  Value *Index = nullptr;
+  for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
+    Index = IdxIt->get(); // Get the last index
+  }
+  
+  if (!Index) {
+    return false;
+  }
+  
+  LLVM_DEBUG(dbgs() << "    GEP Index: " << *Index << "\n");
+  
+  // Step 3: Check if the index comes from a LoadInst
+  // Handle casts and other simple operations that might wrap the load
+  Value *IndexSource = Index;
+  
+  // Unwrap casts (sext, zext, trunc)
+  while (CastInst *Cast = dyn_cast<CastInst>(IndexSource)) {
+    IndexSource = Cast->getOperand(0);
+  }
+  
+  LoadInst *IndexLoad = dyn_cast<LoadInst>(IndexSource);
+  if (!IndexLoad) {
+    LLVM_DEBUG(dbgs() << "    Index is not (directly) from a LoadInst\n");
+    return false;
+  }
+  
+  LLVM_DEBUG(dbgs() << "    Found index load: " << *IndexLoad << "\n");
+  
+  // Step 4: Check if this LoadInst corresponds to a known stream
+  // The load's pointer operand should be part of a direct or indirect stream
+  std::optional<unsigned> SourceStreamID = getStreamSource(IndexLoad, L);
+  
+  if (!SourceStreamID) {
+    LLVM_DEBUG(dbgs() << "    Index load is not from a known stream\n");
+    return false;
+  }
+  
+  LLVM_DEBUG(dbgs() << "    Index comes from Stream ID: " << *SourceStreamID << "\n");
+  
+  // Step 5: Create indirect stream descriptor
+  Value *BasePtr = GEP->getPointerOperand();
+  const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
+  
+  IndirectStreamDescriptor IDS;
+  IDS.StreamID = NextStreamID++;
+  IDS.LoopID = getOrCreateLoopID(L);
+  IDS.BaseStreamID = *SourceStreamID;
+  IDS.BaseAddress = BaseSCEV;
+  IDS.IsBaseLinked = isValueDynamic(BaseSCEV);
+  IDS.MemInst = MemInst;
+  
+  // Handle dynamic base address (e.g., A is a function parameter)
+  if (IDS.IsBaseLinked) {
+    IDS.BaseAddressValue = extractDynamicValue(BaseSCEV, L);
+    if (IDS.BaseAddressValue) {
+      Type *BaseTy = IDS.BaseAddressValue->getType();
+      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+      IDS.LinkID = getOrCreateLinkID(IDS.BaseAddressValue, Size);
+    }
+  }
+  
+  IndirectStreams.push_back(IDS);
+  InstToStreamIDMap[MemInst] = IDS.StreamID;
+  
+  // Also map the IndexLoad to this stream for recursive chaining
+  // This allows A[B[C[i]]] patterns where B's load drives A's indirect access
+  InstToStreamIDMap[IndexLoad] = IDS.StreamID;
+  
+  LLVM_DEBUG({
+    dbgs() << "  Found Indirect Stream:\n";
+    dbgs() << "    Stream ID: " << IDS.StreamID << "\n";
+    dbgs() << "    Loop ID: " << IDS.LoopID << "\n";
+    dbgs() << "    Base Address: " << *BaseSCEV << "\n";
+    dbgs() << "    Base Linked: " << IDS.IsBaseLinked << "\n";
+    dbgs() << "    Driven by Stream: " << IDS.BaseStreamID << "\n";
+    dbgs() << "    Source Instruction: " << *MemInst << "\n";
+  });
+  
+  return true;
+}
+
+std::optional<unsigned> InterStellarStreamAnalyzer::getStreamSource(Value *V, Loop *L) {
+  // Check if the given value (instruction) is part of a known stream
+  //
+  // This is used for recursive indirect stream detection:
+  // - Direct check: Is this instruction in our InstToStreamIDMap?
+  // - Recursive check: If it's a LoadInst, is its pointer from a stream?
+  //
+  // Example: For A[B[C[i]]]
+  //   - getStreamSource(load C[i]) returns Stream #1 (direct)
+  //   - getStreamSource(load B[...]) returns Stream #2 (indirect, from #1)
+  //   - getStreamSource(load A[...]) returns Stream #3 (indirect, from #2)
+  
+  if (!V || !isa<Instruction>(V)) {
+    return std::nullopt;
+  }
+  
+  Instruction *I = cast<Instruction>(V);
+  
+  // Direct check: Is this instruction already mapped to a stream?
+  auto It = InstToStreamIDMap.find(I);
+  if (It != InstToStreamIDMap.end()) {
+    return It->second;
+  }
+  
+  // Recursive check: If this is a LoadInst, check if its pointer comes from a stream
+  if (LoadInst *Load = dyn_cast<LoadInst>(I)) {
+    Value *Ptr = Load->getPointerOperand();
+    
+    // Check if the pointer is a GEP
+    if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+      // Get the index of this GEP
+      if (GEP->getNumIndices() > 0) {
+        Value *Index = nullptr;
+        for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
+          Index = IdxIt->get();
+        }
+        
+        if (Index) {
+          // Unwrap casts
+          while (CastInst *Cast = dyn_cast<CastInst>(Index)) {
+            Index = Cast->getOperand(0);
+          }
+          
+          // Check if the index is from another load (indirect pattern)
+          if (Instruction *IndexInst = dyn_cast<Instruction>(Index)) {
+            // Recursively check if this index instruction is from a stream
+            std::optional<unsigned> SourceStreamID = getStreamSource(IndexInst, L);
+            if (SourceStreamID) {
+              // This load is indirectly accessing via another stream
+              // We should create an indirect stream descriptor for it
+              // But we're in a query function, so just return that we found a source
+              return SourceStreamID;
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  return std::nullopt;
 }
 
 Value *InterStellarStreamAnalyzer::traceIndexThroughLoads(Value *Index, Loop *L) {
@@ -1055,6 +1251,36 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
       // Source instruction
       if (DS.MemInst) {
         OS << "  └─ Source:       " << *DS.MemInst << "\n";
+      }
+      OS << "\n";
+    }
+  }
+  
+  if (!IndirectStreams.empty()) {
+    OS << "  Indirect Streams (Index-Based Access Patterns like A[B[i]]):\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    for (const auto &IDS : IndirectStreams) {
+      OS << "Stream ID: " << IDS.StreamID << " (Loop " << IDS.LoopID << ")\n";
+      
+      // Base Address
+      OS << "  ├─ Base Address:   " << *IDS.BaseAddress;
+      if (IDS.IsBaseLinked) {
+        OS << "   [BL=1, Dynamic, LinkID=" << IDS.LinkID << "]";
+        if (IDS.BaseAddressValue) {
+          OS << "\n  │                = " << *IDS.BaseAddressValue;
+        }
+      } else {
+        OS << "  [BL=0, Static]";
+      }
+      OS << "\n";
+      
+      // Index Source Stream
+      OS << "  ├─ Index Stream:   Stream #" << IDS.BaseStreamID 
+         << " (indices provided by this stream)\n";
+      
+      // Source instruction
+      if (IDS.MemInst) {
+        OS << "  └─ Source:         " << *IDS.MemInst << "\n";
       }
       OS << "\n";
     }

@@ -46,8 +46,12 @@ struct DirectStreamDescriptor {
 struct IndirectStreamDescriptor {
   unsigned StreamID = 0;
   unsigned LoopID = 0;
-  unsigned BaseStreamID = 0;
-  const SCEV *IndexExpression = nullptr;
+  unsigned BaseStreamID = 0;  // The stream that provides indices
+  const SCEV *BaseAddress = nullptr;  // Base address of the indirectly accessed array
+  Value *BaseAddressValue = nullptr;  // IR Value if base is dynamic
+  bool IsBaseLinked = false;  // Base Linked (BL) flag
+  unsigned LinkID = 0;  // Link Descriptor ID if base is dynamic
+  Instruction *MemInst = nullptr;  // Source load/store instruction
 };
 
 /// Data structure to represent a loop descriptor
