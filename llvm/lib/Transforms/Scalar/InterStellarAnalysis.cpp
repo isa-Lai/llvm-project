@@ -341,7 +341,19 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
   }
   
   // Analyze memory accesses in the loop
+  // CRITICAL: Only analyze blocks that DIRECTLY belong to this loop, not nested sub-loops
+  // For nested loops, L->blocks() returns ALL blocks including nested loops' blocks
+  // This would cause instructions in nested loops to be analyzed multiple times
+  // We use L->getBlocksVector() and filter out blocks that belong to sub-loops
   for (BasicBlock *BB : L->blocks()) {
+    // Skip blocks that belong to a nested sub-loop
+    // Those will be analyzed when we process the nested loop itself
+    Loop *BBLoop = LI.getLoopFor(BB);
+    if (BBLoop != L) {
+      // This block belongs to a more deeply nested loop, skip it
+      continue;
+    }
+    
     for (Instruction &I : *BB) {
       if (isa<LoadInst>(&I) || isa<StoreInst>(&I)) {
         analyzeMemoryAccess(&I, L);
@@ -351,6 +363,15 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
 }
 
 void InterStellarStreamAnalyzer::analyzeMemoryAccess(Instruction *I, Loop *L) {
+  // CRITICAL: Check if this instruction has already been assigned to a stream
+  // Each memory instruction should map to exactly ONE stream
+  // This prevents duplicate stream entries for the same instruction
+  if (InstToStreamIDMap.count(I)) {
+    LLVM_DEBUG(dbgs() << "  Instruction already assigned to stream "
+                      << InstToStreamIDMap[I] << ", skipping: " << *I << "\n");
+    return;
+  }
+  
   Value *Ptr = nullptr;
   
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
@@ -499,6 +520,10 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // Handle add expressions with offsets (e.g., i+2 becomes {start+2, +, step})
   // The SCEV might be: (constant + (sext {start,+,step}))
   // We need to extract the AddRec and account for the constant offset
+  // 
+  // CRITICAL: We must ensure the "offset" is truly loop-invariant.
+  // For array[i + rand()], the SCEV is (rand_result + {0,+,1}), where rand_result
+  // is loop-varying. This is NOT a direct stream - it's a computed/random indirect stream.
   const SCEV *ConstantOffset = nullptr;
   if (const SCEVAddExpr *AddExpr = dyn_cast<SCEVAddExpr>(IndVarSCEV)) {
     // Try to find an AddRec operand in the add expression
@@ -526,14 +551,36 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     }
     
     if (FoundAR) {
-      IndVarSCEV = FoundAR;
-      // Compute the constant offset from other operands
-      if (!OtherOperands.empty()) {
-        if (OtherOperands.size() == 1) {
-          ConstantOffset = OtherOperands[0];
-        } else {
-          ConstantOffset = SE.getAddExpr(OtherOperands);
+      // CRITICAL CHECK: Verify that all non-AddRec operands are loop-invariant
+      // If any operand is loop-varying, this is NOT a simple direct stream
+      // Example: array[i + rand()] has SCEV: (rand() + {0,+,1})
+      // rand() is loop-varying, so this is a computed/random indirect access
+      bool AllOperandsInvariant = true;
+      for (const SCEV *Op : OtherOperands) {
+        if (!SE.isLoopInvariant(Op, L)) {
+          AllOperandsInvariant = false;
+          LLVM_DEBUG({
+            dbgs() << "  Index has loop-varying non-affine component: " << *Op << "\n";
+            dbgs() << "  This is NOT a direct stream (computed/random access)\n";
+          });
+          break;
         }
+      }
+      
+      if (AllOperandsInvariant) {
+        IndVarSCEV = FoundAR;
+        // Compute the constant offset from other operands
+        if (!OtherOperands.empty()) {
+          if (OtherOperands.size() == 1) {
+            ConstantOffset = OtherOperands[0];
+          } else {
+            ConstantOffset = SE.getAddExpr(OtherOperands);
+          }
+        }
+      } else {
+        // Loop-varying non-affine component detected
+        // Do NOT treat as direct stream - return false so indirect analysis can handle it
+        return false;
       }
     }
   }
@@ -775,23 +822,58 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   
   IndexLoad = findIndexLoad(IndexSource);
   
-  if (!IndexLoad) {
-    LLVM_DEBUG(dbgs() << "    Index does not contain a LoadInst from a stream\n");
-    return false;
+  // Step 4: Determine index source type
+  // Case 1: Index comes from a LoadInst (stream-based indirect)
+  // Case 2: Index is computed/random (computed indirect)
+  
+  bool IsIndexFromStream = false;
+  unsigned SourceStreamID = 0;
+  
+  if (IndexLoad) {
+    // Found a load - check if it's from a known stream
+    LLVM_DEBUG(dbgs() << "    Found index load: " << *IndexLoad << "\n");
+    
+    std::optional<unsigned> StreamID = getStreamSource(IndexLoad, L);
+    if (StreamID) {
+      IsIndexFromStream = true;
+      SourceStreamID = *StreamID;
+      LLVM_DEBUG(dbgs() << "    Index comes from Stream ID: " << SourceStreamID << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "    Index load is not from a known stream\n");
+    }
   }
   
-  LLVM_DEBUG(dbgs() << "    Found index load: " << *IndexLoad << "\n");
-  
-  // Step 4: Check if this LoadInst corresponds to a known stream
-  // The load's pointer operand should be part of a direct or indirect stream
-  std::optional<unsigned> SourceStreamID = getStreamSource(IndexLoad, L);
-  
-  if (!SourceStreamID) {
-    LLVM_DEBUG(dbgs() << "    Index load is not from a known stream\n");
-    return false;
+  // If we didn't find a stream-based index, check if it's a computed/irregular index
+  // This handles cases like: array[rand()], array[f(i)], array[i + rand()], etc.
+  if (!IsIndexFromStream) {
+    // Check if the index is NOT affine (i.e., not a direct stream pattern)
+    const SCEV *IndexSCEV = SE.getSCEV(Index);
+    
+    // If it's an AddRec for this loop, it would have been detected as direct stream
+    // So if we're here and it's not affine, it's a computed/irregular access
+    if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndexSCEV)) {
+      if (AR->getLoop() == L && AR->isAffine()) {
+        // This should have been caught as direct stream, skip
+        LLVM_DEBUG(dbgs() << "    Index is affine AddRec, should be direct stream\n");
+        return false;
+      }
+    }
+    
+    // Check if the index has loop-varying components (i.e., depends on loop variable)
+    // If it's loop-invariant, it's just a constant index access, not interesting
+    if (!SE.isLoopInvariant(IndexSCEV, L)) {
+      // Index is loop-varying but not affine and not from a stream
+      // This is a computed/irregular indirect access!
+      LLVM_DEBUG(dbgs() << "    Index is computed/irregular (loop-varying, non-affine, no stream)\n");
+      IsIndexFromStream = false;  // Mark as computed indirect
+      SourceStreamID = 0;  // No source stream
+    } else {
+      // Loop-invariant index - probably a constant or parameter
+      // Not an interesting indirect pattern
+      LLVM_DEBUG(dbgs() << "    Index is loop-invariant, not an indirect stream\n");
+      return false;
+    }
   }
-  
-  LLVM_DEBUG(dbgs() << "    Index comes from Stream ID: " << *SourceStreamID << "\n");
   
   // Step 5: Create indirect stream descriptor
   Value *BasePtr = GEP->getPointerOperand();
@@ -800,10 +882,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   IndirectStreamDescriptor IDS;
   IDS.StreamID = NextStreamID++;
   IDS.LoopID = getOrCreateLoopID(L);
-  IDS.BaseStreamID = *SourceStreamID;
+  IDS.BaseStreamID = SourceStreamID;  // 0 if computed/random index
   IDS.BaseAddress = BaseSCEV;
   IDS.IsBaseLinked = isValueDynamic(BaseSCEV);
   IDS.MemInst = MemInst;
+  IDS.IsIndexComputed = !IsIndexFromStream;  // True for computed/random indices
   
   // Handle dynamic base address (e.g., A is a function parameter)
   if (IDS.IsBaseLinked) {
@@ -836,7 +919,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
     dbgs() << "    Loop ID: " << IDS.LoopID << "\n";
     dbgs() << "    Base Address: " << *BaseSCEV << "\n";
     dbgs() << "    Base Linked: " << IDS.IsBaseLinked << "\n";
-    dbgs() << "    Driven by Stream: " << IDS.BaseStreamID << "\n";
+    if (IDS.IsIndexComputed) {
+      dbgs() << "    Index Type: Computed/Random (no stream dependency)\n";
+    } else {
+      dbgs() << "    Driven by Stream: " << IDS.BaseStreamID << "\n";
+    }
     dbgs() << "    Source Instruction: " << *MemInst << "\n";
   });
   
@@ -1346,9 +1433,13 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
       }
       OS << "\n";
       
-      // Index Source Stream
-      OS << "  ├─ Index Stream:   Stream #" << IDS.BaseStreamID 
-         << " (indices provided by this stream)\n";
+      // Index Source Stream or Computed
+      if (IDS.IsIndexComputed) {
+        OS << "  ├─ Index Type:     COMPUTED/RANDOM (no stream dependency)\n";
+      } else {
+        OS << "  ├─ Index Stream:   Stream #" << IDS.BaseStreamID 
+           << " (indices provided by this stream)\n";
+      }
       
       // Source instruction
       if (IDS.MemInst) {
@@ -1398,6 +1489,9 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
   // Print results only in LLVM debugger
   LLVM_DEBUG(Analyzer.print(dbgs()));
   
+  // Also print to standard output for easier testing
+  Analyzer.print(errs());
+  
   // This is an analysis pass, it doesn't modify the IR
   return PreservedAnalyses::all();
 }
@@ -1430,6 +1524,9 @@ bool InterStellarAnalysisLegacyPass::runOnFunction(Function &F) {
   Analyzer.analyze();
   
   LLVM_DEBUG(Analyzer.print(dbgs()));
+  
+  // Also print to standard output for easier testing
+  Analyzer.print(errs());
   
   // Analysis pass doesn't modify IR
   return false;
