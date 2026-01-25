@@ -7,21 +7,14 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// This file implements the InterStellar stream analysis pass that identifies
-/// memory access patterns in loops for hardware-accelerated prefetching.
+/// Implements the InterStellar stream analysis pass that identifies memory
+/// access patterns in loops for hardware-accelerated prefetching.
 ///
-/// The pass performs the following analyses:
-/// 1. Identifies direct streams: affine memory accesses with constant stride
-///    (e.g., A[i] where i increments by 1)
-/// 2. Detects dynamic base addresses that require link variable descriptors
-/// 3. Analyzes loop bounds and nesting structure
-/// 4. Future: Indirect streams and chained memory accesses
-///
-/// Implementation Strategy:
-/// - Use LoopInfo to iterate through loops (innermost first for precision)
-/// - Use ScalarEvolution to analyze memory access patterns via SCEV
-/// - Identify SCEVAddRecExpr for affine recurrences (base + i * stride)
-/// - Distinguish between static (compile-time) and dynamic (runtime) values
+/// Analysis capabilities:
+/// 1. Direct streams: Affine memory accesses with constant stride (e.g., A[i])
+/// 2. Indirect streams: Index-based accesses (e.g., A[B[i]], A[B[C[i]]])
+/// 3. Dynamic values: Runtime-determined bases and loop bounds (link variables)
+/// 4. Loop nesting: Parent-child loop relationships
 ///
 //===----------------------------------------------------------------------===//
 
@@ -49,15 +42,12 @@ STATISTIC(NumLoopsAnalyzed, "Number of loops analyzed");
 
 namespace {
 
-/// InterStellar Stream Analyzer Implementation
-/// This class contains the actual analysis logic and maintains state
-/// for stream and loop descriptors across the function analysis.
+/// Core stream analyzer - identifies memory access patterns and generates
+/// hardware descriptors for direct/indirect streams, loops, and link variables.
 class InterStellarStreamAnalyzer {
 public:
-  InterStellarStreamAnalyzer(Function &F, LoopInfo &LI, ScalarEvolution &SE,
-                             DominatorTree &DT)
-      : F(F), LI(LI), SE(SE), DT(DT), NextStreamID(0), NextLoopID(0),
-        NextLinkID(0) {}
+  InterStellarStreamAnalyzer(Function &F, LoopInfo &LI, ScalarEvolution &SE)
+      : F(F), LI(LI), SE(SE), NextStreamID(0), NextLoopID(0), NextLinkID(0) {}
   
   /// Run the analysis on the function
   bool analyze();
@@ -83,7 +73,6 @@ private:
   Function &F;
   LoopInfo &LI;
   ScalarEvolution &SE;
-  DominatorTree &DT;
   
   // Analysis results
   SmallVector<DirectStreamDescriptor, 8> DirectStreams;
@@ -114,6 +103,8 @@ private:
   Value *extractDynamicValue(const SCEV *S, Loop *L);
   void extractAllDynamicValues(const SCEV *S, SmallVectorImpl<Value *> &Values);
   int64_t getTypeSizeInBytes(Type *Ty);
+  void createDirectStream(const SCEV *Base, int64_t Stride, Loop *L, 
+                         Instruction *MemInst, int64_t ConstantOffset = 0);
 };
 
 bool InterStellarStreamAnalyzer::analyze() {
@@ -141,12 +132,11 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
   LLVM_DEBUG(dbgs() << "Analyzing loop: " << *L->getHeader() << "\n");
   ++NumLoopsAnalyzed;
   
-  // Create loop descriptor
   unsigned LoopID = getOrCreateLoopID(L);
   
-  // Strategy: Try multiple approaches to extract loop bounds
-  // 1. Use getBounds() if available (works for well-formed loops)
-  // 2. Fall back to getInductionVariable() + manual SCEV analysis
+  // Try multiple approaches to extract loop bounds:
+  // 1. getBounds() API (works for well-formed loops)
+  // 2. Fallback to getInductionVariable() + manual SCEV analysis
   
   LoopDescriptor LD;  // All fields auto-initialized to defaults
   LD.LoopID = LoopID;
@@ -363,9 +353,7 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
 }
 
 void InterStellarStreamAnalyzer::analyzeMemoryAccess(Instruction *I, Loop *L) {
-  // CRITICAL: Check if this instruction has already been assigned to a stream
-  // Each memory instruction should map to exactly ONE stream
-  // This prevents duplicate stream entries for the same instruction
+  // Prevent duplicate stream entries - each instruction maps to exactly one stream
   if (InstToStreamIDMap.count(I)) {
     LLVM_DEBUG(dbgs() << "  Instruction already assigned to stream "
                       << InstToStreamIDMap[I] << ", skipping: " << *I << "\n");
@@ -395,27 +383,16 @@ void InterStellarStreamAnalyzer::analyzeMemoryAccess(Instruction *I, Loop *L) {
 bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
                                                          Instruction *MemInst,
                                                          Loop *L) {
-  // Strategy: Handle both optimized and unoptimized IR
-  // 1. Check if Ptr is a GEP instruction - this is the array indexing
-  // 2. If so, analyze the index operand
-  // 3. Trace the index through loads to find the actual induction variable
-  // 4. Get SCEV of the induction variable to check for AddRec pattern
+  // Detect affine memory access patterns (e.g., A[i] where i increments linearly)
   //
-  // IMPORTANT: For nested loops with access pattern A[i*M + j]:
-  // - The SCEV will be a nested AddRec: {{0,+,M}<%outer>,+,1}<%inner>
-  // - For the inner loop, this IS a direct stream with:
-  //   * Base: the outer AddRec {0,+,M}<%outer> (becomes a link variable)
-  //   * Stride: 1 * element_size
-  // - This allows hardware to prefetch the inner loop's sequential access
-  //   while understanding that the base address changes with each outer iteration
+  // Approach:
+  // 1. Trace through GEP chains to handle constant offsets (e.g., C[i+2])
+  // 2. Check for AddRecExpr in SCEV (optimized code path)
+  // 3. Analyze GEP indices for induction variables (unoptimized code path)
   //
-  // BUG FIX #11: Handle constant offsets in GEP chains
-  // For C[i+2], LLVM optimizer may generate:
-  //   %0 = getelementptr i32, ptr %C, i64 %indvars.iv    ; C + i*4 (AddRec)
-  //   %arrayidx = getelementptr i8, ptr %0, i64 8        ; result + 8 (constant offset)
-  // The final GEP (%arrayidx) is not an AddRec, but it has a constant offset
-  // from an AddRec. We need to trace back through GEP chains to find the
-  // underlying AddRec and incorporate the offset into the base address.
+  // Nested loops: For A[i*M + j], the inner loop sees a direct stream with:
+  //   - Base: outer AddRec {0,+,M}<%outer> (becomes link variable)
+  //   - Stride: 1 * element_size
   
   LLVM_DEBUG({
     dbgs() << "Start analyzeDirectStream on instruction: ";
@@ -426,10 +403,10 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     }
   });
   
-  // BUG FIX #11: Trace through GEP chains to find AddRec with constant offsets
-  // Start with the original Ptr and trace backwards through GEPs
+  // Trace through GEP chains to find AddRec with constant offsets
+  // Handles cases like C[i+2] where optimizer generates chained GEPs
   Value *CurrentPtr = Ptr;
-  int64_t AccumulatedOffset = 0;  // Track constant offset in bytes
+  int64_t AccumulatedOffset = 0;
   
   // Trace back through constant-offset GEPs
   while (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(CurrentPtr)) {
@@ -482,51 +459,8 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     
     int64_t Stride = StepConst->getAPInt().getSExtValue();
     
-    // BUG FIX #11: Apply accumulated constant offset to base address
-    // For C[i+2], base should be (C + 2*sizeof(element))
-    const SCEV *AdjustedBase = Base;
-    if (AccumulatedOffset != 0) {
-      LLVM_DEBUG(dbgs() << "  Applying accumulated offset: " << AccumulatedOffset 
-                        << " bytes to base\n");
-      Type *PtrTy = SE.getEffectiveSCEVType(Base->getType());
-      const SCEV *OffsetSCEV = SE.getConstant(PtrTy, AccumulatedOffset);
-      AdjustedBase = SE.getAddExpr(Base, OffsetSCEV);
-      LLVM_DEBUG(dbgs() << "  Adjusted base: " << *AdjustedBase << "\n");
-    }
-    
-    // Create direct stream descriptor
-    DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
-    DS.StreamID = NextStreamID++;
-    DS.LoopID = getOrCreateLoopID(L);
-    DS.BaseAddress = AdjustedBase;
-    DS.Stride = Stride;
-    DS.IsBaseLinked = isValueDynamic(AdjustedBase);
-    DS.MemInst = MemInst;
-    
-    if (DS.IsBaseLinked) {
-      if (Value *BaseVal = extractDynamicValue(AdjustedBase, L)) {
-        Type *BaseTy = BaseVal->getType();
-        unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
-        DS.LinkID = getOrCreateLinkID(BaseVal, Size);
-        ++NumDynamicBases;
-      }
-    }
-    
-    DirectStreams.push_back(DS);
-    InstToStreamIDMap[MemInst] = DS.StreamID;
-    ++NumDirectStreams;
-    
-    LLVM_DEBUG({
-      dbgs() << "  Found Direct Stream (optimized path):\n";
-      dbgs() << "    Stream ID: " << DS.StreamID << "\n";
-      dbgs() << "    Loop ID: " << DS.LoopID << "\n";
-      dbgs() << "    Base: " << *AdjustedBase << "\n";
-      if (AccumulatedOffset != 0) {
-        dbgs() << "    Constant Offset: " << AccumulatedOffset << " bytes\n";
-      }
-      dbgs() << "    Stride: " << Stride << " bytes\n";
-    });
-    
+    // Use helper method to create stream with accumulated offset
+    createDirectStream(Base, Stride, L, MemInst, AccumulatedOffset);
     return true;
   }
   
@@ -570,12 +504,9 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   }
   
   // Handle add expressions with offsets (e.g., i+2 becomes {start+2, +, step})
-  // The SCEV might be: (constant + (sext {start,+,step}))
-  // We need to extract the AddRec and account for the constant offset
-  // 
-  // CRITICAL: We must ensure the "offset" is truly loop-invariant.
-  // For array[i + rand()], the SCEV is (rand_result + {0,+,1}), where rand_result
-  // is loop-varying. This is NOT a direct stream - it's a computed/random indirect stream.
+  // CRITICAL: Verify all non-AddRec operands are loop-invariant.
+  // For array[i + rand()], the SCEV is (rand_result + {0,+,1}).
+  // Since rand_result is loop-varying, this is NOT a direct stream.
   const SCEV *ConstantOffset = nullptr;
   if (const SCEVAddExpr *AddExpr = dyn_cast<SCEVAddExpr>(IndVarSCEV)) {
     // Try to find an AddRec operand in the add expression
@@ -693,21 +624,12 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // Get base address SCEV - this is the pointer to the array
   const SCEV *BasePtrSCEV = SE.getSCEV(BasePtr);
   
-  // For the stream descriptor, we use ONLY the base pointer, not the initial offset
-  // The loop descriptor already describes how the induction variable evolves
-  // (e.g., i starts at N+M, ends at N+M*2, step=2)
-  // The hardware will compute: Address = StreamBase + (CurrentIV - StartIV) * Stride
-  // 
-  // Example: for (i = N+M; i < N+M*2; i+=2) A[i] = ...
-  //   Loop: start=N+M, end=N+M*2, step=2
-  //   Stream: base=A, stride=8 (assuming int)
-  //   Hardware computes: A + (i - (N+M)) * 4 = A[i] correctly
+  // Note: We use ONLY the base pointer for the stream descriptor.
+  // The loop descriptor already describes how the induction variable evolves.
+  // Hardware computes: Address = StreamBase + (CurrentIV - StartIV) * Stride
   //
-  // If we included IndexBase in the stream base, we'd have:
-  //   Stream: base=A+(N+M)*4, which is redundant and creates extra link variables
-  //
-  // BUG FIX #11: However, for constant offsets (C[i+2]), we SHOULD add the offset
-  // to the base address, since this is not redundant with the loop descriptor.
+  // For constant offsets (C[i+2]), we add the offset to the base address
+  // since this is not redundant with the loop descriptor.
   const SCEV *BaseSCEV = BasePtrSCEV;
   
   // Apply accumulated constant offset from GEP chain tracing
@@ -717,49 +639,17 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     Type *PtrTy = SE.getEffectiveSCEVType(BaseSCEV->getType());
     const SCEV *OffsetSCEV = SE.getConstant(PtrTy, AccumulatedOffset);
     BaseSCEV = SE.getAddExpr(BaseSCEV, OffsetSCEV);
-    LLVM_DEBUG(dbgs() << "  Adjusted base from GEP chain: " << *BaseSCEV << "\n");
   }
   
-  // Create direct stream descriptor
-  DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
-  DS.StreamID = NextStreamID++;
-  DS.LoopID = getOrCreateLoopID(L);
-  DS.BaseAddress = BaseSCEV;
-  DS.Stride = MemoryStride;
-  DS.IsBaseLinked = isValueDynamic(BaseSCEV);
-  DS.MemInst = MemInst;
-  
-  // Check if base is dynamic (i.e., if the array pointer itself is dynamic)
-  // We only care if the pointer is a function argument or other runtime value
-  if (DS.IsBaseLinked) {
-    DS.BaseAddressValue = extractDynamicValue(BaseSCEV, L);
-    if (DS.BaseAddressValue) {
-      Type *BaseTy = DS.BaseAddressValue->getType();
-      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
-      DS.LinkID = getOrCreateLinkID(DS.BaseAddressValue, Size);
-      ++NumDynamicBases;
-    }
-  }
-  
-  DirectStreams.push_back(DS);
-  InstToStreamIDMap[MemInst] = DS.StreamID;
-  ++NumDirectStreams;
+  // Use helper method to create stream
+  createDirectStream(BaseSCEV, MemoryStride, L, MemInst);
   
   LLVM_DEBUG({
-    dbgs() << "  Found Direct Stream (GEP path):\n";
-    dbgs() << "    Stream ID: " << DS.StreamID << "\n";
-    dbgs() << "    Loop ID: " << DS.LoopID << "\n";
-    dbgs() << "    Base: " << *BaseSCEV << "\n";
-    if (AccumulatedOffset != 0) {
-      dbgs() << "    Constant Offset Applied: " << AccumulatedOffset << " bytes\n";
-    }
     if (isa<SCEVAddRecExpr>(IndexBase)) {
       dbgs() << "    Index Base (nested AddRec): " << *IndexBase << "\n";
     }
     dbgs() << "    Element Size: " << ElementSize << " bytes\n";
     dbgs() << "    Index Step: " << IndexStepVal << "\n";
-    dbgs() << "    Memory Stride: " << MemoryStride << " bytes\n";
-    dbgs() << "    Base Linked: " << DS.IsBaseLinked << "\n";
   });
   
   return true;
@@ -768,24 +658,13 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
 bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
                                                            Instruction *MemInst,
                                                            Loop *L) {
-  // Indirect Stream Analysis: Detect patterns like A[B[i]], A[B[C[i]]], etc.
+  // Detect indirect access patterns: A[B[i]], A[B[C[i]]], or computed indices
   //
   // Algorithm:
-  // 1. Check if Ptr is a GEP (GetElementPtr) instruction
-  // 2. Extract the index operand from the GEP
-  // 3. Check if the index comes from a LoadInst (this is the "B[i]" part)
-  // 4. Determine if that LoadInst is part of a known stream (direct or indirect)
-  // 5. If yes, create an indirect stream descriptor linking to the index stream
-  //
-  // Example: A[B[i]]
-  //   - B[i] is detected as a direct stream (Stream #1)
-  //   - When analyzing A[...], we see the index is "Load from B[i]"
-  //   - We create an indirect stream (Stream #2) with BaseStreamID = 1
-  //
-  // Example: A[B[C[i]]] (nested/chained indirect)
-  //   - C[i] is detected as direct stream #1
-  //   - B[...] index is "Load from C[i]", so B becomes indirect stream #2 (driven by #1)
-  //   - A[...] index is "Load from B[...]", so A becomes indirect stream #3 (driven by #2)
+  // 1. Extract GEP index operand
+  // 2. Search for LoadInst providing the index (recursively through casts/ops)
+  // 3. Check if LoadInst is from a known stream (enables chaining)
+  // 4. Create indirect stream descriptor with stream dependency
   
   LLVM_DEBUG(dbgs() << "  Trying indirect stream analysis for: " << *MemInst << "\n");
   
@@ -816,21 +695,13 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   
   LLVM_DEBUG(dbgs() << "    GEP Index: " << *Index << "\n");
   
-  // Step 3: Check if the index comes from a LoadInst
-  // We need to trace through:
-  // - Casts (sext, zext, trunc, bitcast)
-  // - Arithmetic operations (add, sub, mul, div, shl, shr, etc.)
-  // to find the underlying LoadInst that provides the base index value
-  //
-  // Example: A[B[C[i] + 1] * 2]
-  //   Index = mul (add (load C[i]), 1), 2
-  //   We need to find the "load C[i]" buried inside
-  
+  // Search for LoadInst providing the index value
+  // Trace through casts, arithmetic ops, selects, and PHIs
   Value *IndexSource = Index;
   LoadInst *IndexLoad = nullptr;
   SmallPtrSet<Value *, 8> Visited;
   
-  // Helper function to recursively search for a LoadInst
+  // Recursive search for LoadInst in index computation tree
   std::function<LoadInst*(Value*)> findIndexLoad = [&](Value *V) -> LoadInst* {
     if (!V || !Visited.insert(V).second) {
       return nullptr;  // Already visited or null
@@ -999,16 +870,9 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
 }
 
 std::optional<unsigned> InterStellarStreamAnalyzer::getStreamSource(Value *V, Loop *L) {
-  // Check if the given value (instruction) is part of a known stream
-  //
-  // This is used for recursive indirect stream detection:
-  // - Direct check: Is this instruction in our InstToStreamIDMap?
-  // - Recursive check: If it's a LoadInst, is its pointer from a stream?
-  //
-  // Example: For A[B[C[i]]]
-  //   - getStreamSource(load C[i]) returns Stream #1 (direct)
-  //   - getStreamSource(load B[...]) returns Stream #2 (indirect, from #1)
-  //   - getStreamSource(load A[...]) returns Stream #3 (indirect, from #2)
+  // Check if an instruction is part of a known stream (enables recursive chaining)
+  // Direct check: Is instruction in InstToStreamIDMap?
+  // Recursive: If LoadInst, is its pointer from a stream?
   
   if (!V || !isa<Instruction>(V)) {
     return std::nullopt;
@@ -1061,9 +925,8 @@ std::optional<unsigned> InterStellarStreamAnalyzer::getStreamSource(Value *V, Lo
 }
 
 Value *InterStellarStreamAnalyzer::traceIndexThroughLoads(Value *Index, Loop *L) {
-  // Trace through loads, casts, and sign extensions to find the underlying
-  // induction variable (PHI node)
-  // This handles unoptimized IR where loop variables are in stack slots
+  // Trace through loads, casts, and extensions to find the PHI induction variable
+  // Handles unoptimized IR where loop variables are stored in stack slots
   
   Value *Current = Index;
   SmallPtrSet<Value *, 8> Visited;
@@ -1378,6 +1241,56 @@ int64_t InterStellarStreamAnalyzer::getTypeSizeInBytes(Type *Ty) {
   return DL.getTypeStoreSize(Ty).getFixedValue();
 }
 
+void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base, 
+                                                    int64_t Stride, Loop *L,
+                                                    Instruction *MemInst,
+                                                    int64_t ConstantOffset) {
+  // Apply constant offset if present
+  const SCEV *AdjustedBase = Base;
+  if (ConstantOffset != 0) {
+    LLVM_DEBUG(dbgs() << "  Applying constant offset: " << ConstantOffset 
+                      << " bytes to base\n");
+    Type *PtrTy = SE.getEffectiveSCEVType(Base->getType());
+    const SCEV *OffsetSCEV = SE.getConstant(PtrTy, ConstantOffset);
+    AdjustedBase = SE.getAddExpr(Base, OffsetSCEV);
+  }
+  
+  // Create stream descriptor
+  DirectStreamDescriptor DS;
+  DS.StreamID = NextStreamID++;
+  DS.LoopID = getOrCreateLoopID(L);
+  DS.BaseAddress = AdjustedBase;
+  DS.Stride = Stride;
+  DS.IsBaseLinked = isValueDynamic(AdjustedBase);
+  DS.MemInst = MemInst;
+  
+  // Handle dynamic base address
+  if (DS.IsBaseLinked) {
+    if (Value *BaseVal = extractDynamicValue(AdjustedBase, L)) {
+      Type *BaseTy = BaseVal->getType();
+      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+      DS.LinkID = getOrCreateLinkID(BaseVal, Size);
+      ++NumDynamicBases;
+    }
+  }
+  
+  DirectStreams.push_back(DS);
+  InstToStreamIDMap[MemInst] = DS.StreamID;
+  ++NumDirectStreams;
+  
+  LLVM_DEBUG({
+    dbgs() << "  Created Direct Stream:\n";
+    dbgs() << "    Stream ID: " << DS.StreamID << "\n";
+    dbgs() << "    Loop ID: " << DS.LoopID << "\n";
+    dbgs() << "    Base: " << *AdjustedBase << "\n";
+    if (ConstantOffset != 0) {
+      dbgs() << "    Constant Offset: " << ConstantOffset << " bytes\n";
+    }
+    dbgs() << "    Stride: " << Stride << " bytes\n";
+    dbgs() << "    Base Linked: " << DS.IsBaseLinked << "\n";
+  });
+}
+
 void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
   OS << "\n";
   OS << "╔═══════════════════════════════════════════════════════════════╗\n";
@@ -1472,9 +1385,6 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
       // Stride
       OS << "  ├─ Stride:       " << DS.Stride << " bytes\n";
       
-      // Shared flag
-      OS << "  ├─ Shared:       " << (DS.IsShared ? "Yes [S=1]" : "No [S=0]") << "\n";
-      
       // Source instruction
       if (DS.MemInst) {
         OS << "  └─ Source:       " << *DS.MemInst << "\n";
@@ -1540,7 +1450,6 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
                                                  FunctionAnalysisManager &AM) {
   auto &LI = AM.getResult<LoopAnalysis>(F);
   auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   
   // Early exit if no loops
   if (LI.empty()) {
@@ -1551,7 +1460,7 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
                     << F.getName() << "\n");
   
   // Create analyzer and run analysis
-  InterStellarStreamAnalyzer Analyzer(F, LI, SE, DT);
+  InterStellarStreamAnalyzer Analyzer(F, LI, SE);
   Analyzer.analyze();
   
   // Print results only in LLVM debugger
@@ -1582,13 +1491,12 @@ InterStellarAnalysisLegacyPass::InterStellarAnalysisLegacyPass()
 bool InterStellarAnalysisLegacyPass::runOnFunction(Function &F) {
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-  auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   
   if (LI.empty()) {
     return false;
   }
   
-  InterStellarStreamAnalyzer Analyzer(F, LI, SE, DT);
+  InterStellarStreamAnalyzer Analyzer(F, LI, SE);
   Analyzer.analyze();
   
   LLVM_DEBUG(Analyzer.print(dbgs()));
@@ -1604,7 +1512,6 @@ void InterStellarAnalysisLegacyPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
   AU.addRequired<LoopInfoWrapperPass>();
   AU.addRequired<ScalarEvolutionWrapperPass>();
-  AU.addRequired<DominatorTreeWrapperPass>();
 }
 
 void InterStellarAnalysisLegacyPass::print(raw_ostream &OS,
@@ -1616,7 +1523,6 @@ INITIALIZE_PASS_BEGIN(InterStellarAnalysisLegacyPass, "interstellar-analysis",
                       "InterStellar Stream Analysis", false, true)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_END(InterStellarAnalysisLegacyPass, "interstellar-analysis",
                     "InterStellar Stream Analysis", false, true)
 

@@ -37,7 +37,6 @@ struct DirectStreamDescriptor {
   Value *BaseAddressValue = nullptr;
   int64_t Stride = 0;
   bool IsBaseLinked = false;  // Base Linked (BL) flag
-  bool IsShared = false;      // Shared (S) flag - for multi-core
   unsigned LinkID = 0;        // ID of the Link Variable Descriptor if base is dynamic
   Instruction *MemInst = nullptr;
 };
