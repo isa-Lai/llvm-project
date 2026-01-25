@@ -408,6 +408,14 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   //   * Stride: 1 * element_size
   // - This allows hardware to prefetch the inner loop's sequential access
   //   while understanding that the base address changes with each outer iteration
+  //
+  // BUG FIX #11: Handle constant offsets in GEP chains
+  // For C[i+2], LLVM optimizer may generate:
+  //   %0 = getelementptr i32, ptr %C, i64 %indvars.iv    ; C + i*4 (AddRec)
+  //   %arrayidx = getelementptr i8, ptr %0, i64 8        ; result + 8 (constant offset)
+  // The final GEP (%arrayidx) is not an AddRec, but it has a constant offset
+  // from an AddRec. We need to trace back through GEP chains to find the
+  // underlying AddRec and incorporate the offset into the base address.
   
   LLVM_DEBUG({
     dbgs() << "Start analyzeDirectStream on instruction: ";
@@ -418,15 +426,44 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     }
   });
   
-  GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+  // BUG FIX #11: Trace through GEP chains to find AddRec with constant offsets
+  // Start with the original Ptr and trace backwards through GEPs
+  Value *CurrentPtr = Ptr;
+  int64_t AccumulatedOffset = 0;  // Track constant offset in bytes
+  
+  // Trace back through constant-offset GEPs
+  while (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(CurrentPtr)) {
+    // Check if this GEP has constant indices
+    int64_t ThisGEPOffset = 0;
+    
+    // Calculate offset for this GEP
+    APInt OffsetAPInt(64, 0, true);
+    if (GEP->accumulateConstantOffset(F.getDataLayout(), OffsetAPInt)) {
+      // All indices are constant
+      ThisGEPOffset = OffsetAPInt.getSExtValue();
+      AccumulatedOffset += ThisGEPOffset;
+      
+      LLVM_DEBUG(dbgs() << "  Found constant-offset GEP: " << *GEP 
+                        << ", offset=" << ThisGEPOffset << " bytes\n");
+      
+      // Move to the base pointer of this GEP
+      CurrentPtr = GEP->getPointerOperand();
+    } else {
+      // This GEP has non-constant indices - stop tracing
+      break;
+    }
+  }
+  
+  // Now check if CurrentPtr (after tracing) is or contains an AddRec
+  GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(CurrentPtr);
   if (!GEP) {
     // Ptr might be the result of a GEP that's already computed
     // Try to get SCEV directly (optimized code path)
-    const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+    const SCEV *PtrSCEV = SE.getSCEV(CurrentPtr);
     const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
     
     if (!AR) {
-      LLVM_DEBUG(dbgs() << "  Not a GEP and not an AddRec: " << *Ptr << "\n");
+      LLVM_DEBUG(dbgs() << "  Not a GEP and not an AddRec: " << *CurrentPtr << "\n");
       return false;
     }
     
@@ -445,17 +482,29 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     
     int64_t Stride = StepConst->getAPInt().getSExtValue();
     
+    // BUG FIX #11: Apply accumulated constant offset to base address
+    // For C[i+2], base should be (C + 2*sizeof(element))
+    const SCEV *AdjustedBase = Base;
+    if (AccumulatedOffset != 0) {
+      LLVM_DEBUG(dbgs() << "  Applying accumulated offset: " << AccumulatedOffset 
+                        << " bytes to base\n");
+      Type *PtrTy = SE.getEffectiveSCEVType(Base->getType());
+      const SCEV *OffsetSCEV = SE.getConstant(PtrTy, AccumulatedOffset);
+      AdjustedBase = SE.getAddExpr(Base, OffsetSCEV);
+      LLVM_DEBUG(dbgs() << "  Adjusted base: " << *AdjustedBase << "\n");
+    }
+    
     // Create direct stream descriptor
     DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
     DS.StreamID = NextStreamID++;
     DS.LoopID = getOrCreateLoopID(L);
-    DS.BaseAddress = Base;
+    DS.BaseAddress = AdjustedBase;
     DS.Stride = Stride;
-    DS.IsBaseLinked = isValueDynamic(Base);
+    DS.IsBaseLinked = isValueDynamic(AdjustedBase);
     DS.MemInst = MemInst;
     
     if (DS.IsBaseLinked) {
-      if (Value *BaseVal = extractDynamicValue(Base, L)) {
+      if (Value *BaseVal = extractDynamicValue(AdjustedBase, L)) {
         Type *BaseTy = BaseVal->getType();
         unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
         DS.LinkID = getOrCreateLinkID(BaseVal, Size);
@@ -471,7 +520,10 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
       dbgs() << "  Found Direct Stream (optimized path):\n";
       dbgs() << "    Stream ID: " << DS.StreamID << "\n";
       dbgs() << "    Loop ID: " << DS.LoopID << "\n";
-      dbgs() << "    Base: " << *Base << "\n";
+      dbgs() << "    Base: " << *AdjustedBase << "\n";
+      if (AccumulatedOffset != 0) {
+        dbgs() << "    Constant Offset: " << AccumulatedOffset << " bytes\n";
+      }
       dbgs() << "    Stride: " << Stride << " bytes\n";
     });
     
@@ -653,7 +705,20 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   //
   // If we included IndexBase in the stream base, we'd have:
   //   Stream: base=A+(N+M)*4, which is redundant and creates extra link variables
+  //
+  // BUG FIX #11: However, for constant offsets (C[i+2]), we SHOULD add the offset
+  // to the base address, since this is not redundant with the loop descriptor.
   const SCEV *BaseSCEV = BasePtrSCEV;
+  
+  // Apply accumulated constant offset from GEP chain tracing
+  if (AccumulatedOffset != 0) {
+    LLVM_DEBUG(dbgs() << "  Applying accumulated GEP chain offset: " 
+                      << AccumulatedOffset << " bytes to base\n");
+    Type *PtrTy = SE.getEffectiveSCEVType(BaseSCEV->getType());
+    const SCEV *OffsetSCEV = SE.getConstant(PtrTy, AccumulatedOffset);
+    BaseSCEV = SE.getAddExpr(BaseSCEV, OffsetSCEV);
+    LLVM_DEBUG(dbgs() << "  Adjusted base from GEP chain: " << *BaseSCEV << "\n");
+  }
   
   // Create direct stream descriptor
   DirectStreamDescriptor DS;  // All fields auto-initialized to defaults
@@ -685,6 +750,9 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     dbgs() << "    Stream ID: " << DS.StreamID << "\n";
     dbgs() << "    Loop ID: " << DS.LoopID << "\n";
     dbgs() << "    Base: " << *BaseSCEV << "\n";
+    if (AccumulatedOffset != 0) {
+      dbgs() << "    Constant Offset Applied: " << AccumulatedOffset << " bytes\n";
+    }
     if (isa<SCEVAddRecExpr>(IndexBase)) {
       dbgs() << "    Index Base (nested AddRec): " << *IndexBase << "\n";
     }
