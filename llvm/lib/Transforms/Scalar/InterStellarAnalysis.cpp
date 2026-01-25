@@ -597,18 +597,16 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     return false;
   }
   
-  // Get the base/start of this AddRec - this is important for nested loops
-  // For nested AddRec like {{0,+,%M}<%outer>,+,1}<%inner>, the start is {0,+,%M}<%outer>
-  const SCEV *IndexBase = AR->getStart();
-  
-  // If we extracted a constant offset (e.g., from i+2), add it to the index base
-  if (ConstantOffset) {
-    // Combine the AddRec's start with the constant offset
-    // This handles cases like A[i+2] where the SCEV is (2 + {0,+,1})
-    // We want IndexBase to be (start + 2) so that the base address is correct
-    Type *IndexTy = SE.getEffectiveSCEVType(IndexBase->getType());
-    const SCEV *OffsetSized = SE.getTruncateOrSignExtend(ConstantOffset, IndexTy);
-    IndexBase = SE.getAddExpr(IndexBase, OffsetSized);
+  // Check if AddRec has a non-zero constant start (e.g., {1,+,1} for i+1)
+  // This happens when compiler computes i+1 before the GEP
+  const SCEV *IndexStart = AR->getStart();
+  if (!ConstantOffset && isa<SCEVConstant>(IndexStart)) {
+    const SCEVConstant *StartConst = cast<SCEVConstant>(IndexStart);
+    if (!StartConst->isZero()) {
+      ConstantOffset = IndexStart;
+      LLVM_DEBUG(dbgs() << "  AddRec start is non-zero constant: " 
+                        << *ConstantOffset << "\n");
+    }
   }
   
   // Calculate memory stride: index_step * element_size
@@ -624,15 +622,12 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // Get base address SCEV - this is the pointer to the array
   const SCEV *BasePtrSCEV = SE.getSCEV(BasePtr);
   
-  // Note: We use ONLY the base pointer for the stream descriptor.
-  // The loop descriptor already describes how the induction variable evolves.
-  // Hardware computes: Address = StreamBase + (CurrentIV - StartIV) * Stride
-  //
-  // For constant offsets (C[i+2]), we add the offset to the base address
-  // since this is not redundant with the loop descriptor.
+  // Apply constant index offset to base address
+  // For array[i+2], the constant offset 2 means we start at array + 2*element_size
+  // For row_ptr[i+1], the offset 1 means we start at row_ptr + 1*sizeof(int)
   const SCEV *BaseSCEV = BasePtrSCEV;
   
-  // Apply accumulated constant offset from GEP chain tracing
+  // First, apply any accumulated offset from GEP chain tracing
   if (AccumulatedOffset != 0) {
     LLVM_DEBUG(dbgs() << "  Applying accumulated GEP chain offset: " 
                       << AccumulatedOffset << " bytes to base\n");
@@ -641,15 +636,31 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     BaseSCEV = SE.getAddExpr(BaseSCEV, OffsetSCEV);
   }
   
+  // Second, apply constant index offset (e.g., +2 in C[i+2] or +1 in row_ptr[i+1])
+  if (ConstantOffset) {
+    // Check if offset is truly constant (not loop-varying)
+    if (const SCEVConstant *ConstOffsetConst = dyn_cast<SCEVConstant>(ConstantOffset)) {
+      int64_t OffsetValue = ConstOffsetConst->getAPInt().getSExtValue();
+      int64_t MemoryOffset = OffsetValue * ElementSize;
+      
+      LLVM_DEBUG(dbgs() << "  Applying constant index offset: " << OffsetValue 
+                        << " indices = " << MemoryOffset << " bytes to base\n");
+      
+      Type *PtrTy = SE.getEffectiveSCEVType(BaseSCEV->getType());
+      const SCEV *MemOffsetSCEV = SE.getConstant(PtrTy, MemoryOffset);
+      BaseSCEV = SE.getAddExpr(BaseSCEV, MemOffsetSCEV);
+    }
+  }
+  
   // Use helper method to create stream
   createDirectStream(BaseSCEV, MemoryStride, L, MemInst);
   
   LLVM_DEBUG({
-    if (isa<SCEVAddRecExpr>(IndexBase)) {
-      dbgs() << "    Index Base (nested AddRec): " << *IndexBase << "\n";
-    }
     dbgs() << "    Element Size: " << ElementSize << " bytes\n";
     dbgs() << "    Index Step: " << IndexStepVal << "\n";
+    if (ConstantOffset) {
+      dbgs() << "    Constant Index Offset Applied: " << *ConstantOffset << "\n";
+    }
   });
   
   return true;
