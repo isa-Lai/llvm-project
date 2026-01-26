@@ -143,6 +143,26 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
   LD.LoopID = LoopID;
   LD.L = L;
   
+  // Capture loop source location from loop header
+  // Try multiple sources: latch terminator (back-edge), then first non-PHI instruction
+  if (BasicBlock *Header = L->getHeader()) {
+    // Try latch terminator first (usually has the loop condition)
+    if (BasicBlock *Latch = L->getLoopLatch()) {
+      if (Instruction *Term = Latch->getTerminator()) {
+        LD.Loc = Term->getDebugLoc();
+      }
+    }
+    // If no location yet, try first non-PHI instruction in header
+    if (!LD.Loc) {
+      for (Instruction &I : *Header) {
+        if (!isa<PHINode>(I)) {
+          LD.Loc = I.getDebugLoc();
+          if (LD.Loc) break;
+        }
+      }
+    }
+  }
+  
   // Get parent loop ID if it exists
   Loop *ParentLoop = L->getParentLoop();
   if (ParentLoop) {
@@ -687,7 +707,6 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   
   // Third, apply dynamic index offset (e.g., i*M in A[i*M + j] for nested loops)
   // This creates a base address that depends on outer loop variables
-  Value *DynamicBaseValue = nullptr;
   if (DynamicIndexOffset) {
     // Scale the dynamic offset by element size: base = A + (i*M) * element_size
     // CRITICAL: Ensure type consistency - both operands must have same type
@@ -927,6 +946,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   IDS.IsBaseLinked = isValueDynamic(BaseSCEV);
   IDS.MemInst = MemInst;
   IDS.IsIndexComputed = !IsIndexFromStream;  // True for computed/random indices
+  IDS.Loc = MemInst->getDebugLoc();
   
   // Handle dynamic base address (e.g., A is a function parameter)
   if (IDS.IsBaseLinked) {
@@ -1441,6 +1461,7 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
   DS.Stride = Stride;
   DS.IsBaseLinked = isValueDynamic(AdjustedBase);
   DS.MemInst = MemInst;
+  DS.Loc = MemInst->getDebugLoc();
   
   // Handle dynamic base address
   if (DS.IsBaseLinked) {
@@ -1482,7 +1503,7 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
 void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
   OS << "\n";
   OS << "╔═══════════════════════════════════════════════════════════════╗\n";
-  OS << "║     InterStellar Stream Analysis Results                     ║\n";
+  OS << "║     InterStellar Stream Analysis Results for Function: " << F.getName() << " ║\n";
   OS << "╚═══════════════════════════════════════════════════════════════╝\n\n";
   
   OS << " Statistics:\n";
@@ -1501,6 +1522,13 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
         OS << " (nested inside Loop " << LD.ParentLoopID << ")";
       }
       OS << "\n";
+      
+      // Print loop source location
+      if (LD.Loc) {
+        OS << "  ├─ Source Location: ";
+        LD.Loc.print(OS);
+        OS << "\n";
+      }
       
       // Parent Loop ID (if nested)
       if (hasParent) {
@@ -1558,6 +1586,13 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
     for (const auto &DS : DirectStreams) {
       OS << "Stream ID: " << DS.StreamID << " (Loop " << DS.LoopID << ")\n";
       
+      // Source location
+      if (DS.Loc) {
+        OS << "  ├─ Source Location: ";
+        DS.Loc.print(OS);
+        OS << "\n";
+      }
+      
       // Base Address
       OS << "  ├─ Base Address: " << *DS.BaseAddress;
       if (DS.IsBaseLinked) {
@@ -1586,6 +1621,13 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
     OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     for (const auto &IDS : IndirectStreams) {
       OS << "Stream ID: " << IDS.StreamID << " (Loop " << IDS.LoopID << ")\n";
+      
+      // Source location
+      if (IDS.Loc) {
+        OS << "  ├─ Source Location: ";
+        IDS.Loc.print(OS);
+        OS << "\n";
+      }
       
       // Base Address
       OS << "  ├─ Base Address:   " << *IDS.BaseAddress;
@@ -1657,9 +1699,6 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
   // Print results only in LLVM debugger
   LLVM_DEBUG(Analyzer.print(dbgs()));
   
-  // Also print to standard output for easier testing
-  Analyzer.print(errs());
-  
   // This is an analysis pass, it doesn't modify the IR
   return PreservedAnalyses::all();
 }
@@ -1692,8 +1731,6 @@ bool InterStellarAnalysisLegacyPass::runOnFunction(Function &F) {
   
   LLVM_DEBUG(Analyzer.print(dbgs()));
   
-  // Also print to standard output for easier testing
-  Analyzer.print(errs());
   
   // Analysis pass doesn't modify IR
   return false;
