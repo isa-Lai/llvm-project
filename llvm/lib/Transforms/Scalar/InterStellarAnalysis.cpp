@@ -104,7 +104,8 @@ private:
   void extractAllDynamicValues(const SCEV *S, SmallVectorImpl<Value *> &Values);
   int64_t getTypeSizeInBytes(Type *Ty);
   void createDirectStream(const SCEV *Base, int64_t Stride, Loop *L, 
-                         Instruction *MemInst, int64_t ConstantOffset = 0);
+                         Instruction *MemInst, int64_t ConstantOffset = 0,
+                         Value *ExplicitBaseValue = nullptr);
 };
 
 bool InterStellarStreamAnalyzer::analyze() {
@@ -444,24 +445,42 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
       return false;
     }
     
-    // Direct AddRec case (optimized code)
-    if (AR->getLoop() != L || !AR->isAffine()) {
+    // Check if AddRec belongs to this loop or an outer loop
+    // For nested loops like A[i*M + j]:
+    //   - Inner loop sees AddRec {A,+,M*4}<%outer> for base (outer loop induction)
+    //   - This outer-loop AddRec is loop-invariant for inner loop
+    //   - It should be used as the base address, not rejected
+    if (AR->getLoop() == L) {
+      // Direct AddRec case: belongs to current loop (simple pattern like A[i])
+      if (!AR->isAffine()) {
+        return false;
+      }
+      
+      const SCEV *Base = AR->getStart();
+      const SCEV *Step = AR->getStepRecurrence(SE);
+      const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(Step);
+      
+      if (!StepConst) {
+        return false;
+      }
+      
+      int64_t Stride = StepConst->getAPInt().getSExtValue();
+      
+      // Use helper method to create stream with accumulated offset
+      createDirectStream(Base, Stride, L, MemInst, AccumulatedOffset);
+      return true;
+    } else if (AR->getLoop()->contains(L)) {
+      // AddRec belongs to outer loop - this is loop-invariant base for current loop
+      // Nested loop case: A[i*M + j] where i*M is outer loop induction (base for inner)
+      // Fall through to GEP analysis to extract inner loop stride from index
+      LLVM_DEBUG(dbgs() << "  AddRec belongs to outer loop, treating as invariant base\n");
+      // Note: We don't return false here, but we also can't analyze further without a GEP
+      // This case typically won't happen because optimized IR will have GEP instructions
+      return false;
+    } else {
+      // AddRec belongs to unrelated loop
       return false;
     }
-    
-    const SCEV *Base = AR->getStart();
-    const SCEV *Step = AR->getStepRecurrence(SE);
-    const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(Step);
-    
-    if (!StepConst) {
-      return false;
-    }
-    
-    int64_t Stride = StepConst->getAPInt().getSExtValue();
-    
-    // Use helper method to create stream with accumulated offset
-    createDirectStream(Base, Stride, L, MemInst, AccumulatedOffset);
-    return true;
   }
   
   // GEP-based analysis (handles unoptimized IR)
@@ -597,15 +616,28 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     return false;
   }
   
-  // Check if AddRec has a non-zero constant start (e.g., {1,+,1} for i+1)
-  // This happens when compiler computes i+1 before the GEP
+  // Check if AddRec has a non-zero start value (e.g., {1,+,1} for i+1, or {i*M,+,1} for nested loops)
+  // The start value represents the loop-invariant offset for the current loop
   const SCEV *IndexStart = AR->getStart();
-  if (!ConstantOffset && isa<SCEVConstant>(IndexStart)) {
-    const SCEVConstant *StartConst = cast<SCEVConstant>(IndexStart);
-    if (!StartConst->isZero()) {
-      ConstantOffset = IndexStart;
-      LLVM_DEBUG(dbgs() << "  AddRec start is non-zero constant: " 
-                        << *ConstantOffset << "\n");
+  
+  // For nested loops like A[i*M + j], IndexStart = i*M (loop-invariant for inner loop)
+  // We need to incorporate this into the base address calculation
+  const SCEV *DynamicIndexOffset = nullptr;
+  
+  if (!ConstantOffset) {
+    if (const SCEVConstant *StartConst = dyn_cast<SCEVConstant>(IndexStart)) {
+      // Constant start (e.g., {2,+,1} for array[i+2])
+      if (!StartConst->isZero()) {
+        ConstantOffset = IndexStart;
+        LLVM_DEBUG(dbgs() << "  AddRec start is non-zero constant: " 
+                          << *ConstantOffset << "\n");
+      }
+    } else if (!isa<SCEVConstant>(IndexStart) && !IndexStart->isZero()) {
+      // Dynamic start (e.g., {i*M,+,1} for nested loops A[i*M + j])
+      // This is loop-invariant for current loop but varies with outer loop
+      DynamicIndexOffset = IndexStart;
+      LLVM_DEBUG(dbgs() << "  AddRec start is dynamic (outer-loop dependent): " 
+                        << *IndexStart << "\n");
     }
   }
   
@@ -625,6 +657,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // Apply constant index offset to base address
   // For array[i+2], the constant offset 2 means we start at array + 2*element_size
   // For row_ptr[i+1], the offset 1 means we start at row_ptr + 1*sizeof(int)
+  // For A[i*M + j], the dynamic offset i*M means base = A + i*M*element_size
   const SCEV *BaseSCEV = BasePtrSCEV;
   
   // First, apply any accumulated offset from GEP chain tracing
@@ -636,7 +669,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     BaseSCEV = SE.getAddExpr(BaseSCEV, OffsetSCEV);
   }
   
-  // Second, apply constant index offset (e.g., +2 in C[i+2] or +1 in row_ptr[i+1])
+  // Second, apply constant index offset (e.g., +2 in C[i+2])
   if (ConstantOffset) {
     // Check if offset is truly constant (not loop-varying)
     if (const SCEVConstant *ConstOffsetConst = dyn_cast<SCEVConstant>(ConstantOffset)) {
@@ -652,8 +685,57 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     }
   }
   
-  // Use helper method to create stream
-  createDirectStream(BaseSCEV, MemoryStride, L, MemInst);
+  // Third, apply dynamic index offset (e.g., i*M in A[i*M + j] for nested loops)
+  // This creates a base address that depends on outer loop variables
+  Value *DynamicBaseValue = nullptr;
+  if (DynamicIndexOffset) {
+    // Scale the dynamic offset by element size: base = A + (i*M) * element_size
+    // CRITICAL: Ensure type consistency - both operands must have same type
+    Type *PtrTy = SE.getEffectiveSCEVType(BaseSCEV->getType());
+    
+    // Cast DynamicIndexOffset to pointer-sized type if needed
+    const SCEV *CastedOffset = DynamicIndexOffset;
+    Type *OffsetTy = DynamicIndexOffset->getType();
+    if (OffsetTy != PtrTy) {
+      // Sign-extend or zero-extend to pointer type
+      CastedOffset = SE.getSignExtendExpr(DynamicIndexOffset, PtrTy);
+      LLVM_DEBUG(dbgs() << "  Type cast: " << *DynamicIndexOffset 
+                        << " from " << *OffsetTy << " to " << *PtrTy << "\n");
+    }
+    
+    const SCEV *ElemSizeSCEV = SE.getConstant(PtrTy, ElementSize);
+    const SCEV *ScaledOffset = SE.getMulExpr(CastedOffset, ElemSizeSCEV);
+    BaseSCEV = SE.getAddExpr(BaseSCEV, ScaledOffset);
+    
+    LLVM_DEBUG(dbgs() << "  Applying dynamic index offset: " << *DynamicIndexOffset
+                      << " * " << ElementSize << " bytes to base\n");
+    LLVM_DEBUG(dbgs() << "  Resulting base SCEV: " << *BaseSCEV << "\n");
+    
+    // Try to extract the dynamic value for the offset (for link variable creation)
+    // For i*M, this might be a computed value in the loop preheader
+    if (Value *OffsetVal = extractDynamicValue(DynamicIndexOffset, L)) {
+      LLVM_DEBUG(dbgs() << "  Found dynamic offset value: " << *OffsetVal << "\n");
+      // Note: We pass the offset value, not the full base, because createDirectStream
+      // will need to compute: base_link_value = A_ptr + offset_value * element_size
+      // For now, we rely on extractDynamicValue to find the materialized address
+    }
+  }
+  
+  // Check if base pointer contains an outer-loop AddRecExpr (optimized code path)
+  // For optimized code, compiler creates %invariant.gep = A + i*M before inner loop
+  Value *OuterLoopBaseValue = nullptr;
+  if (const SCEVAddRecExpr *BaseAR = dyn_cast<SCEVAddRecExpr>(BasePtrSCEV)) {
+    if (BaseAR->getLoop() != L && BaseAR->getLoop()->contains(L)) {
+      // Base contains an AddRecExpr from an outer loop
+      // Use BasePtr (e.g., %invariant.gep) as the dynamic value
+      OuterLoopBaseValue = BasePtr;
+      LLVM_DEBUG(dbgs() << "  Base contains outer-loop AddRecExpr, using BasePtr as link variable: " 
+                        << *BasePtr << "\n");
+    }
+  }
+  
+  // Use helper method to create stream, passing the outer loop base value if available
+  createDirectStream(BaseSCEV, MemoryStride, L, MemInst, AccumulatedOffset, OuterLoopBaseValue);
   
   LLVM_DEBUG({
     dbgs() << "    Element Size: " << ElementSize << " bytes\n";
@@ -829,11 +911,19 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   Value *BasePtr = GEP->getPointerOperand();
   const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
   
+  // Calculate element size from GEP
+  Type *ElementType = GEP->getSourceElementType();
+  if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
+    ElementType = ArrTy->getElementType();
+  }
+  int64_t ElemSize = getTypeSizeInBytes(ElementType);
+  
   IndirectStreamDescriptor IDS;
   IDS.StreamID = NextStreamID++;
   IDS.LoopID = getOrCreateLoopID(L);
   IDS.BaseStreamID = SourceStreamID;  // 0 if computed/random index
   IDS.BaseAddress = BaseSCEV;
+  IDS.ElementSize = ElemSize;
   IDS.IsBaseLinked = isValueDynamic(BaseSCEV);
   IDS.MemInst = MemInst;
   IDS.IsIndexComputed = !IsIndexFromStream;  // True for computed/random indices
@@ -868,6 +958,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
     dbgs() << "    Stream ID: " << IDS.StreamID << "\n";
     dbgs() << "    Loop ID: " << IDS.LoopID << "\n";
     dbgs() << "    Base Address: " << *BaseSCEV << "\n";
+    dbgs() << "    Element Size: " << IDS.ElementSize << " bytes\n";
     dbgs() << "    Base Linked: " << IDS.IsBaseLinked << "\n";
     if (IDS.IsIndexComputed) {
       dbgs() << "    Index Type: Computed/Random (no stream dependency)\n";
@@ -1049,6 +1140,13 @@ bool InterStellarStreamAnalyzer::isValueDynamic(const SCEV *S) {
     return false;
   }
   
+  // AddRecExpr represents induction variables - these are dynamic
+  // For nested loops, an outer-loop AddRecExpr is a dynamic value
+  // from the perspective of the inner loop (e.g., i*M in A[i*M + j])
+  if (isa<SCEVAddRecExpr>(S)) {
+    return true;
+  }
+  
   // If it contains any SCEVUnknown, it's potentially dynamic
   if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(S)) {
     Value *V = Unknown->getValue();
@@ -1091,6 +1189,74 @@ Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {
   // If it's a simple unknown (single variable), return it directly
   if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(S)) {
     return Unknown->getValue();
+  }
+  
+  // For AddRecExpr (induction variables), find the PHI or computed value
+  // For nested loops, outer-loop AddRecExprs represent loop-invariant base addresses
+  // For A[i*M + j], the base is {A,+,M*4}<%outer> which is computed once per outer iteration
+  if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    const Loop *ARLoop = AR->getLoop();
+    
+    // Search for the value computing this AddRecExpr
+    // In optimized code, this is often stored in an invariant GEP instruction
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Header = L->getHeader();
+    
+    // Lambda to find an instruction computing the AddRecExpr value
+    auto findARValue = [&](BasicBlock *BB) -> Value * {
+      if (!BB) return nullptr;
+      for (Instruction &I : *BB) {
+        // Skip void-type instructions
+        if (!SE.isSCEVable(I.getType()))
+          continue;
+        
+        const SCEV *InstSCEV = SE.getSCEV(&I);
+        
+        // Direct match
+        if (InstSCEV == S) {
+          LLVM_DEBUG(dbgs() << "  Found instruction for AddRecExpr: " << I << "\n");
+          return &I;
+        }
+        
+        // For GEP instructions, check if they compute the address we need
+        if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          // GEP might be the invariant base pointer
+          if (InstSCEV == S) {
+            return GEP;
+          }
+        }
+      }
+      return nullptr;
+    };
+    
+    // Try preheader first (where loop-invariant values are hoisted)
+    if (Value *V = findARValue(Preheader))
+      return V;
+    
+    // Try header (where PHI nodes live)
+    if (Value *V = findARValue(Header))
+      return V;
+    
+    // If we can't find a specific instruction, try to find the PHI node
+    // that represents the induction variable for this AddRecExpr
+    if (ARLoop) {
+      BasicBlock *ARHeader = ARLoop->getHeader();
+      if (ARHeader) {
+        for (PHINode &PHI : ARHeader->phis()) {
+          const SCEV *PhiSCEV = SE.getSCEV(&PHI);
+          if (PhiSCEV == S) {
+            LLVM_DEBUG(dbgs() << "  Found PHI for AddRecExpr: " << PHI << "\n");
+            return &PHI;
+          }
+        }
+      }
+    }
+    
+    // Fallback: create a symbolic representation
+    // The SCEV expander can materialize this value if needed
+    LLVM_DEBUG(dbgs() << "  Could not find concrete value for AddRecExpr: " << *S << "\n");
+    // Return nullptr and let the caller handle it
+    return nullptr;
   }
   
   // For composite expressions (e.g., N+M, i*j), we need to find the instruction
@@ -1255,7 +1421,8 @@ int64_t InterStellarStreamAnalyzer::getTypeSizeInBytes(Type *Ty) {
 void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base, 
                                                     int64_t Stride, Loop *L,
                                                     Instruction *MemInst,
-                                                    int64_t ConstantOffset) {
+                                                    int64_t ConstantOffset,
+                                                    Value *ExplicitBaseValue) {
   // Apply constant offset if present
   const SCEV *AdjustedBase = Base;
   if (ConstantOffset != 0) {
@@ -1277,7 +1444,14 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
   
   // Handle dynamic base address
   if (DS.IsBaseLinked) {
-    if (Value *BaseVal = extractDynamicValue(AdjustedBase, L)) {
+    // If an explicit base value is provided (e.g., %invariant.gep for nested loops),
+    // use it directly instead of trying to extract from SCEV
+    Value *BaseVal = ExplicitBaseValue;
+    if (!BaseVal) {
+      BaseVal = extractDynamicValue(AdjustedBase, L);
+    }
+    
+    if (BaseVal) {
       Type *BaseTy = BaseVal->getType();
       unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
       DS.LinkID = getOrCreateLinkID(BaseVal, Size);
@@ -1296,6 +1470,9 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
     dbgs() << "    Base: " << *AdjustedBase << "\n";
     if (ConstantOffset != 0) {
       dbgs() << "    Constant Offset: " << ConstantOffset << " bytes\n";
+    }
+    if (ExplicitBaseValue) {
+      dbgs() << "    Explicit Base Value: " << *ExplicitBaseValue << "\n";
     }
     dbgs() << "    Stride: " << Stride << " bytes\n";
     dbgs() << "    Base Linked: " << DS.IsBaseLinked << "\n";
@@ -1421,6 +1598,9 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
         OS << "  [BL=0, Static]";
       }
       OS << "\n";
+      
+      // Element Size
+      OS << "  ├─ Element Size:   " << IDS.ElementSize << " bytes\n";
       
       // Index Source Stream or Computed
       if (IDS.IsIndexComputed) {

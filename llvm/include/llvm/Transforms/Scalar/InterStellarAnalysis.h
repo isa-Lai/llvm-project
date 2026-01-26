@@ -48,6 +48,7 @@ struct IndirectStreamDescriptor {
   unsigned BaseStreamID = 0;  // The stream that provides indices (0 if computed/random)
   const SCEV *BaseAddress = nullptr;  // Base address of the indirectly accessed array
   Value *BaseAddressValue = nullptr;  // IR Value if base is dynamic
+  int64_t ElementSize = 0;    // Size of elements being accessed (in bytes)
   bool IsBaseLinked = false;  // Base Linked (BL) flag
   unsigned LinkID = 0;  // Link Descriptor ID if base is dynamic
   Instruction *MemInst = nullptr;  // Source load/store instruction
