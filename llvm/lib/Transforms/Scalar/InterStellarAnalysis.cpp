@@ -773,7 +773,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   // Detect indirect access patterns: A[B[i]], A[B[C[i]]], or computed indices
   //
   // Algorithm:
-  // 1. Extract GEP index operand
+  // 1. Extract GEP index operand (handle chained GEPs for struct field accesses)
   // 2. Search for LoadInst providing the index (recursively through casts/ops)
   // 3. Check if LoadInst is from a known stream (enables chaining)
   // 4. Create indirect stream descriptor with stream dependency
@@ -787,17 +787,46 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
     return false;
   }
   
-  // Step 2: Extract the index operand(s)
+  // Step 1.5: Handle chained GEPs for struct field accesses
+  // Pattern: struct_array[indirect_idx].field
+  // IR: %field_gep = gep i8, ptr %struct_gep, i64 <field_offset>
+  //     %struct_gep = gep %struct, ptr %base, i64 %indirect_idx
+  // 
+  // When we see a GEP with constant indices (field offsets), check if its
+  // pointer operand is another GEP with a loop-varying index (the actual indirect access)
+  GetElementPtrInst *RootGEP = GEP;
+  
+  // Check if this GEP has only constant indices (indicates field offset GEP)
+  bool AllConstantIndices = true;
+  for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
+    if (!isa<ConstantInt>(IdxIt->get())) {
+      AllConstantIndices = false;
+      break;
+    }
+  }
+  
+  // If all indices are constant, this might be a field-offset GEP
+  // Check if the pointer operand is another GEP with loop-varying indices
+  if (AllConstantIndices) {
+    if (GetElementPtrInst *ParentGEP = dyn_cast<GetElementPtrInst>(GEP->getPointerOperand())) {
+      // Found a parent GEP - use it as the root for indirect analysis
+      RootGEP = ParentGEP;
+      LLVM_DEBUG(dbgs() << "    Found chained GEP for struct field access, using parent GEP as root\n");
+      LLVM_DEBUG(dbgs() << "    Parent GEP: " << *ParentGEP << "\n");
+    }
+  }
+  
+  // Step 2: Extract the index operand(s) from the root GEP
   // For simple arrays: GEP has one index
   // For multi-dimensional: GEP might have multiple indices
   // We focus on the last index which represents the actual array subscript
-  if (GEP->getNumIndices() == 0) {
-    LLVM_DEBUG(dbgs() << "    GEP has no indices\n");
+  if (RootGEP->getNumIndices() == 0) {
+    LLVM_DEBUG(dbgs() << "    Root GEP has no indices\n");
     return false;
   }
   
   Value *Index = nullptr;
-  for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
+  for (auto IdxIt = RootGEP->idx_begin(); IdxIt != RootGEP->idx_end(); ++IdxIt) {
     Index = IdxIt->get(); // Get the last index
   }
   
@@ -805,7 +834,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
     return false;
   }
   
-  LLVM_DEBUG(dbgs() << "    GEP Index: " << *Index << "\n");
+  LLVM_DEBUG(dbgs() << "    Root GEP Index: " << *Index << "\n");
   
   // Search for LoadInst providing the index value
   // Trace through casts, arithmetic ops, selects, and PHIs
@@ -927,15 +956,20 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   }
   
   // Step 5: Create indirect stream descriptor
-  Value *BasePtr = GEP->getPointerOperand();
+  // Use the root GEP to extract base pointer and element size
+  Value *BasePtr = RootGEP->getPointerOperand();
   const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
   
-  // Calculate element size from GEP
-  Type *ElementType = GEP->getSourceElementType();
+  // Calculate element size from the root GEP (the one with the indirect index)
+  Type *ElementType = RootGEP->getSourceElementType();
   if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
     ElementType = ArrTy->getElementType();
   }
   int64_t ElemSize = getTypeSizeInBytes(ElementType);
+  
+  LLVM_DEBUG(dbgs() << "    Base pointer: " << *BasePtr << "\n");
+  LLVM_DEBUG(dbgs() << "    Element type: " << *ElementType << "\n");
+  LLVM_DEBUG(dbgs() << "    Element size: " << ElemSize << " bytes\n");
   
   IndirectStreamDescriptor IDS;
   IDS.StreamID = NextStreamID++;
