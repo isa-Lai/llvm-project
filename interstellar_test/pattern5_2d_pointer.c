@@ -12,7 +12,7 @@ void pattern5_2d_pointer(int *A, int *D2A, int N, int D2_rows, int D2_cols) {
             
             // Indirect access: D2A[A[i]][j] if within bounds
             if (i < N) {
-                int idx_i = A[i] % D2_rows; //A pending issue
+                int idx_i = A[i] % D2_rows;
                 D2A[idx_i * D2_cols + j]++;
                 int idx_j = A[j] % D2_cols;
                 D2A[i * D2_cols + idx_j]++;

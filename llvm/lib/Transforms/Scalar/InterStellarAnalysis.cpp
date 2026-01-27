@@ -100,6 +100,7 @@ private:
   unsigned getOrCreateLoopID(Loop *L);
   unsigned getOrCreateLinkID(Value *V, unsigned SizeInBytes);
   bool isValueDynamic(const SCEV *S);
+  bool isEffectivelyLoopInvariant(const SCEV *S, Loop *L);
   Value *extractDynamicValue(const SCEV *S, Loop *L);
   void extractAllDynamicValues(const SCEV *S, SmallVectorImpl<Value *> &Values);
   int64_t getTypeSizeInBytes(Type *Ty);
@@ -514,6 +515,14 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
       return false;
     }
     
+    // CRITICAL: Verify that the base address is effectively loop-invariant
+    // Example: D3B[rand()][j][k] where rand() is called every iteration
+    // The base address depends on rand(), which is NOT loop-invariant
+    if (!isEffectivelyLoopInvariant(Base, L)) {
+      LLVM_DEBUG(dbgs() << "  Base address is not effectively loop-invariant: " << *Base << "\n");
+      return false;
+    }
+    
     int64_t Stride = StepConst->getAPInt().getSExtValue();
     
     // Use helper method to create stream with accumulated offset
@@ -546,7 +555,165 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     return false;
   }
   
-  // Trace through loads to find the actual induction variable
+  // CRITICAL FIX: Analyze index SCEV first to detect compound indices
+  // Pattern: array[idx_i * M + j] where idx_i = load(A[i])
+  // In the inner j-loop, idx_i is loop-invariant, so this should be a direct stream!
+  //
+  // Example from pattern5_2d_pointer.c:
+  //   int idx_i = A[i] % D2_rows;         // Outer loop, i
+  //   D2A[idx_i * D2_cols + j]++;         // Inner loop, j
+  //
+  // For the j-loop, idx_i * D2_cols is loop-invariant (constant for each iteration of j).
+  // The SCEV is: (idx_i * D2_cols) + {0,+,1}<j-loop>
+  //             = loop_invariant_part + affine_part
+  //
+  // This should be recognized as a direct stream with:
+  //   - Base: array + (idx_i * D2_cols) * element_size
+  //   - Stride: 1 * element_size
+  //
+  // Compare with pattern7_2d_fixed.c where D2B[idx_i][j] generates TWO GEPs:
+  //   - First GEP: selects row (includes indirect index)
+  //   - Second GEP: selects column (direct stream)
+  // Both patterns are semantically equivalent and should produce the same stream type!
+  
+  const SCEV *IndexSCEV = SE.getSCEV(Index);
+  LLVM_DEBUG(dbgs() << "  Index SCEV: " << *IndexSCEV << "\n");
+  
+  // Try to decompose index SCEV into: loop_invariant_part + affine_loop_variant_part
+  const SCEV *LoopInvariantPart = nullptr;
+  const SCEVAddRecExpr *AffinePartAR = nullptr;
+  
+  // Unwrap casts first
+  const SCEV *UnwrappedIndexSCEV = IndexSCEV;
+  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(UnwrappedIndexSCEV)) {
+    UnwrappedIndexSCEV = Cast->getOperand();
+  }
+  
+  // Check if the index is a sum of loop-invariant and loop-variant parts
+  if (const SCEVAddExpr *AddExpr = dyn_cast<SCEVAddExpr>(UnwrappedIndexSCEV)) {
+    SmallVector<const SCEV *, 4> InvariantOps;
+    
+    for (const SCEV *Op : AddExpr->operands()) {
+      // Unwrap casts on operands
+      const SCEV *UnwrappedOp = Op;
+      while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(UnwrappedOp)) {
+        UnwrappedOp = Cast->getOperand();
+      }
+      
+      // Check if this operand is an affine AddRec for the current loop
+      if (const SCEVAddRecExpr *OpAR = dyn_cast<SCEVAddRecExpr>(UnwrappedOp)) {
+        if (OpAR->getLoop() == L && OpAR->isAffine()) {
+          // Found the affine part! Only accept one affine AddRec
+          if (!AffinePartAR) {
+            AffinePartAR = OpAR;
+          } else {
+            // Multiple AddRecs for this loop - too complex
+            AffinePartAR = nullptr;
+            break;
+          }
+        } else {
+          // AddRec for a different loop - part of loop-invariant base
+          InvariantOps.push_back(Op);
+        }
+      } else if (SE.isLoopInvariant(Op, L)) {
+        // This operand is loop-invariant for current loop
+        InvariantOps.push_back(Op);
+      } else {
+        // Check if this operand, while not strictly loop-invariant,
+        // is based on values from outer loops (e.g., A[i] in inner j-loop)
+        // This handles the case: D2A[idx_i * D2_cols + j] where idx_i = A[i]
+        // Even though idx_i is recomputed inside j-loop, its value only depends
+        // on the outer i-loop variable, making it effectively loop-invariant
+        // for the j-loop in terms of access pattern.
+        
+        // Try to find if all contributing values are loop-invariant or from outer loops
+        bool IsEffectivelyInvariant = isEffectivelyLoopInvariant(Op, L);
+        
+        if (IsEffectivelyInvariant) {
+          LLVM_DEBUG(dbgs() << "  Operand is effectively loop-invariant (depends on outer loops): " << *Op << "\n");
+          InvariantOps.push_back(Op);
+        } else {
+          // Loop-varying non-affine component (e.g., rand())
+          LLVM_DEBUG(dbgs() << "  Index has loop-varying non-affine operand: " << *Op << "\n");
+          AffinePartAR = nullptr;
+          break;
+        }
+      }
+    }
+    
+    // If we successfully decomposed the index into invariant + affine parts
+    if (AffinePartAR && !InvariantOps.empty()) {
+      LLVM_DEBUG({
+        dbgs() << "  Successfully decomposed index into:\n";
+        dbgs() << "    Affine part (loop-variant): " << *AffinePartAR << "\n";
+        dbgs() << "    Loop-invariant part: ";
+        for (const SCEV *Op : InvariantOps) {
+          dbgs() << *Op << " ";
+        }
+        dbgs() << "\n";
+        dbgs() << "  This is a DIRECT stream with loop-invariant base offset!\n";
+      });
+      
+      // Compute the loop-invariant offset
+      if (InvariantOps.size() == 1) {
+        LoopInvariantPart = InvariantOps[0];
+      } else {
+        LoopInvariantPart = SE.getAddExpr(InvariantOps);
+      }
+      
+      // Calculate memory stride: affine_step * element_size
+      const SCEV *AffineStep = AffinePartAR->getStepRecurrence(SE);
+      const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(AffineStep);
+      
+      if (!StepConst) {
+        LLVM_DEBUG(dbgs() << "  Affine step is not constant, cannot create direct stream\n");
+        return false;
+      }
+      
+      Type *ElementType = GEP->getSourceElementType();
+      if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
+        ElementType = ArrTy->getElementType();
+      }
+      int64_t ElementSize = getTypeSizeInBytes(ElementType);
+      int64_t StepValue = StepConst->getAPInt().getSExtValue();
+      int64_t MemoryStride = StepValue * ElementSize;
+      
+      // Get base address and incorporate the loop-invariant offset
+      const SCEV *BasePtrSCEV = SE.getSCEV(BasePtr);
+      const SCEV *BaseSCEV = BasePtrSCEV;
+      
+      // Apply accumulated GEP chain offset first
+      if (AccumulatedOffset != 0) {
+        Type *PtrTy = SE.getEffectiveSCEVType(BaseSCEV->getType());
+        const SCEV *OffsetSCEV = SE.getConstant(PtrTy, AccumulatedOffset);
+        BaseSCEV = SE.getAddExpr(BaseSCEV, OffsetSCEV);
+      }
+      
+      // Apply the loop-invariant index offset (e.g., idx_i * D2_cols)
+      // Scale by element size: base = array + (loop_invariant_offset) * element_size
+      Type *PtrTy = SE.getEffectiveSCEVType(BaseSCEV->getType());
+      
+      // Cast loop-invariant part to pointer type if needed
+      const SCEV *CastedInvariant = LoopInvariantPart;
+      Type *InvariantTy = LoopInvariantPart->getType();
+      if (InvariantTy != PtrTy) {
+        CastedInvariant = SE.getSignExtendExpr(LoopInvariantPart, PtrTy);
+      }
+      
+      const SCEV *ElemSizeSCEV = SE.getConstant(PtrTy, ElementSize);
+      const SCEV *ScaledInvariant = SE.getMulExpr(CastedInvariant, ElemSizeSCEV);
+      BaseSCEV = SE.getAddExpr(BaseSCEV, ScaledInvariant);
+      
+      LLVM_DEBUG(dbgs() << "  Resulting base SCEV: " << *BaseSCEV << "\n");
+      LLVM_DEBUG(dbgs() << "  Memory stride: " << MemoryStride << " bytes\n");
+      
+      // Create the direct stream
+      createDirectStream(BaseSCEV, MemoryStride, L, MemInst, 0);
+      return true;
+    }
+  }
+  
+  // If we reach here, standard analysis applies: trace through loads
   Value *IndVar = traceIndexThroughLoads(Index, L);
   if (!IndVar) {
     LLVM_DEBUG(dbgs() << "  Could not trace index to induction variable\n");
@@ -800,6 +967,16 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     }
   }
   
+  // CRITICAL: Verify that the final base address is effectively loop-invariant
+  // Example: D3B[rand()][j][k] where rand() is called every iteration
+  // The base address depends on rand(), which is NOT loop-invariant
+  // This check catches cases where BasePtrSCEV or DynamicIndexOffset contains
+  // calls to rand() or other loop-varying non-affine computations
+  if (!isEffectivelyLoopInvariant(BaseSCEV, L)) {
+    LLVM_DEBUG(dbgs() << "  Base address is not effectively loop-invariant: " << *BaseSCEV << "\n");
+    return false;
+  }
+  
   // Use helper method to create stream, passing the outer loop base value if available
   // Use StreamLoop (which may be an outer loop) instead of L (current loop being analyzed)
   createDirectStream(BaseSCEV, MemoryStride, StreamLoop, MemInst, AccumulatedOffset, OuterLoopBaseValue);
@@ -980,13 +1157,27 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
     // Check if the index is NOT affine (i.e., not a direct stream pattern)
     const SCEV *IndexSCEV = SE.getSCEV(Index);
     
-    // If it's an AddRec for this loop, it would have been detected as direct stream
-    // So if we're here and it's not affine, it's a computed/irregular access
+    // Special case: If the index is affine, normally it would be a direct stream.
+    // However, if the BASE ADDRESS is not loop-invariant (contains rand(), function calls, etc.),
+    // then even with an affine index, this is still an irregular/computed access pattern.
+    // Example: D3B[rand_i][j][k] where k is sequential but rand_i makes the base random.
     if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndexSCEV)) {
       if (AR->getLoop() == L && AR->isAffine()) {
-        // This should have been caught as direct stream, skip
-        LLVM_DEBUG(dbgs() << "    Index is affine AddRec, should be direct stream\n");
-        return false;
+        // Check if the base address is loop-invariant
+        // If it's not, then this is a computed/random indirect stream
+        Value *BasePtr = RootGEP->getPointerOperand();
+        const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
+        
+        if (isEffectivelyLoopInvariant(BaseSCEV, L)) {
+          // Base is invariant and index is affine - this should have been a direct stream
+          LLVM_DEBUG(dbgs() << "    Index is affine AddRec with invariant base, should be direct stream\n");
+          return false;
+        } else {
+          // Base is NOT invariant (e.g., contains rand(), function calls)
+          // Even though index is affine, the overall pattern is irregular/computed
+          LLVM_DEBUG(dbgs() << "    Index is affine but base address is not loop-invariant (computed/random base)\n");
+          // Continue to classify as computed indirect stream
+        }
       }
     }
     
@@ -1279,6 +1470,136 @@ bool InterStellarStreamAnalyzer::isValueDynamic(const SCEV *S) {
   }
   
   return HasDynamic;
+}
+
+bool InterStellarStreamAnalyzer::isEffectivelyLoopInvariant(const SCEV *S, Loop *L) {
+  // Check if a SCEV expression is effectively loop-invariant for loop L.
+  // This is more permissive than SE.isLoopInvariant() because it accepts:
+  // 1. Truly loop-invariant values (standard case)
+  // 2. Values computed from outer loop variables (e.g., A[i] in inner j-loop)
+  //
+  // Use case: D2A[idx_i * D2_cols + j] where idx_i = A[i]
+  // Even though idx_i is recomputed in j-loop, its value only depends on i,
+  // so the access pattern is a direct stream in the j-loop.
+  
+  // First, check the standard case
+  if (SE.isLoopInvariant(S, L)) {
+    return true;
+  }
+  
+  // Unwrap casts
+  const SCEV *Unwrapped = S;
+  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Unwrapped)) {
+    Unwrapped = Cast->getOperand();
+  }
+  
+  // Check for AddRecExpr from parent loops (loop-invariant for current loop)
+  if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Unwrapped)) {
+    const Loop *ARLoop = AR->getLoop();
+    
+    // If AddRec is for the current loop, it's NOT invariant
+    if (ARLoop == L) {
+      return false;
+    }
+    
+    // If AddRec is for a parent loop, it's effectively invariant for current loop
+    Loop *ParentLoop = L->getParentLoop();
+    while (ParentLoop) {
+      if (ARLoop == ParentLoop) {
+        return true;  // Depends on outer loop, invariant for current loop
+      }
+      ParentLoop = ParentLoop->getParentLoop();
+    }
+    
+    // AddRec for unrelated loop or inner loop - not invariant
+    return false;
+  }
+  
+  // Check composite expressions recursively
+  if (const SCEVNAryExpr *NAry = dyn_cast<SCEVNAryExpr>(Unwrapped)) {
+    // All operands must be effectively invariant
+    for (const SCEV *Op : NAry->operands()) {
+      if (!isEffectivelyLoopInvariant(Op, L)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  
+  if (const SCEVUDivExpr *UDiv = dyn_cast<SCEVUDivExpr>(Unwrapped)) {
+    return isEffectivelyLoopInvariant(UDiv->getLHS(), L) &&
+           isEffectivelyLoopInvariant(UDiv->getRHS(), L);
+  }
+  
+  // SCEVUnknown: Check if it's based on values from outer loops or constants
+  if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(Unwrapped)) {
+    Value *V = Unknown->getValue();
+    
+    // Constants and globals are invariant
+    if (isa<Constant>(V) || isa<GlobalVariable>(V)) {
+      return true;
+    }
+    
+    // Function arguments are loop-invariant for all loops
+    if (isa<Argument>(V)) {
+      return true;
+    }
+    
+    // Check if this value is defined outside the loop
+    if (Instruction *I = dyn_cast<Instruction>(V)) {
+      // If defined outside loop, it's invariant
+      if (!L->contains(I->getParent())) {
+        return true;
+      }
+      
+      // CRITICAL: If instruction is a call, it's NOT effectively invariant
+      // Example: rand() returns different values each iteration
+      if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+        LLVM_DEBUG(dbgs() << "  Value is a call instruction inside loop, NOT invariant: " << *I << "\n");
+        return false;
+      }
+      
+      // CRITICAL: If instruction may have side effects or may read/write memory,
+      // it cannot be considered loop-invariant
+      if (I->mayHaveSideEffects() || I->mayReadFromMemory()) {
+        // Exception: LoadInst from loop-invariant address is okay
+        // Example: A[i] where i is outer loop variable
+        if (LoadInst *Load = dyn_cast<LoadInst>(I)) {
+          Value *Ptr = Load->getPointerOperand();
+          const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+          
+          // Check if the load address is effectively invariant
+          if (isEffectivelyLoopInvariant(PtrSCEV, L)) {
+            LLVM_DEBUG(dbgs() << "  Load from effectively invariant address: " << *Load << "\n");
+            return true;
+          }
+        }
+        
+        LLVM_DEBUG(dbgs() << "  Instruction has side effects or reads memory, NOT invariant: " << *I << "\n");
+        return false;
+      }
+      
+      // If defined inside loop, check if it only depends on loop-invariant values
+      // This handles cases like: idx_i = A[i] % D2_rows where A[i] depends on outer loop
+      for (Use &U : I->operands()) {
+        Value *Operand = U.get();
+        const SCEV *OpSCEV = SE.getSCEV(Operand);
+        
+        if (!isEffectivelyLoopInvariant(OpSCEV, L)) {
+          return false;  // Depends on loop-varying value
+        }
+      }
+      
+      // All operands are effectively invariant and no side effects
+      return true;
+    }
+    
+    // Unknown case - conservatively return false
+    return false;
+  }
+  
+  // Default: not invariant
+  return false;
 }
 
 Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {

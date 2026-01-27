@@ -20,7 +20,20 @@ void pattern6_3d_pointer(int *A, int *D3A, int N, int D3_dim1, int D3_dim2, int 
                     int idx_j = A[j] % D3_dim2;
                     indirect_idx = i * D3_dim2 * D3_dim3 + idx_j * D3_dim3 + k;
                     D3A[indirect_idx]++;
+                    int idx_k = A[k] % D3_dim3;
+                    indirect_idx = i * D3_dim2 * D3_dim3 + j * D3_dim3 + idx_k;
+                    D3A[indirect_idx]++;
                 }
+
+                int rand_i = rand() % D3_dim1;
+                int rand_j = rand() % D3_dim2;
+                int rand_k = rand() % D3_dim3;
+                int rand_idx = rand_i * D3_dim2 * D3_dim3 + rand_j * D3_dim3 + rand_k;
+                D3A[rand_idx++]++;
+                rand_idx = i * D3_dim2 * D3_dim3 + rand_j * D3_dim3 + k;
+                D3A[rand_idx++]++;
+                rand_idx = i * D3_dim2 * D3_dim3 + j * D3_dim3 + rand_k;
+                D3A[rand_idx++]++;
             }
         }
     }

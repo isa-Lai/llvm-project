@@ -18,6 +18,8 @@ void pattern8_3d_fixed(int *A, int D3B[][10][10], int N) {
                     D3B[idx_i][j][k]++;
                     int idx_j = A[j] % 10;
                     D3B[i][idx_j][k]++;
+                    int idx_k = A[k] % 10;
+                    D3B[i][j][idx_k]++;
                 }
                 
                 // Indirect with rand: D3B[rand() % 10][j][k]
