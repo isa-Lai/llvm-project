@@ -470,37 +470,56 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     //   - Inner loop sees AddRec {A,+,M*4}<%outer> for base (outer loop induction)
     //   - This outer-loop AddRec is loop-invariant for inner loop
     //   - It should be used as the base address, not rejected
-    if (AR->getLoop() == L) {
+    const Loop *ARLoop = AR->getLoop();
+    Loop *StreamLoop = nullptr;
+    
+    if (ARLoop == L) {
       // Direct AddRec case: belongs to current loop (simple pattern like A[i])
-      if (!AR->isAffine()) {
-        return false;
-      }
-      
-      const SCEV *Base = AR->getStart();
-      const SCEV *Step = AR->getStepRecurrence(SE);
-      const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(Step);
-      
-      if (!StepConst) {
-        return false;
-      }
-      
-      int64_t Stride = StepConst->getAPInt().getSExtValue();
-      
-      // Use helper method to create stream with accumulated offset
-      createDirectStream(Base, Stride, L, MemInst, AccumulatedOffset);
-      return true;
-    } else if (AR->getLoop()->contains(L)) {
-      // AddRec belongs to outer loop - this is loop-invariant base for current loop
-      // Nested loop case: A[i*M + j] where i*M is outer loop induction (base for inner)
-      // Fall through to GEP analysis to extract inner loop stride from index
-      LLVM_DEBUG(dbgs() << "  AddRec belongs to outer loop, treating as invariant base\n");
-      // Note: We don't return false here, but we also can't analyze further without a GEP
-      // This case typically won't happen because optimized IR will have GEP instructions
+      StreamLoop = L;
+    } else if (L->contains(ARLoop)) {
+      // AddRec belongs to an inner loop (nested inside current loop)
+      // This shouldn't happen when analyzing memory accesses in current loop
+      LLVM_DEBUG(dbgs() << "  AddRec belongs to inner loop, skipping\n");
       return false;
     } else {
-      // AddRec belongs to unrelated loop
+      // Check if AddRec belongs to any parent loop
+      Loop *ParentLoop = L->getParentLoop();
+      while (ParentLoop) {
+        if (ARLoop == ParentLoop) {
+          StreamLoop = ParentLoop;
+          LLVM_DEBUG(dbgs() << "  AddRec belongs to parent loop (outer loop stream)\n");
+          break;
+        }
+        ParentLoop = ParentLoop->getParentLoop();
+      }
+      
+      if (!StreamLoop) {
+        // AddRec belongs to unrelated loop
+        LLVM_DEBUG(dbgs() << "  AddRec belongs to unrelated loop\n");
+        return false;
+      }
+    }
+    
+    // Verify it's affine
+    if (!AR->isAffine()) {
+      LLVM_DEBUG(dbgs() << "  AddRec not affine\n");
       return false;
     }
+    
+    const SCEV *Base = AR->getStart();
+    const SCEV *Step = AR->getStepRecurrence(SE);
+    const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(Step);
+    
+    if (!StepConst) {
+      return false;
+    }
+    
+    int64_t Stride = StepConst->getAPInt().getSExtValue();
+    
+    // Use helper method to create stream with accumulated offset
+    // Use StreamLoop (may be outer loop) instead of L
+    createDirectStream(Base, Stride, StreamLoop, MemInst, AccumulatedOffset);
+    return true;
   }
   
   // GEP-based analysis (handles unoptimized IR)
@@ -614,10 +633,38 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     return false;
   }
   
-  // Check if it belongs to this loop
-  if (AR->getLoop() != L) {
-    LLVM_DEBUG(dbgs() << "  AddRec not for this loop\n");
+  // Check if AddRec belongs to this loop or any parent loop
+  // For nested loops, A[i] where i is the outer loop variable should be
+  // detected as a direct stream of the outer loop, even when analyzed from inner loop
+  const Loop *ARLoop = AR->getLoop();
+  Loop *StreamLoop = nullptr;
+  
+  if (ARLoop == L) {
+    // Direct case: AddRec belongs to current loop (e.g., inner loop analyzing B[j])
+    StreamLoop = L;
+  } else if (L->contains(ARLoop)) {
+    // AddRec belongs to an inner loop - not applicable for this analysis context
+    LLVM_DEBUG(dbgs() << "  AddRec belongs to inner loop, skipping\n");
     return false;
+  } else {
+    // Check if AddRec belongs to any parent loop
+    // For nested loops: A[i] analyzed from inner loop, where i is outer loop variable
+    Loop *ParentLoop = L->getParentLoop();
+    while (ParentLoop) {
+      if (ARLoop == ParentLoop) {
+        // Found it! This stream belongs to the parent loop
+        StreamLoop = ParentLoop;
+        LLVM_DEBUG(dbgs() << "  AddRec belongs to parent loop (outer loop stream)\n");
+        break;
+      }
+      ParentLoop = ParentLoop->getParentLoop();
+    }
+    
+    if (!StreamLoop) {
+      // AddRec belongs to unrelated loop
+      LLVM_DEBUG(dbgs() << "  AddRec belongs to unrelated loop\n");
+      return false;
+    }
   }
   
   // Check if it's affine (linear: start + stride * i)
@@ -754,13 +801,17 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   }
   
   // Use helper method to create stream, passing the outer loop base value if available
-  createDirectStream(BaseSCEV, MemoryStride, L, MemInst, AccumulatedOffset, OuterLoopBaseValue);
+  // Use StreamLoop (which may be an outer loop) instead of L (current loop being analyzed)
+  createDirectStream(BaseSCEV, MemoryStride, StreamLoop, MemInst, AccumulatedOffset, OuterLoopBaseValue);
   
   LLVM_DEBUG({
     dbgs() << "    Element Size: " << ElementSize << " bytes\n";
     dbgs() << "    Index Step: " << IndexStepVal << "\n";
     if (ConstantOffset) {
       dbgs() << "    Constant Index Offset Applied: " << *ConstantOffset << "\n";
+    }
+    if (StreamLoop != L) {
+      dbgs() << "    Stream associated with outer loop (not current loop)\n";
     }
   });
   

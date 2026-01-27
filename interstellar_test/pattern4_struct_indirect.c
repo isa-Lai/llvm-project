@@ -15,7 +15,7 @@ void pattern4_struct_indirect(int *A, struct Point *points, int N) {
         // Indirect struct access using A as index
         int idx = A[i];
         if (idx >= 0 && idx < N) {
-            points[idx].x += 10; //pending issue
+            points[idx].x += 10;
             points[idx].y += 20;
         }
         
