@@ -17,6 +17,7 @@
 
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/DebugLoc.h"
 
 namespace llvm {
 
@@ -39,6 +40,7 @@ struct DirectStreamDescriptor {
   bool IsBaseLinked = false;  // Base Linked (BL) flag
   unsigned LinkID = 0;        // ID of the Link Variable Descriptor if base is dynamic
   Instruction *MemInst = nullptr;
+  DebugLoc Loc;               // Source location of the memory access
 };
 
 /// Data structure to represent an indirect stream descriptor
@@ -53,6 +55,7 @@ struct IndirectStreamDescriptor {
   unsigned LinkID = 0;  // Link Descriptor ID if base is dynamic
   Instruction *MemInst = nullptr;  // Source load/store instruction
   bool IsIndexComputed = false;  // True if index is computed (not from a stream)
+  DebugLoc Loc;               // Source location of the memory access
 };
 
 /// Data structure to represent a loop descriptor
@@ -69,6 +72,7 @@ struct LoopDescriptor {
   bool IsEndLinked = false;            // End Linked (EL) flag
   unsigned StartLinkID = 0;            // Link Descriptor ID if SL=1
   unsigned EndLinkID = 0;              // Link Descriptor ID if EL=1
+  DebugLoc Loc;                        // Source location of the loop
 };
 
 /// Data structure to represent a link variable descriptor
