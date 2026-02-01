@@ -3011,7 +3011,7 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
     
     // Stage 1.1: Eliminate redundant streams using dominance analysis
     // Group streams by signature (LoopID, BaseAddress, Stride)
-    LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Stream Redundancy Analysis\n");
+    LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Redundancy Analysis\n");
     
     SmallVector<SmallVector<unsigned, 2>, 4> StreamGroups;
     SmallVector<bool, 8> Processed(Streams.size(), false);
@@ -3043,6 +3043,9 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
         StreamGroups.push_back(std::move(Group));
       }
     }
+    
+    // Track which streams should be removed (redundant streams)
+    SmallPtrSet<const DirectStreamDescriptor *, 8> StreamsToRemove;
     
     for (const auto &Group : StreamGroups) {
       LLVM_DEBUG(dbgs() << "  Found " << Group.size() 
@@ -3077,7 +3080,25 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
         LLVM_DEBUG(Streams[PrimaryIdx].Loc.print(dbgs()));
       }
       LLVM_DEBUG(dbgs() << "\n");
+      
+      // Mark all non-primary streams for removal
+      for (unsigned Idx : Group) {
+        if (Idx != PrimaryIdx) {
+          StreamsToRemove.insert(&Streams[Idx]);
+        }
+      }
     }
+    
+    // Filter out redundant streams - keep only primary streams
+    SmallVector<DirectStreamDescriptor, 8> FilteredStreams;
+    for (const auto &DS : Streams) {
+      if (!StreamsToRemove.count(&DS)) {
+        FilteredStreams.push_back(DS);
+      }
+    }
+    
+    // Replace Streams with the filtered list for subsequent stages
+    Streams = std::move(FilteredStreams);
     
     // Stage 1.1: Also analyze indirect stream redundancy
     // Indirect streams should be deduplicated based on base address, element size,
@@ -3089,6 +3110,9 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       
       SmallVector<SmallVector<unsigned, 2>, 4> IndirectStreamGroups;
       SmallVector<bool, 8> IndirectProcessed(IndirectStreams.size(), false);
+      
+      // Track which indirect streams should be removed (redundant streams)
+      SmallPtrSet<const IndirectStreamDescriptor *, 8> IndirectStreamsToRemove;
       
       for (size_t i = 0; i < IndirectStreams.size(); ++i) {
         if (IndirectProcessed[i])
@@ -3179,7 +3203,25 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
           LLVM_DEBUG(IndirectStreams[PrimaryIdx].Loc.print(dbgs()));
         }
         LLVM_DEBUG(dbgs() << "\n");
+        
+        // Mark all non-primary indirect streams for removal
+        for (unsigned Idx : Group) {
+          if (Idx != PrimaryIdx) {
+            IndirectStreamsToRemove.insert(&IndirectStreams[Idx]);
+          }
+        }
       }
+      
+      // Filter out redundant indirect streams - keep only primary streams
+      SmallVector<IndirectStreamDescriptor, 4> FilteredIndirectStreams;
+      for (const auto &IDS : IndirectStreams) {
+        if (!IndirectStreamsToRemove.count(&IDS)) {
+          FilteredIndirectStreams.push_back(IDS);
+        }
+      }
+      
+      // Replace IndirectStreams with the filtered list for subsequent stages
+      IndirectStreams = std::move(FilteredIndirectStreams);
     }
     
     // Stage 1.2: Analyze merge feasibility for nested loops
