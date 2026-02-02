@@ -33,6 +33,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <functional>
 
 #define DEBUG_TYPE "interstellar-analysis"
 
@@ -3224,6 +3225,58 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       IndirectStreams = std::move(FilteredIndirectStreams);
     }
     
+    // Helper function to extract AddRecExpr for a specific loop from complex SCEV
+    // Recursively searches through SCEV tree (AddExpr, MulExpr, CastExpr, etc.)
+    std::function<const SCEVAddRecExpr *(const SCEV *, const Loop *)> FindAddRecForLoop = 
+        [&](const SCEV *S, const Loop *TargetLoop) -> const SCEVAddRecExpr * {
+      if (!S || !TargetLoop)
+        return nullptr;
+      
+      // Direct match: top-level is AddRecExpr for target loop
+      if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+        if (AR->getLoop() == TargetLoop)
+          return AR;
+        // For nested AddRecs, search the start value (base)
+        // Example: {{%base,+,400}<%Loop0>,+,40}<%Loop1>
+        // When searching for Loop0, we need to look inside the outer AddRec's start value
+        if (auto *Found = FindAddRecForLoop(AR->getStart(), TargetLoop))
+          return Found;
+      }
+      
+      // Search within AddExpr operands (e.g., "base + offset")
+      if (const SCEVAddExpr *Add = dyn_cast<SCEVAddExpr>(S)) {
+        for (const SCEV *Op : Add->operands()) {
+          if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Op)) {
+            if (AR->getLoop() == TargetLoop)
+              return AR;
+          }
+          // Recurse into complex operands
+          if (auto *Found = FindAddRecForLoop(Op, TargetLoop))
+            return Found;
+        }
+      }
+      
+      // Search within MulExpr operands (e.g., "4 * {0,+,stride}")
+      if (const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(S)) {
+        for (const SCEV *Op : Mul->operands()) {
+          if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Op)) {
+            if (AR->getLoop() == TargetLoop)
+              return AR;
+          }
+          // Recurse into complex operands
+          if (auto *Found = FindAddRecForLoop(Op, TargetLoop))
+            return Found;
+        }
+      }
+      
+      // Search through type casts (sext, zext, trunc)
+      if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
+        return FindAddRecForLoop(Cast->getOperand(), TargetLoop);
+      }
+      
+      return nullptr;
+    };
+    
     // Stage 1.2: Analyze merge feasibility for nested loops
     LLVM_DEBUG(dbgs() << "\n[Stage 1.2] Linearization Feasibility Analysis\n");
     
@@ -3234,6 +3287,8 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
     }
     
     // Analyze each stream for potential linearization
+    // For deep nested loops (3+), we need to recursively check all parent loops
+    // to identify all possible merge opportunities at each nesting level
     SmallVector<StreamMergeCandidate, 4> MergeCandidates;
     
     for (const auto &DS : Streams) {
@@ -3241,111 +3296,208 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       if (LoopIt == LoopIDToDescriptor.end())
         continue;
       
-      const LoopDescriptor *InnerLD = LoopIt->second;
-      Loop *InnerLoop = InnerLD->L;
+      const LoopDescriptor *CurrentLD = LoopIt->second;
+      Loop *CurrentLoop = CurrentLD->L;
       
-      if (!InnerLoop || !InnerLoop->getParentLoop())
+      if (!CurrentLoop)
         continue;
       
-      Loop *OuterLoop = InnerLoop->getParentLoop();
-      unsigned OuterLoopID = InnerLD->ParentLoopID;
+      if (!CurrentLoop->getParentLoop())
+        continue;  // No parent loop, nothing to merge
       
-      auto OuterLDIt = LoopIDToDescriptor.find(OuterLoopID);
-      if (OuterLDIt == LoopIDToDescriptor.end())
-        continue;
+      // Recursive multi-level analysis: Walk up the loop nest
+      // For each parent loop, check if we can linearize at that level
+      // Example: for i { for j { for k { A[i][j][k] } } }
+      //   - Level 1: k→j (if P matches dimension)
+      //   - Level 2: k-j→i (if M*P or just M matches dimension)
       
-      // const LoopDescriptor *OuterLD = OuterLDIt->second;  // Available for future use
-      const SCEV *InnerTripCount = InnerLD->EndValue;
+      Loop *ChildLoop = CurrentLoop;
+      const LoopDescriptor *ChildLD = CurrentLD;
+      const SCEV *CumulativeSpan = nullptr;
+      SmallVector<unsigned, 4> RequiredDimensions;
+      
+      // Start with the innermost loop's trip count and stride
+      const SCEV *InnerTripCount = ChildLD->EndValue;
       
       if (!InnerTripCount)
         continue;
       
-      LLVM_DEBUG(dbgs() << "  Analyzing Stream #" << DS.StreamID 
-                        << " (Loop #" << DS.LoopID << " → Loop #" 
-                        << OuterLoopID << ")\n");
+      // Track dimensions for this stream (used in Stage 2 interprocedural analysis)
+      if (ChildLD->IsEndLinked) {
+        RequiredDimensions.push_back(ChildLD->EndLinkID);
+      }
       
-      // Calculate inner span: TripCount * Stride
-      // Ensure both operands have the same type to avoid SCEV assertion failure
-      Type *TripCountType = InnerTripCount->getType();
-      const SCEV *InnerStrideSCEV = SE.getConstant(TripCountType, DS.Stride);
-      const SCEV *InnerSpan = SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
-      
-      LLVM_DEBUG(dbgs() << "    Inner span: " << *InnerSpan << "\n");
-      
-      // Extract outer loop step from base address
-      const SCEV *BaseStep = nullptr;
-      
-      if (const SCEVAddRecExpr *BaseAR = dyn_cast<SCEVAddRecExpr>(DS.BaseAddress)) {
-        Loop *BaseARLoop = const_cast<Loop *>(BaseAR->getLoop());
+      // Iterate through all parent loops (from immediate parent upward)
+      while (ChildLoop->getParentLoop()) {
+        Loop *ParentLoop = ChildLoop->getParentLoop();
+        unsigned ParentLoopID = ChildLD->ParentLoopID;
         
-        // Check if AddRec belongs to outer loop or ancestor
-        bool IsOuterLoopRelated = false;
-        Loop *CurrentLoop = OuterLoop;
-        while (CurrentLoop) {
-          if (CurrentLoop == BaseARLoop) {
-            IsOuterLoopRelated = true;
-            break;
+        LLVM_DEBUG(dbgs() << "  Analyzing Stream #" << DS.StreamID 
+                          << " (Loop #" << DS.LoopID << " → Loop #" 
+                          << ParentLoopID << ")");
+        if (DS.Loc) {
+          LLVM_DEBUG(dbgs() << " at ");
+          LLVM_DEBUG(DS.Loc.print(dbgs()));
+        }
+        LLVM_DEBUG(dbgs() << "\n");
+        
+        // Print full pointer SCEV for debugging
+        LLVM_DEBUG(dbgs() << "    Full pointer SCEV: " << *DS.BaseAddress << "\n");
+        
+        // Calculate cumulative span for this nesting level
+        // For first iteration: span = inner_trip_count * stride
+        // For subsequent iterations: span = previous_span * current_trip_count
+        LLVM_DEBUG(dbgs() << "    Inner stride: " << DS.Stride << " bytes\n");
+        LLVM_DEBUG(dbgs() << "    Child trip count: " << *InnerTripCount << "\n");
+        
+        // Ensure both operands have the same type to avoid SCEV assertion failure
+        Type *TripCountType = InnerTripCount->getType();
+        const SCEV *InnerStrideSCEV = SE.getConstant(TripCountType, DS.Stride);
+        
+        if (!CumulativeSpan) {
+          // First level: Span = TripCount * Stride
+          CumulativeSpan = SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
+        } else {
+          // Deeper level: Span = PreviousSpan * CurrentTripCount
+          // Need to ensure types match
+          if (CumulativeSpan->getType() != TripCountType) {
+            CumulativeSpan = SE.getSignExtendExpr(CumulativeSpan, TripCountType);
           }
-          CurrentLoop = CurrentLoop->getParentLoop();
+          CumulativeSpan = SE.getMulExpr(CumulativeSpan, InnerTripCount);
         }
         
-        if (IsOuterLoopRelated && BaseAR->isAffine()) {
-          BaseStep = BaseAR->getStepRecurrence(SE);
-          LLVM_DEBUG(dbgs() << "    Outer step: " << *BaseStep << "\n");
-        }
-      }
-      
-      if (!BaseStep) {
-        LLVM_DEBUG(dbgs() << "    ✗ Could not extract outer loop step\n");
-        continue;
-      }
-      
-      // Check if linearizable
-      bool IsPotentiallyLinearizable = false;
-      
-      if (isa<SCEVConstant>(InnerSpan) && isa<SCEVConstant>(BaseStep)) {
-        const SCEVConstant *SpanConst = cast<SCEVConstant>(InnerSpan);
-        const SCEVConstant *StepConst = cast<SCEVConstant>(BaseStep);
+        LLVM_DEBUG(dbgs() << "    Cumulative span at this level: " << *CumulativeSpan << "\n");
         
-        if (SpanConst->getAPInt() == StepConst->getAPInt()) {
+        // Extract parent loop step from base address using helper function
+        LLVM_DEBUG(dbgs() << "    Analyzing SCEV structure...\n");
+        
+        const SCEV *BaseStep = nullptr;
+        const SCEVAddRecExpr *ParentAddRec = FindAddRecForLoop(DS.BaseAddress, ParentLoop);
+        
+        if (ParentAddRec && ParentAddRec->isAffine()) {
+          // Found an AddRec for the parent loop - extract its step
+          const SCEV *RawStep = ParentAddRec->getStepRecurrence(SE);
+          
+          // Determine if step is already in bytes (pointer arithmetic) or index units
+          // If the AddRec type is a pointer type, step is already in bytes
+          // If the AddRec type is an integer type, step is in index units
+          bool StepIsAlreadyInBytes = ParentAddRec->getType()->isPointerTy();
+          
+          LLVM_DEBUG(dbgs() << "      Parent step (raw): " << *RawStep << "\n");
+          
+          if (StepIsAlreadyInBytes) {
+            // Step is already in bytes (e.g., {%ptr,+,40} for pointer arithmetic)
+            BaseStep = RawStep;
+            LLVM_DEBUG(dbgs() << "      Step is in bytes (pointer arithmetic)\n");
+          } else {
+            // Step is in index units (e.g., {0,+,%dim} for array indexing)
+            // Need to multiply by element size to get byte step
+            LLVM_DEBUG(dbgs() << "      Step is in index units (array indexing)\n");
+            LLVM_DEBUG(dbgs() << "      Element size: " << DS.Stride << " bytes\n");
+            
+            Type *StepType = RawStep->getType();
+            const SCEV *ElementSizeSCEV = SE.getConstant(StepType, DS.Stride);
+            BaseStep = SE.getMulExpr(RawStep, ElementSizeSCEV);
+          }
+          
+          LLVM_DEBUG(dbgs() << "      ✓ Found parent loop AddRec step\n");
+          LLVM_DEBUG(dbgs() << "    Parent step: " << *BaseStep << "\n");
+        }
+        
+        if (!BaseStep) {
+          LLVM_DEBUG(dbgs() << "    ✗ Could not extract parent loop step - dimension not contiguous\n");
+          LLVM_DEBUG(dbgs() << "    ✗ STOPPING merge analysis: intermediate dimension is non-contiguous\n");
+          // CRITICAL: Stop here! We can only merge contiguous dimensions in order.
+          // If dimension j is non-contiguous (e.g., A[i][idx_j][k] where idx_j is data-dependent),
+          // we CANNOT merge k→i even if i is contiguous, because j breaks the continuity.
+          // Example: D3B[i][A[j]%10][k] - cannot merge k→j→i even though i is contiguous
+          // because the j dimension uses indirect indexing.
+          break;
+        }
+        
+        // Check if linearizable at this nesting level
+        // For a stream to be linearizable, the cumulative span must equal the parent step
+        bool IsPotentiallyLinearizable = false;
+        
+        // First try SCEV pointer equality (works for symbolic expressions)
+        if (CumulativeSpan == BaseStep) {
           IsPotentiallyLinearizable = true;
-          LLVM_DEBUG(dbgs() << "    ✓ Constants match - linearizable!\n");
+          LLVM_DEBUG(dbgs() << "    ✓ Symbolic match - linearizable!\n");
         }
-      } else if (InnerSpan == BaseStep) {
-        IsPotentiallyLinearizable = true;
-        LLVM_DEBUG(dbgs() << "    ✓ Symbolic match - linearizable!\n");
-      } else if (const SCEVMulExpr *StepMul = dyn_cast<SCEVMulExpr>(BaseStep)) {
-        for (const SCEV *Op : StepMul->operands()) {
-          if (Op == InnerStrideSCEV || Op == InnerTripCount) {
-            const SCEV *ExpectedStep = SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
-            if (ExpectedStep == BaseStep) {
-              IsPotentiallyLinearizable = true;
-              LLVM_DEBUG(dbgs() << "    ✓ Stride×tripcount match - linearizable!\n");
-              break;
+        // For constants, compare values (handle different bit widths safely)
+        else if (isa<SCEVConstant>(CumulativeSpan) && isa<SCEVConstant>(BaseStep)) {
+          const SCEVConstant *SpanConst = cast<SCEVConstant>(CumulativeSpan);
+          const SCEVConstant *StepConst = cast<SCEVConstant>(BaseStep);
+          
+          // Use sign-extended comparison to handle different bit widths
+          const APInt &SpanVal = SpanConst->getAPInt();
+          const APInt &StepVal = StepConst->getAPInt();
+          
+          // Extend both to the maximum bit width before comparing
+          unsigned MaxWidth = std::max(SpanVal.getBitWidth(), StepVal.getBitWidth());
+          APInt SpanExtended = SpanVal.sext(MaxWidth);
+          APInt StepExtended = StepVal.sext(MaxWidth);
+          
+          if (SpanExtended == StepExtended) {
+            IsPotentiallyLinearizable = true;
+            LLVM_DEBUG(dbgs() << "    ✓ Constants match - linearizable!\n");
+          }
+        }
+        // Try matching against stride×tripcount pattern
+        else if (const SCEVMulExpr *StepMul = dyn_cast<SCEVMulExpr>(BaseStep)) {
+          for (const SCEV *Op : StepMul->operands()) {
+            if (Op == InnerStrideSCEV || Op == InnerTripCount) {
+              const SCEV *ExpectedStep = SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
+              if (ExpectedStep == BaseStep) {
+                IsPotentiallyLinearizable = true;
+                LLVM_DEBUG(dbgs() << "    ✓ Stride×tripcount match - linearizable!\n");
+                break;
+              }
             }
           }
         }
-      }
-      
-      if (IsPotentiallyLinearizable) {
-        StreamMergeCandidate Candidate;
-        Candidate.StreamID = DS.StreamID;
-        Candidate.InnerLoopID = DS.LoopID;
-        Candidate.OuterLoopID = OuterLoopID;
-        Candidate.RequiredBound = InnerLD->EndValueDynamic;
-        Candidate.ExpectedStride = BaseStep;
         
-        if (InnerLD->IsEndLinked) {
-          Candidate.RequiredDimensions.push_back(InnerLD->EndLinkID);
+        if (IsPotentiallyLinearizable) {
+          StreamMergeCandidate Candidate;
+          Candidate.StreamID = DS.StreamID;
+          Candidate.InnerLoopID = DS.LoopID;
+          Candidate.OuterLoopID = ParentLoopID;
+          Candidate.RequiredBound = ChildLD->EndValueDynamic;  // Runtime bound (Value*)
+          Candidate.ExpectedStride = BaseStep;
+          Candidate.RequiredDimensions = std::move(RequiredDimensions);
+          
+          MergeCandidates.push_back(Candidate);
+          
+          LLVM_DEBUG(dbgs() << "    → Merge candidate created (level " 
+                            << MergeCandidates.size() << ")\n");
+          
+          // Reset RequiredDimensions for next iteration
+          RequiredDimensions.clear();
+          // Re-add dimensions we've accumulated so far for next level
+          if (ChildLD->IsEndLinked) {
+            RequiredDimensions.push_back(ChildLD->EndLinkID);
+          }
+        } else {
+          LLVM_DEBUG(dbgs() << "    ✗ Span/step mismatch - not linearizable at this level\n");
         }
         
-        MergeCandidates.push_back(Candidate);
+        // Move to next parent loop (if any)
+        ChildLoop = ParentLoop;
         
-        LLVM_DEBUG(dbgs() << "    → Merge candidate created\n");
-      } else {
-        LLVM_DEBUG(dbgs() << "    ✗ Span/step mismatch - not linearizable\n");
-      }
-    }
+        // Find the parent loop's descriptor to get its trip count for next iteration
+        auto ParentLDIt = LoopIDToDescriptor.find(ParentLoopID);
+        if (ParentLDIt != LoopIDToDescriptor.end()) {
+          ChildLD = ParentLDIt->second;
+          InnerTripCount = ChildLD->EndValue;
+          if (ChildLD->IsEndLinked && InnerTripCount) {
+            RequiredDimensions.push_back(ChildLD->EndLinkID);
+          }
+        } else {
+          // No descriptor for parent loop, can't continue walking up
+          break;
+        }
+      }  // End while (walking up parent loops)
+    }  // End for (each stream)
     
     if (!MergeCandidates.empty()) {
       LLVM_DEBUG(dbgs() << "\n═══ Merge Candidates Summary ═══\n");

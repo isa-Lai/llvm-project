@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-void patternB_4level_nesting(int *A, int *B, int *C, int *D, 
+void patternB_4level_nesting(int *A, int *B, int *C, int *D, int*E,
                               int N, int M, int P, int Q) {
     for (int i = 0; i < N; i++) {           // Loop 0 (outermost)
         for (int j = 0; j < M; j++) {       // Loop 1 (nested in Loop 0)
@@ -16,6 +16,7 @@ void patternB_4level_nesting(int *A, int *B, int *C, int *D,
                     B[j]++;  // Loop 1 variable (2 levels up from innermost)
                     C[k]++;  // Loop 2 variable (1 level up from innermost)
                     D[m]++;  // Loop 3 variable (current level)
+                    E[i*M*P*Q+j*P*Q+k*Q+m]++; // Combination access
                 }
             }
         }
@@ -33,8 +34,9 @@ int main() {
     int *B = (int *)calloc(M, sizeof(int));
     int *C = (int *)calloc(P, sizeof(int));
     int *D = (int *)calloc(Q, sizeof(int));
+    int *E = (int *)calloc(N*M*P*Q, sizeof(int));   
     
-    patternB_4level_nesting(A, B, C, D, N, M, P, Q);
+    patternB_4level_nesting(A, B, C, D, E, N, M, P, Q);
     
     // Verify results
     // A[i] should be incremented M*P*Q times for each i
@@ -53,6 +55,7 @@ int main() {
     free(B);
     free(C);
     free(D);
+    free(E);
     
     return 0;
 }
