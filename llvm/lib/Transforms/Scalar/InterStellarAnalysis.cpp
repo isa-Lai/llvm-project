@@ -3705,12 +3705,29 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
           }
         }
         
-        // CRITICAL: For multi-dimensional arrays, we need to find the coefficient
-        // of the OUTER loop variable in the full address expression.
-        //
-        // The address SCEV from the inner loop's perspective contains the outer
-        // loop variable as an AddRec. We extract its step coefficient and compare
-        // with the inner loop's bound.
+        // For multi-level merges (e.g., Loop #2 → Loop #0), compute cumulative bound
+        // Example: idx = i*dim2*dim3 + j*dim3 + k
+        // Merging (k,j) → i requires checking: coefficient(i) == bound(j) * bound(k)
+        const SCEV *CumulativeBound = InnerLoopBound;
+        
+        if (Candidate.RequiredDimensions.size() > 1) {
+          // Multi-level merge: multiply all intermediate loop bounds
+          // RequiredDimensions contains [innermost, ..., outermost-1]
+          for (unsigned LoopID = Candidate.InnerLoopID - 1; LoopID > Candidate.OuterLoopID; LoopID--) {
+            auto LDIt = LoopIDToDescriptor.find(LoopID);
+            if (LDIt != LoopIDToDescriptor.end()) {
+              const LoopDescriptor *IntermediateLD = LDIt->second;
+              const SCEV *IntermediateBound = IntermediateLD->EndValue;
+              if (IntermediateLD->EndValueDynamic && IntermediateLD->IsEndLinked) {
+                const SCEV *DynSCEV = SE.getSCEV(IntermediateLD->EndValueDynamic);
+                if (DynSCEV) IntermediateBound = DynSCEV;
+              }
+              CumulativeBound = SE.getMulExpr(CumulativeBound, IntermediateBound);
+            }
+          }
+        }
+        
+        // Find outer loop coefficient in address SCEV
         
         const SCEVAddRecExpr *OuterAddRecInAddress = FindAddRecForLoop(FullAddressSCEV, OuterLD->L);
         
@@ -3756,24 +3773,37 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
             }
           }
           
-          // Compare outer coefficient with inner bound
+          // Compare outer coefficient with cumulative bound
           
           bool IsMatch = false;
           
-          if (NormalizedCoefficient == InnerLoopBound) {
+          if (NormalizedCoefficient == CumulativeBound) {
             IsMatch = true;
           }
           else if (const SCEVConstant *CoeffConst = dyn_cast<SCEVConstant>(NormalizedCoefficient)) {
-            if (const SCEVConstant *BoundConst = dyn_cast<SCEVConstant>(InnerLoopBound)) {
+            if (const SCEVConstant *BoundConst = dyn_cast<SCEVConstant>(CumulativeBound)) {
               if (CoeffConst->getAPInt() == BoundConst->getAPInt()) {
                 IsMatch = true;
               }
             }
           }
-          else if (InnerLD->EndValueDynamic) {
-            if (const SCEVUnknown *CoeffUnknown = dyn_cast<SCEVUnknown>(NormalizedCoefficient)) {
-              if (CoeffUnknown->getValue() == InnerLD->EndValueDynamic) {
-                IsMatch = true;
+          else if (CumulativeBound->getSCEVType() == scMulExpr) {
+            // For symbolic multiplication like (%dim2 * %dim3), try to match
+            if (NormalizedCoefficient->getSCEVType() == scMulExpr) {
+              // Both are MulExpr, check if they're equivalent
+              const SCEVMulExpr *CoeffMul = cast<SCEVMulExpr>(NormalizedCoefficient);
+              const SCEVMulExpr *BoundMul = cast<SCEVMulExpr>(CumulativeBound);
+              if (CoeffMul->getNumOperands() == BoundMul->getNumOperands()) {
+                // Check if all operands match (order-independent comparison)
+                SmallPtrSet<const SCEV *, 4> CoeffOps(CoeffMul->operands().begin(), CoeffMul->operands().end());
+                bool AllMatch = true;
+                for (const SCEV *BoundOp : BoundMul->operands()) {
+                  if (!CoeffOps.count(BoundOp)) {
+                    AllMatch = false;
+                    break;
+                  }
+                }
+                if (AllMatch) IsMatch = true;
               }
             }
           }
