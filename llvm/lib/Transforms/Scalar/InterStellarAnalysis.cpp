@@ -34,6 +34,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
+#include <map>
 
 #define DEBUG_TYPE "interstellar-analysis"
 
@@ -3541,6 +3542,110 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
                             << " dimension(s))");
         }
         LLVM_DEBUG(dbgs() << "\n");
+      }
+      
+      // ============================================================
+      // STAGE 2.4: DEDUPLICATION - KEEP ONLY OUTERMOST MERGES
+      // ============================================================
+      // When multiple merge candidates exist for the same stream at different
+      // nesting levels, keep only the outermost (broadest) merge.
+      // Example: For Stream #0 with both "Loop 2→1" and "Loop 2→0",
+      //          keep only "Loop 2→0" since it's the broadest merge.
+      // Rationale:
+      //   - Maximizes stream length (outermost = longest span)
+      //   - Minimizes metadata overhead (one descriptor per stream)
+      //   - Simplifies backend implementation
+      // ============================================================
+      
+      if (MergeCandidates.size() > 1) {
+        LLVM_DEBUG(dbgs() << "\n[Stage 2.4] Deduplication - Keep Only Outermost Merges\n");
+        
+        // Group candidates by (StreamID, InnerLoopID)
+        // Key: pair<StreamID, InnerLoopID>
+        // Value: vector of indices into MergeCandidates
+        std::map<std::pair<unsigned, unsigned>, SmallVector<size_t, 4>> CandidateGroups;
+        
+        for (size_t i = 0; i < MergeCandidates.size(); ++i) {
+          auto Key = std::make_pair(MergeCandidates[i].StreamID, 
+                                    MergeCandidates[i].InnerLoopID);
+          CandidateGroups[Key].push_back(i);
+        }
+        
+        // Track which candidates to keep
+        SmallVector<bool, 8> KeepCandidate(MergeCandidates.size(), true);
+        unsigned RemovedCount = 0;
+        
+        // For each group with multiple candidates, keep only the outermost
+        for (const auto &Entry : CandidateGroups) {
+          const auto &Indices = Entry.second;
+          
+          if (Indices.size() > 1) {
+            // Find the candidate with the smallest OuterLoopID (outermost loop)
+            // Loop numbering: Loop 0 = outermost, Loop N = innermost
+            size_t OutermostIdx = Indices[0];
+            unsigned MinOuterLoopID = MergeCandidates[Indices[0]].OuterLoopID;
+            
+            for (size_t i = 1; i < Indices.size(); ++i) {
+              unsigned CurrOuterLoopID = MergeCandidates[Indices[i]].OuterLoopID;
+              if (CurrOuterLoopID < MinOuterLoopID) {
+                MinOuterLoopID = CurrOuterLoopID;
+                OutermostIdx = Indices[i];
+              }
+            }
+            
+            // Debug output: show which candidates we're considering
+            LLVM_DEBUG(dbgs() << "\nStream #" << MergeCandidates[Indices[0]].StreamID 
+                              << " (Loop #" << MergeCandidates[Indices[0]].InnerLoopID 
+                              << "):\n");
+            LLVM_DEBUG(dbgs() << "  Found " << Indices.size() 
+                              << " merge candidates, keeping only outermost:\n");
+            
+            // Mark all candidates except the outermost for removal
+            for (size_t Idx : Indices) {
+              if (Idx != OutermostIdx) {
+                KeepCandidate[Idx] = false;
+                RemovedCount++;
+                LLVM_DEBUG(dbgs() << "    ✗ REMOVE: Loop #" 
+                                  << MergeCandidates[Idx].InnerLoopID
+                                  << " → Loop #" << MergeCandidates[Idx].OuterLoopID
+                                  << " (redundant)\n");
+              } else {
+                LLVM_DEBUG(dbgs() << "    ✓ KEEP: Loop #" 
+                                  << MergeCandidates[Idx].InnerLoopID
+                                  << " → Loop #" << MergeCandidates[Idx].OuterLoopID
+                                  << " (outermost)\n");
+              }
+            }
+          }
+        }
+        
+        // Filter out removed candidates
+        if (RemovedCount > 0) {
+          SmallVector<StreamMergeCandidate, 4> FilteredCandidates;
+          for (size_t i = 0; i < MergeCandidates.size(); ++i) {
+            if (KeepCandidate[i]) {
+              FilteredCandidates.push_back(MergeCandidates[i]);
+            }
+          }
+          MergeCandidates = std::move(FilteredCandidates);
+          
+          LLVM_DEBUG(dbgs() << "\nRemoved " << RemovedCount 
+                            << " redundant merge candidate(s)\n");
+          LLVM_DEBUG(dbgs() << "\n═══ Deduplicated Merge Candidates ═══\n");
+          LLVM_DEBUG(dbgs() << "Total candidates: " << MergeCandidates.size() << "\n");
+          for (const auto &Candidate : MergeCandidates) {
+            LLVM_DEBUG(dbgs() << "  Stream #" << Candidate.StreamID 
+                              << ": Loop #" << Candidate.InnerLoopID
+                              << " → Loop #" << Candidate.OuterLoopID);
+            if (!Candidate.RequiredDimensions.empty()) {
+              LLVM_DEBUG(dbgs() << " (requires " << Candidate.RequiredDimensions.size() 
+                                << " dimension(s))");
+            }
+            LLVM_DEBUG(dbgs() << "\n");
+          }
+        } else {
+          LLVM_DEBUG(dbgs() << "  No redundant candidates found\n");
+        }
       }
       
       // ============================================================
