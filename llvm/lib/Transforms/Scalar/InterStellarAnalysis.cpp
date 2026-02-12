@@ -3206,8 +3206,11 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
   
   SmallVector<DirectStreamDescriptor, 8> Streams = Analyzer.getDirectStreams();
   SmallVector<LoopDescriptor, 4> Loops = Analyzer.getLoopDescriptors();
+  SmallVector<IndirectStreamDescriptor, 4> IndirectStreams = Analyzer.getIndirectStreams();
   
-  if (!Streams.empty() && !Loops.empty()) {
+  // Run Pass 2 if there are any loops (even without streams)
+  // Stage 1.5 will clean up empty loops before merge analysis
+  if (!Loops.empty()) {
     auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
     
     LLVM_DEBUG(dbgs() << "\n"
@@ -3216,11 +3219,12 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
                       << "╚═══════════════════════════════════════════════════╝\n");
     
     // Stage 1.1: Eliminate redundant streams using dominance analysis
-    // Group streams by signature (LoopID, BaseAddress, Stride)
-    LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Redundancy Analysis\n");
-    
-    SmallVector<SmallVector<unsigned, 2>, 4> StreamGroups;
-    SmallVector<bool, 8> Processed(Streams.size(), false);
+    // Only run if there are streams to deduplicate
+    if (!Streams.empty()) {
+      LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Redundancy Analysis\n");
+      
+      SmallVector<SmallVector<unsigned, 2>, 4> StreamGroups;
+      SmallVector<bool, 8> Processed(Streams.size(), false);
     
     for (size_t i = 0; i < Streams.size(); ++i) {
       if (Processed[i])
@@ -3309,8 +3313,6 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
     // Stage 1.1: Also analyze indirect stream redundancy
     // Indirect streams should be deduplicated based on base address, element size,
     // and index source (either a specific stream ID or computed/random)
-    // Get IndirectStreams early - we'll filter it and use the filtered version for final output
-    SmallVector<IndirectStreamDescriptor, 4> IndirectStreams = Analyzer.getIndirectStreams();
     
     if (!IndirectStreams.empty()) {
       LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Indirect Stream Redundancy Analysis\n");
@@ -3431,8 +3433,11 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       IndirectStreams = std::move(FilteredIndirectStreams);
     }
     
+    } // End: if (!Streams.empty()) - Stage 1.1
+    
     // Helper function to extract AddRecExpr for a specific loop from complex SCEV
     // Recursively searches through SCEV tree (AddExpr, MulExpr, CastExpr, etc.)
+    // Declared here for use in both Stage 1.2 and Stage 2
     std::function<const SCEVAddRecExpr *(const SCEV *, const Loop *)> FindAddRecForLoop = 
         [&](const SCEV *S, const Loop *TargetLoop) -> const SCEVAddRecExpr * {
       if (!S || !TargetLoop)
@@ -3483,19 +3488,19 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       return nullptr;
     };
     
-    // Stage 1.2: Analyze merge feasibility for nested loops
-    LLVM_DEBUG(dbgs() << "\n[Stage 1.2] Linearization Feasibility Analysis\n");
-    
-    // Build mapping from LoopID to Loop descriptor
+    // Build mapping from LoopID to Loop descriptor (used in Stage 1.2 and Stage 2)
     DenseMap<unsigned, const LoopDescriptor *> LoopIDToDescriptor;
     for (const auto &LD : Loops) {
       LoopIDToDescriptor[LD.LoopID] = &LD;
     }
     
-    // Analyze each stream for potential linearization
-    // For deep nested loops (3+), we need to recursively check all parent loops
-    // to identify all possible merge opportunities at each nesting level
+    // Merge candidates (populated in Stage 1.2, used in Stage 2 & 3)
     SmallVector<StreamMergeCandidate, 4> MergeCandidates;
+    
+    // Stage 1.2: Analyze merge feasibility for nested loops
+    // Only run if there are streams to analyze
+    if (!Streams.empty()) {
+      LLVM_DEBUG(dbgs() << "\n[Stage 1.2] Linearization Feasibility Analysis\n");
     
     for (const auto &DS : Streams) {
       auto LoopIt = LoopIDToDescriptor.find(DS.LoopID);
@@ -3734,6 +3739,95 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
         }
       }  // End while (walking up parent loops)
     }  // End for (each stream)
+    
+    } // End: if (!Streams.empty()) - Stage 1.2
+    
+    // ============================================================
+    // STAGE 1.5: EARLY CLEANUP - REMOVE EMPTY LOOPS
+    // ============================================================
+    // Remove loops with no associated streams BEFORE merge analysis
+    // This optimization saves analysis time when loops have no streams
+    // (e.g., pure computation loops without memory accesses)
+    // This stage ALWAYS runs if there are any loops, even if no streams
+    //
+    // IMPORTANT: We must keep parent loops of loops with streams,
+    // as they may be needed for merge analysis in Stage 2.
+    // ============================================================
+    
+    LLVM_DEBUG(dbgs() << "\n[Stage 1.5] Early cleanup: Removing loops with no streams\n");
+    
+    // Count streams per loop
+    DenseMap<unsigned, unsigned> StreamCountPerLoop;
+    for (const auto &DS : Streams) {
+      StreamCountPerLoop[DS.LoopID]++;
+    }
+    
+    // Mark loops with streams as active (Stage 1.5 early cleanup)
+    DenseSet<unsigned> KeepLoopIDs;
+    for (const auto &LD : Loops) {
+      if (StreamCountPerLoop.lookup(LD.LoopID) > 0) {
+        KeepLoopIDs.insert(LD.LoopID);
+      }
+    }
+    
+    // Recursively mark parent loops as active
+    // (they may be needed for merge analysis)
+    bool FoundNewParent = true;
+    while (FoundNewParent) {
+      FoundNewParent = false;
+      for (const auto &LD : Loops) {
+        if (KeepLoopIDs.count(LD.LoopID)) {
+          continue;  // Already active
+        }
+        
+        // Check if this loop is a parent of any active loop
+        for (const auto &ChildLD : Loops) {
+          if (KeepLoopIDs.count(ChildLD.LoopID) && 
+              ChildLD.ParentLoopID == LD.LoopID) {
+            KeepLoopIDs.insert(LD.LoopID);
+            FoundNewParent = true;
+            break;
+          }
+        }
+      }
+    }
+    
+    // Filter out loops with no streams and no active children
+    SmallVector<LoopDescriptor, 4> FilteredLoops;
+    unsigned RemovedCount = 0;
+    
+    for (const auto &LD : Loops) {
+      if (KeepLoopIDs.count(LD.LoopID)) {
+        FilteredLoops.push_back(LD);
+      } else {
+        RemovedCount++;
+        LLVM_DEBUG(dbgs() << "  ✗ Removed Loop #" << LD.LoopID 
+                          << " (no streams, not a parent)\n");
+      }
+    }
+    
+    if (RemovedCount > 0) {
+      Loops = std::move(FilteredLoops);
+      LLVM_DEBUG(dbgs() << "  Removed " << RemovedCount 
+                        << " empty loop(s), " << Loops.size() 
+                        << " loop(s) remaining\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "  No empty loops to remove\n");
+    }
+    
+    // Early exit: If no loops remain, skip merge analysis entirely
+    if (Loops.empty()) {
+      LLVM_DEBUG(dbgs() << "\n[Stage 1.5] No loops remaining after cleanup\n");
+      LLVM_DEBUG(dbgs() << "Skipping Stage 2 (Pattern Classification)\n");
+      LLVM_DEBUG(dbgs() << "Skipping Stage 3 (Loop Merge Transformation)\n");
+      
+      // Print final results with remaining streams (if any)
+      SmallVector<LinkVariableDescriptor, 4> LinkVars = Analyzer.getLinkVariables();
+      LLVM_DEBUG(printAllDescriptors(dbgs(), Loops, Streams, IndirectStreams, LinkVars));
+      
+      // Analysis complete - return
+      return PreservedAnalyses::all();
+    }
     
     // Get LinkVariables early - needed for Stage 3 merges and final output
     SmallVector<LinkVariableDescriptor, 4> LinkVars = Analyzer.getLinkVariables();
@@ -4472,16 +4566,16 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       
       LLVM_DEBUG(dbgs() << "\n[Stage 3.1] Cleaning up unused loop descriptors\n");
       
-      // Count streams per loop
-      DenseMap<unsigned, unsigned> StreamCountPerLoop;
+      // Count streams per loop (for Stage 3.1 parent relationship analysis)
+      DenseMap<unsigned, unsigned> StreamsPerLoop;
       for (const auto &DS : Streams) {
-        StreamCountPerLoop[DS.LoopID]++;
+        StreamsPerLoop[DS.LoopID]++;
       }
       
       // Pass 1: Mark loops that are directly active (have streams or are virtual)
       DenseSet<unsigned> ActiveLoopIDs;
       for (const auto &LD : Loops) {
-        if (StreamCountPerLoop.lookup(LD.LoopID) > 0 || LD.IsVirtual) {
+        if (StreamsPerLoop.lookup(LD.LoopID) > 0 || LD.IsVirtual) {
           ActiveLoopIDs.insert(LD.LoopID);
         }
       }
@@ -4532,13 +4626,13 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
         }
       }
       
-      // Build filtered loop list and track removed loops
-      SmallVector<LoopDescriptor, 4> FilteredLoops;
+      // Build filtered loop list and track removed loops (Stage 3.1)
+      SmallVector<LoopDescriptor, 4> ActiveLoops;
       SmallPtrSet<const LoopDescriptor *, 4> RemovedLoops;
       
       for (const auto &LD : Loops) {
         if (ActiveLoopIDs.count(LD.LoopID)) {
-          FilteredLoops.push_back(LD);
+          ActiveLoops.push_back(LD);
         } else {
           RemovedLoops.insert(&LD);
           LLVM_DEBUG(dbgs() << "  ✗ Removed Loop #" << LD.LoopID 
@@ -4548,7 +4642,7 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       
       // Update loops collection
       if (RemovedLoops.size() > 0) {
-        Loops = std::move(FilteredLoops);
+        Loops = std::move(ActiveLoops);
         LLVM_DEBUG(dbgs() << "  Removed " << RemovedLoops.size() 
                           << " unused loop descriptor(s)\n");
       } else {
@@ -4572,7 +4666,7 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       // Use the updated LinkVars from Stage 3 (which includes new link IDs for merged bounds)
       
       LLVM_DEBUG(printAllDescriptors(dbgs(), Loops, Streams, IndirectStreams, LinkVars));
-  } // End: if (!Streams.empty() && !Loops.empty())
+  } // End: if (!Loops.empty())
   
   // This is an analysis pass, it doesn't modify the IR
   return PreservedAnalyses::all();

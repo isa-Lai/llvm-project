@@ -21,6 +21,15 @@ void pattern5_2d_pointer(int *A, int *D2A, int N, int D2_rows, int D2_cols) {
     }
 }
 
+void pattern5_2d_pointerB(int *A, int *D2A, int N, int D2_rows, int D2_cols) {
+    for (int i = 0; i < D2_rows; i++) {
+        for (int j = 0; j < D2_cols; j++) {
+            // Direct access: D2A[i][j] (linearized as D2A[i * D2_cols + j])
+            D2A[i * D2_cols + j]++;
+        }
+    }
+}
+
 int main() {
     // Test 1: N = 30, 15x20 array
     int N1 = 30;

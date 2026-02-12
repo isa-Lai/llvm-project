@@ -23,6 +23,34 @@ void patternB_4level_nesting(int *A, int *B, int *C, int *D, int*E,
     }
 }
 
+void patternB_4d_array(int A[][10][10][10], int N) {
+    // 4-level nested access pattern
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < 10; j++) {
+            for (int k = 0; k < 10; k++) {
+                for (int m = 0; m < 10; m++) {
+                    A[i][j][k][m]++;
+                }
+            }
+        }
+    }
+}
+
+void patternB_4d_array_pointer(int *A, int N, int M, int P, int Q) {
+    // 4-level nested access pattern with pointer and index calculation
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < M; j++) {
+            for (int k = 0; k < P; k++) {
+                for (int m = 0; m < Q; m++) {
+                    A[i*M*P*Q + j*P*Q + k*Q + m]++;
+                }
+            }
+        }
+    }
+}
+
+
+
 int main() {
     // Test: 4x5x6x7 nested structure
     int N = 4;

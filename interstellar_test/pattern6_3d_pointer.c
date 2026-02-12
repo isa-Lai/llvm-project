@@ -39,6 +39,18 @@ void pattern6_3d_pointer(int *A, int *D3A, int N, int D3_dim1, int D3_dim2, int 
     }
 }
 
+void pattern6_3d_pointerB(int *A, int *D3A, int N, int D3_dim1, int D3_dim2, int D3_dim3) {
+    for (int i = 0; i < D3_dim1; i++) {
+        for (int j = 0; j < D3_dim2-1; j++) {
+            for (int k = 0; k < D3_dim3; k++) {
+                // Direct access: D3A[i][j][k] (linearized)
+                int idx = i * D3_dim2 * D3_dim3 + j * D3_dim3 + k;
+                D3A[idx]++;
+            }
+        }
+    }
+}
+
 int main() {
     // Test 1: N = 15, 8x10x12 array
     int N1 = 15;
