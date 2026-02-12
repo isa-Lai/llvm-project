@@ -22,6 +22,17 @@ void pattern7_2d_fixed(int *A, int D2B[][10], int N) {
     }
 }
 
+
+void pattern7_2d_fixedB(int *B, int D2B[][10], int N) {
+    int D2B_rows = 10;  // Fixed size
+    for (int i = 0; i < D2B_rows; i++) {
+        for (int j = 0; j < 10; j++) {
+            // Direct access: D2B[i][j]
+            D2B[i][j]++;
+        }
+    }
+}
+
 int main() {
     // Test 1: N = 50
     int N1 = 50;

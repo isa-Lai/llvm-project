@@ -6,7 +6,8 @@
 
 void pattern8_3d_fixed(int *A, int D3B[][10][10], int N) {
     int D3B_dim1 = 10;  // Fixed size
-    for (int i = 0; i < D3B_dim1; i++) {
+    int D3B_dim2 = 10;  // Fixed size
+    for (int i = 0; i < D3B_dim2; i++) {
         for (int j = 0; j < 10; j++) {
             for (int k = 0; k < 10; k++) {
                 // Direct access: D3B[i][j][k]
@@ -29,6 +30,19 @@ void pattern8_3d_fixed(int *A, int D3B[][10][10], int N) {
                 D3B[i][rand_j][k]++;
                 int rand_k = rand() % 10;
                 D3B[i][j][rand_k]++;
+            }
+        }
+    }
+}
+
+void pattern8_3d_fixedB(int *A, int D3B[][10][10], int N) {
+    int D3B_dim1 = 10;  // Fixed size
+    int D3B_dim2 = 10;  // Fixed size
+    for (int i = 0; i < D3B_dim2; i++) {
+        for (int j = 0; j < 10; j++) {
+            for (int k = 0; k < 10; k++) {
+                // Direct access: D3B[i][j][k]
+                D3B[i][j][k]++;
             }
         }
     }

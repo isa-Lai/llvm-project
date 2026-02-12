@@ -24,6 +24,7 @@ void pattern9_mixed(int *A, int *B, struct Point *points, int D2B[][10], int N) 
         for (int j = 0; j < 10; j++) {
             D2B[i][j] = A[i] + j;
             D2B[idx % 10][j] = B[idx] - j;
+            D2B[idx % 10][j+1] = B[idx+j] - j;
         }
     }
 }

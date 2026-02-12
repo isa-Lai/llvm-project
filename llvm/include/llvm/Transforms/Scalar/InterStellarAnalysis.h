@@ -73,6 +73,12 @@ struct LoopDescriptor {
   unsigned StartLinkID = 0;            // Link Descriptor ID if SL=1
   unsigned EndLinkID = 0;              // Link Descriptor ID if EL=1
   DebugLoc Loc;                        // Source location of the loop
+  
+  // Virtual loop metadata (for merged loops)
+  bool IsVirtual = false;              // True if this is a virtual merged loop
+  unsigned MergedFromInnerLoop = 0;    // Original inner loop ID (if virtual)
+  unsigned MergedToOuterLoop = 0;      // Original outer loop ID (if virtual)
+  SmallVector<unsigned, 2> MergedDimensions; // Link IDs of merged dimensions
 };
 
 /// Data structure to represent a link variable descriptor
