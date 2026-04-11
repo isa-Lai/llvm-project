@@ -1490,7 +1490,7 @@ void tools::addOpenMPHostOffloadingArgs(const Compilation &C,
   // information using -fopenmp-targets= option.
   constexpr llvm::StringLiteral Targets("--offload-targets=");
 
-  SmallVector<std::string> Triples;
+  SmallVector<StringRef> Triples;
   auto TCRange = C.getOffloadToolChains<Action::OFK_OpenMP>();
   std::transform(TCRange.first, TCRange.second, std::back_inserter(Triples),
                  [](auto TC) { return TC.second->getTripleString(); });
@@ -1796,16 +1796,22 @@ bool tools::addSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
     CmdArgs.push_back("--export-dynamic-symbol=__cfi_check");
 
   if (SanArgs.hasMemTag()) {
-    if (!TC.getTriple().isAndroid()) {
-      TC.getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
-          << "-fsanitize=memtag*" << TC.getTriple().str();
-    }
+    CmdArgs.push_back("-z");
     CmdArgs.push_back(
-        Args.MakeArgString("--android-memtag-mode=" + SanArgs.getMemtagMode()));
-    if (SanArgs.hasMemtagHeap())
-      CmdArgs.push_back("--android-memtag-heap");
-    if (SanArgs.hasMemtagStack())
-      CmdArgs.push_back("--android-memtag-stack");
+        Args.MakeArgString("memtag-mode=" + SanArgs.getMemtagMode()));
+
+    if (SanArgs.hasMemtagHeap()) {
+      CmdArgs.push_back("-z");
+      CmdArgs.push_back("memtag-heap");
+    }
+
+    if (SanArgs.hasMemtagStack()) {
+      CmdArgs.push_back("-z");
+      CmdArgs.push_back("memtag-stack");
+    }
+
+    if (TC.getTriple().isAndroid())
+      CmdArgs.push_back("--android-memtag-note");
   }
 
   return !StaticRuntimes.empty() || !NonWholeStaticRuntimes.empty() ||
@@ -2345,6 +2351,16 @@ bool tools::checkDebugInfoOption(const Arg *A, const ArgList &Args,
   D.Diag(diag::warn_drv_unsupported_debug_info_opt_for_target)
       << A->getAsString(Args) << TC.getTripleString();
   return false;
+}
+
+void tools::addDebugInfoForProfilingArgs(const Driver &D, const ToolChain &TC,
+                                         const ArgList &Args,
+                                         ArgStringList &CmdArgs) {
+  if (Args.hasFlag(options::OPT_fdebug_info_for_profiling,
+                   options::OPT_fno_debug_info_for_profiling, false) &&
+      checkDebugInfoOption(
+          Args.getLastArg(options::OPT_fdebug_info_for_profiling), Args, D, TC))
+    CmdArgs.push_back("-fdebug-info-for-profiling");
 }
 
 void tools::AddAssemblerKPIC(const ToolChain &ToolChain, const ArgList &Args,
@@ -2966,11 +2982,12 @@ void tools::addMachineOutlinerArgs(const Driver &D,
         D.Diag(diag::warn_drv_moutline_unsupported_opt) << Triple.getArchName();
       }
     } else {
-      // Disable all outlining behaviour.
-      //
-      // FIXME: This should probably use the `nooutline` attribute rather than
-      // tweaking Pipeline Pass flags, so `-mno-outline` and `-moutline` objects
-      // can be combined correctly during LTO.
+      if (!IsLTO)
+        // Disable all outlining behaviour using `nooutline` attribute, in case
+        // Linker Invocation lacks `-mno-outline`.
+        CmdArgs.push_back("-mno-outline");
+
+      // Disable Pass in Pipeline
       addArg(Twine("-enable-machine-outliner=never"));
     }
   }
@@ -3090,7 +3107,7 @@ void tools::addOpenCLBuiltinsLib(const Driver &D, const llvm::Triple &TT,
   bool FilenameSearch = LibclcNamespec.consume_front(":");
   if (FilenameSearch) {
     SmallString<128> LibclcFile(LibclcNamespec);
-    if (llvm::sys::fs::exists(LibclcFile)) {
+    if (D.getVFS().exists(LibclcFile)) {
       CC1Args.push_back("-mlink-builtin-bitcode");
       CC1Args.push_back(DriverArgs.MakeArgString(LibclcFile));
       return;
@@ -3112,7 +3129,7 @@ void tools::addOpenCLBuiltinsLib(const Driver &D, const llvm::Triple &TT,
     if (!CPU.empty()) {
       SmallString<128> CPUPath(BasePath);
       llvm::sys::path::append(CPUPath, CPU, "libclc.bc");
-      if (llvm::sys::fs::exists(CPUPath)) {
+      if (D.getVFS().exists(CPUPath)) {
         CC1Args.push_back("-mlink-builtin-bitcode");
         CC1Args.push_back(DriverArgs.MakeArgString(CPUPath));
         return;
@@ -3123,7 +3140,7 @@ void tools::addOpenCLBuiltinsLib(const Driver &D, const llvm::Triple &TT,
   // Fall back to the generic library for the triple.
   SmallString<128> GenericPath(BasePath);
   llvm::sys::path::append(GenericPath, "libclc.bc");
-  if (llvm::sys::fs::exists(GenericPath)) {
+  if (D.getVFS().exists(GenericPath)) {
     CC1Args.push_back("-mlink-builtin-bitcode");
     CC1Args.push_back(DriverArgs.MakeArgString(GenericPath));
     return;
