@@ -32,6 +32,8 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -191,14 +193,6 @@ void NVPTXAsmPrinter::emitInstruction(const MachineInstr *MI) {
 
 void NVPTXAsmPrinter::lowerToMCInst(const MachineInstr *MI, MCInst &OutMI) {
   OutMI.setOpcode(MI->getOpcode());
-  // Special: Do not mangle symbol operand of CALL_PROTOTYPE
-  if (MI->getOpcode() == NVPTX::CALL_PROTOTYPE) {
-    const MachineOperand &MO = MI->getOperand(0);
-    OutMI.addOperand(GetSymbolRef(
-      OutContext.getOrCreateSymbol(Twine(MO.getSymbolName()))));
-    return;
-  }
-
   for (const auto MO : MI->operands())
     OutMI.addOperand(lowerOperand(MO));
 }
@@ -320,6 +314,107 @@ void NVPTXAsmPrinter::printReturnValStr(const MachineFunction &MF,
   printReturnValStr(&F, O);
 }
 
+void NVPTXAsmPrinter::emitCallPrototype(const CallBase &CB,
+                                        unsigned UniqueCallSite,
+                                        raw_ostream &O) const {
+  const DataLayout &DL = getDataLayout();
+  const NVPTXSubtarget &STI = MF->getSubtarget<NVPTXSubtarget>();
+  const auto *TLI = cast<NVPTXTargetLowering>(STI.getTargetLowering());
+  const auto PtrVT = TLI->getPointerTy(DL);
+  Type *RetTy = CB.getFunctionType()->getReturnType();
+
+  O << "prototype_" << UniqueCallSite << " : .callprototype ";
+
+  if (RetTy->isVoidTy()) {
+    O << "()";
+  } else {
+    O << "(";
+    if (shouldPassAsArray(RetTy)) {
+      const Align RetAlign =
+          getPTXParamAlign(&CB, RetTy, AttributeList::ReturnIndex, DL);
+      O << ".param .align " << RetAlign.value() << " .b8 _["
+        << DL.getTypeAllocSize(RetTy) << "]";
+    } else if (RetTy->isFloatingPointTy() || RetTy->isIntegerTy()) {
+      unsigned size = 0;
+      if (auto *ITy = dyn_cast<IntegerType>(RetTy)) {
+        size = ITy->getBitWidth();
+      } else {
+        assert(RetTy->isFloatingPointTy() &&
+               "Floating point type expected here");
+        size = RetTy->getPrimitiveSizeInBits();
+      }
+      // PTX ABI requires all scalar return values to be at least 32
+      // bits in size.  fp16 normally uses .b16 as its storage type in
+      // PTX, so its size must be adjusted here, too.
+      size = promoteScalarArgumentSize(size);
+
+      O << ".param .b" << size << " _";
+    } else if (isa<PointerType>(RetTy)) {
+      O << ".param .b" << PtrVT.getSizeInBits() << " _";
+    } else {
+      llvm_unreachable("Unknown return type");
+    }
+    O << ") ";
+  }
+  O << "_ (";
+
+  auto MakeArg = [&](const unsigned I) {
+    Type *Ty = CB.getArgOperand(I)->getType();
+
+    if (CB.paramHasAttr(I, Attribute::ByVal)) {
+      // Indirect calls need strict ABI alignment so we disable optimizations by
+      // not providing a function to optimize.
+      Type *ETy = CB.getParamByValType(I);
+      // Mirror the byval alignment computed by SelectionDAGBuilder: prefer an
+      // explicit stack/param alignment, otherwise fall back to the byval type
+      // alignment.
+      MaybeAlign InitialAlign = CB.getParamStackAlign(I);
+      if (!InitialAlign)
+        InitialAlign = CB.getParamAlign(I);
+      Align ByValAlign =
+          InitialAlign.value_or(TLI->getByValTypeAlignment(ETy, DL));
+      Align ParamByValAlign =
+          getDeviceByValParamAlign(/*F=*/nullptr, ETy, ByValAlign, DL);
+
+      O << ".param .align " << ParamByValAlign.value() << " .b8 _["
+        << DL.getTypeAllocSize(ETy) << "]";
+      return;
+    }
+
+    if (shouldPassAsArray(Ty)) {
+      Align ParamAlign =
+          getPTXParamAlign(&CB, Ty, I + AttributeList::FirstArgIndex, DL);
+      O << ".param .align " << ParamAlign.value() << " .b8 _["
+        << DL.getTypeAllocSize(Ty) << "]";
+      return;
+    }
+    // scalar type
+    unsigned sz = 0;
+    if (auto *ITy = dyn_cast<IntegerType>(Ty)) {
+      sz = promoteScalarArgumentSize(ITy->getBitWidth());
+    } else if (isa<PointerType>(Ty)) {
+      sz = PtrVT.getSizeInBits();
+    } else {
+      sz = Ty->getPrimitiveSizeInBits();
+    }
+    O << ".param .b" << sz << " _";
+  };
+
+  const FunctionType *FTy = CB.getFunctionType();
+  const unsigned NumArgs = FTy->getNumParams();
+
+  interleave(seq(NumArgs), O, MakeArg, ", ");
+
+  if (FTy->isVarArg() && CB.arg_size() > NumArgs)
+    O << (NumArgs ? "," : "") << " .param .align "
+      << STI.getMaxRequiredAlignment() << " .b8 _[]";
+
+  O << ")";
+  if (shouldEmitPTXNoReturn(&CB, TM))
+    O << " .noreturn";
+  O << ";\n";
+}
+
 // Return true if MBB is the header of a loop marked with
 // llvm.loop.unroll.disable or llvm.loop.unroll.count=1.
 bool NVPTXAsmPrinter::isLoopHeaderOfNoUnroll(
@@ -417,6 +512,11 @@ void NVPTXAsmPrinter::emitFunctionBodyStart() {
   SmallString<128> Str;
   raw_svector_ostream O(Str);
   emitDemotedVars(&MF->getFunction(), O);
+
+  const auto *MFI = MF->getInfo<NVPTXMachineFunctionInfo>();
+  for (const auto &[Id, CB] : MFI->getCallPrototypes())
+    emitCallPrototype(*CB, Id, O);
+
   OutStreamer->emitRawText(O.str());
 }
 
@@ -1082,8 +1182,7 @@ void NVPTXAsmPrinter::printModuleLevelGV(const GlobalVariable *GVar,
           if (aggBuffer.numSymbols()) {
             const unsigned int ptrSize = MAI.getCodePointerSize();
             if (ElementSize % ptrSize ||
-                !aggBuffer.allSymbolsAligned(ptrSize) ||
-                !aggBuffer.allSymbolsFullPtrSize(ptrSize)) {
+                !aggBuffer.allSymbolsAligned(ptrSize)) {
               // Print in bytes and use the mask() operator for pointers.
               if (!STI.hasMaskOperator())
                 report_fatal_error(
@@ -1153,6 +1252,7 @@ void NVPTXAsmPrinter::AggBuffer::printSymbol(unsigned nSym, raw_ostream &os) {
 }
 
 void NVPTXAsmPrinter::AggBuffer::printBytes(raw_ostream &os) {
+  unsigned int ptrSize = AP.MAI.getCodePointerSize();
   // Do not emit trailing zero initializers. They will be zero-initialized by
   // ptxas. This saves on both space requirements for the generated PTX and on
   // memory use by ptxas. (See:
@@ -1181,18 +1281,13 @@ void NVPTXAsmPrinter::AggBuffer::printBytes(raw_ostream &os) {
     std::string symText;
     llvm::raw_string_ostream oss(symText);
     printSymbol(nSym, oss);
-    // A symbol occupies SymbolSizes[nSym] bytes, which is the pointer size for
-    // a plain pointer but may be narrower for a ptrtoint to a smaller integer.
-    // Emit only that many low bytes; the dropped high bytes are the part the
-    // truncation discards.
-    unsigned symSize = SymbolSizes[nSym];
-    for (unsigned i = 0; i < symSize; ++i) {
+    for (unsigned i = 0; i < ptrSize; ++i) {
       if (i)
         os << ", ";
       llvm::write_hex(os, 0xFFULL << i * 8, HexPrintStyle::PrefixUpper);
       os << "(" << symText << ")";
     }
-    pos += symSize;
+    pos += ptrSize;
     nextSymbolPos = symbolPosInBuffer[++nSym];
     assert(nextSymbolPos >= pos);
   }
@@ -1682,7 +1777,7 @@ void NVPTXAsmPrinter::bufferLEByte(const Constant *CPV, int Bytes,
       }
       if (Cexpr->getOpcode() == Instruction::PtrToInt) {
         Value *V = Cexpr->getOperand(0)->stripPointerCasts();
-        AggBuffer->addSymbol(V, Cexpr->getOperand(0), AllocSize);
+        AggBuffer->addSymbol(V, Cexpr->getOperand(0));
         AggBuffer->addZeros(AllocSize);
         break;
       }
@@ -1690,7 +1785,7 @@ void NVPTXAsmPrinter::bufferLEByte(const Constant *CPV, int Bytes,
       // ptrtoint, e.g. add(ptrtoint(@g), C). It can't fold to a ConstantInt
       // because it references a symbol; emit it through lowerConstantForGV, the
       // same path scalar symbol-relative integer globals use.
-      AggBuffer->addSymbol(Cexpr, Cexpr, AllocSize);
+      AggBuffer->addSymbol(Cexpr, Cexpr);
       AggBuffer->addZeros(AllocSize);
       break;
     }
@@ -1706,10 +1801,10 @@ void NVPTXAsmPrinter::bufferLEByte(const Constant *CPV, int Bytes,
 
   case Type::PointerTyID: {
     if (const GlobalValue *GVar = dyn_cast<GlobalValue>(CPV)) {
-      AggBuffer->addSymbol(GVar, GVar, AllocSize);
+      AggBuffer->addSymbol(GVar, GVar);
     } else if (const ConstantExpr *Cexpr = dyn_cast<ConstantExpr>(CPV)) {
       const Value *v = Cexpr->stripPointerCasts();
-      AggBuffer->addSymbol(v, Cexpr, AllocSize);
+      AggBuffer->addSymbol(v, Cexpr);
     }
     AggBuffer->addZeros(AllocSize);
     break;
