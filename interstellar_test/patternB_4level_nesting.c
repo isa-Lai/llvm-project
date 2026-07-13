@@ -27,7 +27,7 @@ void patternB_4d_array(int A[][10][10][10], int N) {
     // 4-level nested access pattern
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < 10; j++) {
-            for (int k = 0; k < 10; k++) {
+            for (int k = 0; k < 9; k++) {
                 for (int m = 0; m < 10; m++) {
                     A[i][j][k][m]++;
                 }

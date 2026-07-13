@@ -31,6 +31,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
@@ -671,7 +672,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
       if (InvariantOps.size() == 1) {
         LoopInvariantPart = InvariantOps[0];
       } else {
-        LoopInvariantPart = SE.getAddExpr(InvariantOps);
+        SmallVector<SCEVUse, 4> InvariantOpsUse;
+        InvariantOpsUse.reserve(InvariantOps.size());
+        for (const SCEV *Op : InvariantOps)
+          InvariantOpsUse.push_back(Op);
+        LoopInvariantPart = SE.getAddExpr(InvariantOpsUse);
       }
       
       // Calculate memory stride: affine_step * element_size
@@ -795,7 +800,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
           if (OtherOperands.size() == 1) {
             ConstantOffset = OtherOperands[0];
           } else {
-            ConstantOffset = SE.getAddExpr(OtherOperands);
+            SmallVector<SCEVUse, 4> OtherOperandsUse;
+            OtherOperandsUse.reserve(OtherOperands.size());
+            for (const SCEV *Op : OtherOperands)
+              OtherOperandsUse.push_back(Op);
+            ConstantOffset = SE.getAddExpr(OtherOperandsUse);
           }
         }
       } else {
@@ -1536,125 +1545,159 @@ bool InterStellarStreamAnalyzer::isEffectivelyLoopInvariant(const SCEV *S, Loop 
   // Use case: D2A[idx_i * D2_cols + j] where idx_i = A[i]
   // Even though idx_i is recomputed in j-loop, its value only depends on i,
   // so the access pattern is a direct stream in the j-loop.
-  
-  // First, check the standard case
-  if (SE.isLoopInvariant(S, L)) {
-    return true;
-  }
-  
-  // Unwrap casts
-  const SCEV *Unwrapped = S;
-  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Unwrapped)) {
-    Unwrapped = Cast->getOperand();
-  }
-  
-  // Check for AddRecExpr from parent loops (loop-invariant for current loop)
-  if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Unwrapped)) {
-    const Loop *ARLoop = AR->getLoop();
-    
-    // If AddRec is for the current loop, it's NOT invariant
-    if (ARLoop == L) {
+
+  // Guard against cyclic SCEV/value graphs (e.g., self-referential PHI patterns)
+  // to avoid unbounded recursion.
+  SmallPtrSet<const SCEV *, 32> VisitingSCEVs;
+  SmallPtrSet<const Value *, 32> VisitingValues;
+
+  std::function<bool(const SCEV *)> IsInvariant = [&](const SCEV *CurS) -> bool {
+    if (!CurS)
+      return false;
+
+    if (!VisitingSCEVs.insert(CurS).second)
+      return true; // already on recursion stack; treat as invariant to break cycle
+
+    // First, check the standard case.
+    if (SE.isLoopInvariant(CurS, L)) {
+      VisitingSCEVs.erase(CurS);
+      return true;
+    }
+
+    // Unwrap casts.
+    const SCEV *Unwrapped = CurS;
+    while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Unwrapped))
+      Unwrapped = Cast->getOperand();
+
+    // Check for AddRecExpr from parent loops (loop-invariant for current loop).
+    if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Unwrapped)) {
+      const Loop *ARLoop = AR->getLoop();
+
+      // If AddRec is for the current loop, it's NOT invariant.
+      if (ARLoop == L) {
+        VisitingSCEVs.erase(CurS);
+        return false;
+      }
+
+      // If AddRec is for a parent loop, it's effectively invariant for current loop.
+      for (Loop *ParentLoop = L->getParentLoop(); ParentLoop;
+           ParentLoop = ParentLoop->getParentLoop()) {
+        if (ARLoop == ParentLoop) {
+          VisitingSCEVs.erase(CurS);
+          return true; // Depends on outer loop, invariant for current loop.
+        }
+      }
+
+      // AddRec for unrelated loop or inner loop - not invariant.
+      VisitingSCEVs.erase(CurS);
       return false;
     }
-    
-    // If AddRec is for a parent loop, it's effectively invariant for current loop
-    Loop *ParentLoop = L->getParentLoop();
-    while (ParentLoop) {
-      if (ARLoop == ParentLoop) {
-        return true;  // Depends on outer loop, invariant for current loop
+
+    // Check composite expressions recursively.
+    if (const SCEVNAryExpr *NAry = dyn_cast<SCEVNAryExpr>(Unwrapped)) {
+      for (const SCEV *Op : NAry->operands()) {
+        if (!IsInvariant(Op)) {
+          VisitingSCEVs.erase(CurS);
+          return false;
+        }
       }
-      ParentLoop = ParentLoop->getParentLoop();
-    }
-    
-    // AddRec for unrelated loop or inner loop - not invariant
-    return false;
-  }
-  
-  // Check composite expressions recursively
-  if (const SCEVNAryExpr *NAry = dyn_cast<SCEVNAryExpr>(Unwrapped)) {
-    // All operands must be effectively invariant
-    for (const SCEV *Op : NAry->operands()) {
-      if (!isEffectivelyLoopInvariant(Op, L)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  
-  if (const SCEVUDivExpr *UDiv = dyn_cast<SCEVUDivExpr>(Unwrapped)) {
-    return isEffectivelyLoopInvariant(UDiv->getLHS(), L) &&
-           isEffectivelyLoopInvariant(UDiv->getRHS(), L);
-  }
-  
-  // SCEVUnknown: Check if it's based on values from outer loops or constants
-  if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(Unwrapped)) {
-    Value *V = Unknown->getValue();
-    
-    // Constants and globals are invariant
-    if (isa<Constant>(V) || isa<GlobalVariable>(V)) {
+      VisitingSCEVs.erase(CurS);
       return true;
     }
-    
-    // Function arguments are loop-invariant for all loops
-    if (isa<Argument>(V)) {
-      return true;
+
+    if (const SCEVUDivExpr *UDiv = dyn_cast<SCEVUDivExpr>(Unwrapped)) {
+      bool Res = IsInvariant(UDiv->getLHS()) && IsInvariant(UDiv->getRHS());
+      VisitingSCEVs.erase(CurS);
+      return Res;
     }
-    
-    // Check if this value is defined outside the loop
-    if (Instruction *I = dyn_cast<Instruction>(V)) {
-      // If defined outside loop, it's invariant
-      if (!L->contains(I->getParent())) {
+
+    // SCEVUnknown: Check if it's based on values from outer loops or constants.
+    if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(Unwrapped)) {
+      Value *V = Unknown->getValue();
+
+      // Constants and globals are invariant.
+      if (isa<Constant>(V) || isa<GlobalVariable>(V)) {
+        VisitingSCEVs.erase(CurS);
         return true;
       }
-      
-      // CRITICAL: If instruction is a call, it's NOT effectively invariant
-      // Example: rand() returns different values each iteration
-      if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
-        LLVM_DEBUG(dbgs() << "  Value is a call instruction inside loop, NOT invariant: " << *I << "\n");
-        return false;
+
+      // Function arguments are loop-invariant for all loops.
+      if (isa<Argument>(V)) {
+        VisitingSCEVs.erase(CurS);
+        return true;
       }
-      
-      // CRITICAL: If instruction may have side effects or may read/write memory,
-      // it cannot be considered loop-invariant
-      if (I->mayHaveSideEffects() || I->mayReadFromMemory()) {
-        // Exception: LoadInst from loop-invariant address is okay
-        // Example: A[i] where i is outer loop variable
-        if (LoadInst *Load = dyn_cast<LoadInst>(I)) {
-          Value *Ptr = Load->getPointerOperand();
-          const SCEV *PtrSCEV = SE.getSCEV(Ptr);
-          
-          // Check if the load address is effectively invariant
-          if (isEffectivelyLoopInvariant(PtrSCEV, L)) {
-            LLVM_DEBUG(dbgs() << "  Load from effectively invariant address: " << *Load << "\n");
-            return true;
+
+      if (!VisitingValues.insert(V).second) {
+        VisitingSCEVs.erase(CurS);
+        return true; // break value-level cycle conservatively
+      }
+
+      // Check if this value is defined outside the loop.
+      if (Instruction *I = dyn_cast<Instruction>(V)) {
+        if (!L->contains(I->getParent())) {
+          VisitingValues.erase(V);
+          VisitingSCEVs.erase(CurS);
+          return true;
+        }
+
+        // Calls inside loop are not effectively invariant.
+        if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+          LLVM_DEBUG(dbgs() << "  Value is a call instruction inside loop, NOT invariant: "
+                            << *I << "\n");
+          VisitingValues.erase(V);
+          VisitingSCEVs.erase(CurS);
+          return false;
+        }
+
+        // Instructions with side effects/memory reads are not invariant,
+        // except loads from effectively invariant addresses.
+        if (I->mayHaveSideEffects() || I->mayReadFromMemory()) {
+          if (LoadInst *Load = dyn_cast<LoadInst>(I)) {
+            Value *Ptr = Load->getPointerOperand();
+            const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+
+            if (IsInvariant(PtrSCEV)) {
+              LLVM_DEBUG(dbgs() << "  Load from effectively invariant address: "
+                                << *Load << "\n");
+              VisitingValues.erase(V);
+              VisitingSCEVs.erase(CurS);
+              return true;
+            }
+          }
+
+          LLVM_DEBUG(dbgs() << "  Instruction has side effects or reads memory, NOT invariant: "
+                            << *I << "\n");
+          VisitingValues.erase(V);
+          VisitingSCEVs.erase(CurS);
+          return false;
+        }
+
+        // If defined inside loop, check if it only depends on loop-invariant values.
+        for (Use &U : I->operands()) {
+          Value *Operand = U.get();
+          const SCEV *OpSCEV = SE.getSCEV(Operand);
+          if (!IsInvariant(OpSCEV)) {
+            VisitingValues.erase(V);
+            VisitingSCEVs.erase(CurS);
+            return false;
           }
         }
-        
-        LLVM_DEBUG(dbgs() << "  Instruction has side effects or reads memory, NOT invariant: " << *I << "\n");
-        return false;
+
+        VisitingValues.erase(V);
+        VisitingSCEVs.erase(CurS);
+        return true;
       }
-      
-      // If defined inside loop, check if it only depends on loop-invariant values
-      // This handles cases like: idx_i = A[i] % D2_rows where A[i] depends on outer loop
-      for (Use &U : I->operands()) {
-        Value *Operand = U.get();
-        const SCEV *OpSCEV = SE.getSCEV(Operand);
-        
-        if (!isEffectivelyLoopInvariant(OpSCEV, L)) {
-          return false;  // Depends on loop-varying value
-        }
-      }
-      
-      // All operands are effectively invariant and no side effects
-      return true;
+
+      VisitingValues.erase(V);
+      VisitingSCEVs.erase(CurS);
+      return false;
     }
-    
-    // Unknown case - conservatively return false
+
+    VisitingSCEVs.erase(CurS);
     return false;
-  }
-  
-  // Default: not invariant
-  return false;
+  };
+
+  return IsInvariant(S);
 }
 
 Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {
@@ -1930,10 +1973,59 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
     // use it directly instead of trying to extract from SCEV
     Value *BaseVal = ExplicitBaseValue;
     if (!BaseVal) {
-      BaseVal = extractDynamicValue(AdjustedBase, L);
+      // Check if AdjustedBase is a composite expression like (constant + dynamic_value)
+      // This happens when we have offset-adjusted bases like (8 + %A), (12 + %A), etc.
+      // We need to materialize the full expression to get unique link IDs
+      bool NeedsMaterialization = false;
+      
+      if (const SCEVAddExpr *AddExpr = dyn_cast<SCEVAddExpr>(AdjustedBase)) {
+        // Check if this is a constant + dynamic pattern
+        // E.g., (8 + %A) has one SCEVConstant and one SCEVUnknown
+        bool HasConstant = false;
+        bool HasDynamic = false;
+        
+        for (const SCEV *Op : AddExpr->operands()) {
+          if (isa<SCEVConstant>(Op)) {
+            HasConstant = true;
+          } else if (!isa<SCEVConstant>(Op)) {
+            HasDynamic = true;
+          }
+        }
+        
+        // If we have both constant and dynamic parts, we need to materialize
+        // This ensures (8+%A) gets a different LinkID than %A
+        if (HasConstant && HasDynamic) {
+          NeedsMaterialization = true;
+        }
+      }
+      
+      if (NeedsMaterialization) {
+        // Materialize the offset-adjusted address using SCEVExpander
+        // Insert point: loop preheader (where link variables should be computed)
+        BasicBlock *Preheader = L->getLoopPreheader();
+        if (!Preheader) {
+          // If no preheader, fallback to extracting just the dynamic part
+          LLVM_DEBUG(dbgs() << "  Warning: Loop has no preheader, cannot materialize offset\n");
+          BaseVal = extractDynamicValue(AdjustedBase, L);
+        } else {
+          // Use SCEVExpander to materialize the AdjustedBase SCEV into IR
+          SCEVExpander Expander(SE, "interstellar");
+          // Insert at the end of preheader (before the terminator)
+          Expander.setInsertPoint(Preheader->getTerminator());
+          BaseVal = Expander.expandCodeFor(AdjustedBase, 
+                                           PointerType::getUnqual(F.getContext()),
+                                           Preheader->getTerminator());
+          
+          LLVM_DEBUG(dbgs() << "  Materialized offset-adjusted base: " << *BaseVal << "\n");
+        }
+      } else {
+        // No offset or simple dynamic value - use normal extraction
+        BaseVal = extractDynamicValue(AdjustedBase, L);
+      }
     }
     
     if (BaseVal) {
+      DS.BaseAddressValue = BaseVal;
       Type *BaseTy = BaseVal->getType();
       unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
       DS.LinkID = getOrCreateLinkID(BaseVal, Size);
@@ -2355,6 +2447,17 @@ void printAllDescriptors(raw_ostream &OS,
 }
 
 } // anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Forward Declarations
+//===----------------------------------------------------------------------===//
+
+static void generateHardwareDescriptorIR(
+    Function &F,
+    const SmallVectorImpl<LoopDescriptor> &Loops,
+    const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
+    const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
+    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars);
 
 //===----------------------------------------------------------------------===//
 // InterStellarAnalysisPass Implementation (New Pass Manager)
@@ -3372,7 +3475,11 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
                     if (OtherOps.size() == 1) {
                       RemainingPart = OtherOps[0];
                     } else if (OtherOps.size() > 1) {
-                      RemainingPart = SE.getMulExpr(OtherOps);
+                      SmallVector<SCEVUse, 4> OtherOpsUse;
+                      OtherOpsUse.reserve(OtherOps.size());
+                      for (const SCEV *OtherOp : OtherOps)
+                        OtherOpsUse.push_back(OtherOp);
+                      RemainingPart = SE.getMulExpr(OtherOpsUse);
                     }
                     break;
                   }
@@ -3870,10 +3977,564 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
       // Use the updated LinkVars from Stage 3 (which includes new link IDs for merged bounds)
       
       LLVM_DEBUG(printAllDescriptors(dbgs(), Loops, Streams, IndirectStreams, LinkVars));
+      
+      // ============================================================
+      // PHASE 1: IR GENERATION
+      // ============================================================
+      // Generate LLVM IR intrinsic calls to configure hardware descriptors.
+      // This phase transforms the analysis results into executable IR that
+      // the backend will lower to CSR writes.
+      //
+      // Process:
+      // 1. Assign unified GlobalIDs (0-indexed, non-overlapping across all types)
+      // 2. Emit intrinsic calls in loop preheaders
+      // 3. Ordering: Links → Loops → DirectStreams → IndirectStreams
+      // ============================================================
+      
+      LLVM_DEBUG(dbgs() << "\n"
+                        << "╔═══════════════════════════════════════════════════╗\n"
+                        << "║  Phase 1: IR Generation                            ║\n"
+                        << "╚═══════════════════════════════════════════════════╝\n");
+      
+      // Generate IR only if we have descriptors to configure
+      if (!LinkVars.empty() || !Loops.empty() || 
+          !Streams.empty() || !IndirectStreams.empty()) {
+        generateHardwareDescriptorIR(F, Loops, Streams, IndirectStreams, LinkVars);
+      } else {
+        LLVM_DEBUG(dbgs() << "No descriptors to generate IR for\n");
+      }
   } // End: if (!Loops.empty())
   
-  // This is an analysis pass, it doesn't modify the IR
-  return PreservedAnalyses::all();
+  // IMPORTANT: Since we now modify the IR by injecting intrinsic calls,
+  // we must return PreservedAnalyses::none() to notify the pass manager.
+  return PreservedAnalyses::none();
+}
+
+//===----------------------------------------------------------------------===//
+// IR Generation Helper Functions
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Build ID remapping tables: Analysis IDs → Unified GlobalIDs
+/// Assigns sequential GlobalIDs starting from 0 across all descriptor types.
+/// Order: Links → Loops → DirectStreams → IndirectStreams
+void buildIDRemappingTables(
+    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
+    const SmallVectorImpl<LoopDescriptor> &Loops,
+    const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
+    const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
+    DenseMap<unsigned, unsigned> &LinkIDMap,
+    DenseMap<unsigned, unsigned> &LoopIDMap,
+    DenseMap<unsigned, unsigned> &StreamIDMap,
+    DenseMap<unsigned, unsigned> &IndirectIDMap,
+    unsigned &TotalDescriptorCount) {
+  
+  unsigned NextGlobalID = 0;  // Single global counter starting from 0
+  
+  LLVM_DEBUG(dbgs() << "\n[ID Remapping] Assigning unified GlobalIDs:\n");
+  
+  // 1. Assign GlobalIDs to Link Variables first (they are referenced by others)
+  for (const auto &Link : LinkVars) {
+    LinkIDMap[Link.LinkID] = NextGlobalID;
+    LLVM_DEBUG(dbgs() << "  Link Analysis ID " << Link.LinkID 
+                      << " → GlobalID " << NextGlobalID << "\n");
+    NextGlobalID++;
+  }
+  
+  // 2. Assign GlobalIDs to Loop Descriptors
+  for (const auto &Loop : Loops) {
+    LoopIDMap[Loop.LoopID] = NextGlobalID;
+    LLVM_DEBUG(dbgs() << "  Loop Analysis ID " << Loop.LoopID 
+                      << " → GlobalID " << NextGlobalID << "\n");
+    NextGlobalID++;
+  }
+  
+  // 3. Assign GlobalIDs to Direct Stream Descriptors
+  for (const auto &Stream : DirectStreams) {
+    StreamIDMap[Stream.StreamID] = NextGlobalID;
+    LLVM_DEBUG(dbgs() << "  DirectStream Analysis ID " << Stream.StreamID 
+                      << " → GlobalID " << NextGlobalID << "\n");
+    NextGlobalID++;
+  }
+  
+  // 4. Assign GlobalIDs to Indirect Stream Descriptors
+  for (const auto &Indirect : IndirectStreams) {
+    IndirectIDMap[Indirect.StreamID] = NextGlobalID;
+    LLVM_DEBUG(dbgs() << "  IndirectStream Analysis ID " << Indirect.StreamID 
+                      << " → GlobalID " << NextGlobalID << "\n");
+    NextGlobalID++;
+  }
+  
+  TotalDescriptorCount = NextGlobalID;
+  LLVM_DEBUG(dbgs() << "\nTotal descriptors: " << TotalDescriptorCount << "\n");
+  
+  // Validate: Must not exceed hardware limit (32 CSRs: 0x800-0x81F)
+  if (TotalDescriptorCount > 32) {
+    report_fatal_error("InterStellar: Total descriptors (" + 
+                       Twine(TotalDescriptorCount) + 
+                       ") exceeds hardware limit (32)");
+  }
+}
+
+/// Inject intrinsic calls into loop preheaders
+/// Emits configuration intrinsics in dependency order:
+/// Links → Loops → DirectStreams → IndirectStreams
+void injectDescriptorIR(
+    Function &F,
+    const SmallVectorImpl<LoopDescriptor> &Loops,
+    const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
+    const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
+    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
+    const DenseMap<unsigned, unsigned> &LoopIDMap,
+    const DenseMap<unsigned, unsigned> &StreamIDMap,
+    const DenseMap<unsigned, unsigned> &IndirectIDMap,
+    const DenseMap<unsigned, unsigned> &LinkIDMap) {
+  
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  
+  // Get intrinsic function declarations
+  Function *ConfigLinkFn = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::interstellar_configure_link);
+  Function *ConfigLoopFn = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::interstellar_configure_loop);
+  Function *ConfigDirectStreamFn = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::interstellar_configure_directstream);
+  Function *ConfigIndirectStreamFn = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::interstellar_configure_indirectstream);
+  
+  LLVM_DEBUG(dbgs() << "\n[IR Generation] Emitting intrinsic calls:\n");
+
+  // Precompute lookup tables to avoid repeated O(N^2) scans.
+  DenseMap<unsigned, const LoopDescriptor *> LoopDescByID;
+  for (const auto &LD : Loops)
+    LoopDescByID[LD.LoopID] = &LD;
+
+  DenseMap<unsigned, const LinkVariableDescriptor *> LinkVarByID;
+  for (const auto &LV : LinkVars)
+    LinkVarByID[LV.LinkID] = &LV;
+
+  // Cache topmost anchor loop for each loop node.
+  DenseMap<Loop *, Loop *> TopmostAnchorCache;
+  auto getTopmostAnchorLoop = [&](Loop *L) -> Loop * {
+    if (!L)
+      return nullptr;
+
+    auto It = TopmostAnchorCache.find(L);
+    if (It != TopmostAnchorCache.end())
+      return It->second;
+
+    SmallVector<Loop *, 8> Chain;
+    Loop *Cur = L;
+    while (Cur) {
+      Chain.push_back(Cur);
+      if (!Cur->getParentLoop())
+        break;
+      Cur = Cur->getParentLoop();
+    }
+
+    Loop *Anchor = Chain.back(); // topmost loop in this chain
+    if (!Anchor->getLoopPreheader()) {
+      // Conservative fallback: choose nearest ancestor with a preheader.
+      Anchor = nullptr;
+      for (auto RI = Chain.rbegin(), RE = Chain.rend(); RI != RE; ++RI) {
+        if ((*RI)->getLoopPreheader()) {
+          Anchor = *RI;
+          break;
+        }
+      }
+    }
+
+    for (Loop *Node : Chain)
+      TopmostAnchorCache[Node] = Anchor;
+
+    return Anchor;
+  };
+  
+  // Group descriptors by anchor loop preheader (topmost loop in nest).
+  // Map: AnchorLoop* -> {Links, Loops, Streams, IndirectStreams}
+  DenseMap<Loop*, SmallVector<const LinkVariableDescriptor*, 4>> LinksByLoop;
+  DenseMap<Loop*, SmallVector<const LoopDescriptor*, 4>> LoopsByLoop;
+  DenseMap<Loop*, SmallVector<const DirectStreamDescriptor*, 4>> StreamsByLoop;
+  DenseMap<Loop*, SmallVector<const IndirectStreamDescriptor*, 4>> IndirectByLoop;
+  
+  // Collect loop descriptors per anchor loop.
+  for (const auto &LD : Loops) {
+    Loop *Anchor = getTopmostAnchorLoop(LD.L);
+    if (!Anchor)
+      continue;
+    LoopsByLoop[Anchor].push_back(&LD);
+  }
+  
+  // Collect direct stream descriptors per anchor loop.
+  for (const auto &DS : DirectStreams) {
+    auto LDIt = LoopDescByID.find(DS.LoopID);
+    if (LDIt == LoopDescByID.end())
+      continue;
+
+    Loop *Anchor = getTopmostAnchorLoop(LDIt->second->L);
+    if (!Anchor)
+      continue;
+
+    StreamsByLoop[Anchor].push_back(&DS);
+
+    // If stream uses a link variable, add it too.
+    if (DS.IsBaseLinked) {
+      auto LVIt = LinkVarByID.find(DS.LinkID);
+      if (LVIt != LinkVarByID.end())
+        LinksByLoop[Anchor].push_back(LVIt->second);
+    }
+  }
+  
+  // Collect indirect stream descriptors per anchor loop.
+  for (const auto &IDS : IndirectStreams) {
+    auto LDIt = LoopDescByID.find(IDS.LoopID);
+    if (LDIt == LoopDescByID.end())
+      continue;
+
+    Loop *Anchor = getTopmostAnchorLoop(LDIt->second->L);
+    if (!Anchor)
+      continue;
+
+    IndirectByLoop[Anchor].push_back(&IDS);
+
+    // If stream uses a link variable, add it too.
+    if (IDS.IsBaseLinked) {
+      auto LVIt = LinkVarByID.find(IDS.LinkID);
+      if (LVIt != LinkVarByID.end())
+        LinksByLoop[Anchor].push_back(LVIt->second);
+    }
+  }
+  
+  // Also collect link variables used by loop bounds at anchor loop.
+  for (const auto &LD : Loops) {
+    Loop *Anchor = getTopmostAnchorLoop(LD.L);
+    if (!Anchor)
+      continue;
+
+    if (LD.IsStartLinked) {
+      auto LVIt = LinkVarByID.find(LD.StartLinkID);
+      if (LVIt != LinkVarByID.end())
+        LinksByLoop[Anchor].push_back(LVIt->second);
+    }
+    if (LD.IsEndLinked) {
+      auto LVIt = LinkVarByID.find(LD.EndLinkID);
+      if (LVIt != LinkVarByID.end())
+        LinksByLoop[Anchor].push_back(LVIt->second);
+    }
+  }
+  
+  // Track which descriptors we've already emitted (to avoid duplicates)
+  DenseSet<unsigned> EmittedLinkIDs;
+  DenseSet<unsigned> EmittedLoopIDs;
+  DenseSet<unsigned> EmittedStreamIDs;
+  DenseSet<unsigned> EmittedIndirectIDs;
+  
+  // Emit intrinsics for each loop's preheader
+  for (const auto &Entry : LoopsByLoop) {
+    Loop *L = Entry.first;
+    BasicBlock *Preheader = L->getLoopPreheader();
+    
+    if (!Preheader) {
+      LLVM_DEBUG(dbgs() << "  Warning: Loop has no preheader, skipping\n");
+      continue;
+    }
+    
+    LLVM_DEBUG(dbgs() << "\n  Emitting for loop in BB: " 
+                      << Preheader->getName() << "\n");
+    
+    // Create IRBuilder positioned at the end of preheader (before terminator)
+    IRBuilder<> Builder(Preheader->getTerminator());
+    
+    // 1. Emit Link Variable configurations first (they're referenced by others)
+    for (const auto *LV : LinksByLoop[L]) {
+      if (EmittedLinkIDs.count(LV->LinkID)) continue;  // Skip duplicates
+      
+      unsigned GlobalID = LinkIDMap.lookup(LV->LinkID);
+      
+      // Check if the dynamic value dominates the preheader insertion point
+      // This is critical: the value must be available before we use it
+      Value *ValueArg = LV->DynamicValue;
+      if (Instruction *ValueInst = dyn_cast<Instruction>(ValueArg)) {
+        // Check if instruction is in the loop (not preheader)
+        if (L->contains(ValueInst->getParent())) {
+          // The instruction is inside the loop, so it doesn't dominate the preheader
+          // We need to materialize a loop-invariant version
+          LLVM_DEBUG(dbgs() << "    Warning: Link value is loop-variant, skipping: " 
+                            << *ValueArg << "\n");
+          // Skip this link - the stream should use non-linked mode
+          continue;
+        }
+      }
+      
+      LLVM_DEBUG(dbgs() << "    Link GlobalID=" << GlobalID 
+                        << " (Analysis ID=" << LV->LinkID << ")\n");
+      
+      // Prepare the value argument - must be a pointer type
+      if (!ValueArg->getType()->isPointerTy()) {
+        // If not already a pointer, cast it to pointer
+        ValueArg = Builder.CreateIntToPtr(ValueArg, PointerType::getUnqual(Ctx));
+      }
+      
+      // Emit: call void @llvm.interstellar.configure.link(i32 GlobalID, ptr value, i32 size)
+      Builder.CreateCall(ConfigLinkFn, {
+        Builder.getInt32(GlobalID),
+        ValueArg,
+        Builder.getInt32(LV->SizeInBytes)
+      });
+      
+      EmittedLinkIDs.insert(LV->LinkID);
+    }
+    
+    // 2. Emit Loop Descriptor configuration
+    for (const auto *LD : LoopsByLoop[L]) {
+      if (EmittedLoopIDs.count(LD->LoopID)) continue;  // Skip duplicates
+      
+      unsigned GlobalID = LoopIDMap.lookup(LD->LoopID);
+      unsigned ParentGlobalID = 0;
+      
+      // Remap parent loop ID to GlobalID
+      if (LD->ParentLoopID != 0) {
+        ParentGlobalID = LoopIDMap.lookup(LD->ParentLoopID);
+      }
+      
+      // Extract start/end values (constant or link GlobalID)
+      unsigned StartVal = 0;
+      unsigned EndVal = 0;
+      
+      if (LD->IsStartLinked) {
+        StartVal = LinkIDMap.lookup(LD->StartLinkID);
+      } else if (LD->StartValue) {
+        if (auto *C = dyn_cast<SCEVConstant>(LD->StartValue)) {
+          StartVal = C->getValue()->getZExtValue();
+        }
+      }
+      
+      if (LD->IsEndLinked) {
+        EndVal = LinkIDMap.lookup(LD->EndLinkID);
+      } else if (LD->EndValue) {
+        if (auto *C = dyn_cast<SCEVConstant>(LD->EndValue)) {
+          EndVal = C->getValue()->getZExtValue();
+        }
+      }
+      
+      unsigned StepVal = 1;  // Default step
+      if (LD->StepValue) {
+        if (auto *C = dyn_cast<SCEVConstant>(LD->StepValue)) {
+          StepVal = C->getValue()->getZExtValue();
+        }
+      }
+      
+      LLVM_DEBUG(dbgs() << "    Loop GlobalID=" << GlobalID 
+                        << " (Analysis ID=" << LD->LoopID << ")"
+                        << " Parent=" << ParentGlobalID
+                        << " SL=" << LD->IsStartLinked
+                        << " EL=" << LD->IsEndLinked << "\n");
+      
+      // Emit: call void @llvm.interstellar.configure.loop(...)
+      Builder.CreateCall(ConfigLoopFn, {
+        Builder.getInt32(GlobalID),
+        Builder.getInt32(ParentGlobalID),
+        Builder.getInt1(LD->IsStartLinked),
+        Builder.getInt1(LD->IsEndLinked),
+        Builder.getInt32(StartVal),
+        Builder.getInt32(EndVal),
+        Builder.getInt32(StepVal)
+      });
+      
+      EmittedLoopIDs.insert(LD->LoopID);
+    }
+    
+    // 3. Emit Direct Stream Descriptor configurations
+    for (const auto *DS : StreamsByLoop[L]) {
+      if (EmittedStreamIDs.count(DS->StreamID)) continue;  // Skip duplicates
+      
+      unsigned GlobalID = StreamIDMap.lookup(DS->StreamID);
+      unsigned LoopGlobalID = LoopIDMap.lookup(DS->LoopID);
+      
+      // Check if this stream references a link that wasn't emitted (loop-variant)
+      bool ActuallyLinked = DS->IsBaseLinked;
+      if (ActuallyLinked && !EmittedLinkIDs.count(DS->LinkID)) {
+        // The link was skipped because it was loop-variant
+        // Fall back to non-linked mode
+        LLVM_DEBUG(dbgs() << "    Warning: Stream " << DS->StreamID 
+                          << " references skipped link " << DS->LinkID 
+                          << ", using non-linked mode\n");
+        ActuallyLinked = false;
+      }
+      
+      // Prepare base address argument:
+      // When ActuallyLinked=true: encode LinkID as pointer (backend extracts LinkID)
+      // When ActuallyLinked=false: pass actual constant pointer (backend uses this address)
+      Value *BaseArg = nullptr;
+      if (ActuallyLinked) {
+        // Base is dynamic - encode LinkID as pointer so backend knows which link to use
+        unsigned LinkGlobalID = LinkIDMap.lookup(DS->LinkID);
+        BaseArg = Builder.CreateIntToPtr(Builder.getInt64(LinkGlobalID), 
+                                         PointerType::getUnqual(Builder.getContext()));
+      } else {
+        // Base is constant (e.g., global array) or non-linked - pass the actual pointer
+        BaseArg = DS->BaseAddressValue;
+        if (!BaseArg) {
+          // Fallback: try to extract from SCEV if BaseAddressValue not set
+          if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(DS->BaseAddress)) {
+            BaseArg = U->getValue();
+          }
+        }
+        
+        // CRITICAL: Check if the base address is loop-variant
+        // If it's computed inside the loop, we can't use it in the preheader
+        if (BaseArg) {
+          if (Instruction *BaseInst = dyn_cast<Instruction>(BaseArg)) {
+            if (L->contains(BaseInst->getParent())) {
+              // Base is loop-variant - skip this stream
+              LLVM_DEBUG(dbgs() << "    Warning: Stream " << DS->StreamID 
+                                << " has loop-variant base, skipping\n");
+              continue;  // Skip this stream entirely
+            }
+          }
+        }
+        
+        // If still null, use null pointer as safe fallback
+        if (!BaseArg) {
+          BaseArg = ConstantPointerNull::get(PointerType::getUnqual(Builder.getContext()));
+        }
+      }
+      
+      LLVM_DEBUG(dbgs() << "    DirectStream GlobalID=" << GlobalID 
+                        << " (Analysis ID=" << DS->StreamID << ")"
+                        << " Loop=" << LoopGlobalID
+                        << " BL=" << ActuallyLinked
+                        << " BaseAddr=" << *BaseArg
+                        << " Stride=" << DS->Stride << "\n");
+      
+      // Emit: call void @llvm.interstellar.configure.directstream(globalid, loop, BL, base, stride)
+      Builder.CreateCall(ConfigDirectStreamFn, {
+        Builder.getInt32(GlobalID),
+        Builder.getInt32(LoopGlobalID),
+        Builder.getInt1(ActuallyLinked),
+        BaseArg,
+        Builder.getInt32(DS->Stride)
+      });
+      
+      EmittedStreamIDs.insert(DS->StreamID);
+    }
+    
+    // 4. Emit Indirect Stream Descriptor configurations
+    for (const auto *IDS : IndirectByLoop[L]) {
+      if (EmittedIndirectIDs.count(IDS->StreamID)) continue;  // Skip duplicates
+      
+      unsigned GlobalID = IndirectIDMap.lookup(IDS->StreamID);
+      unsigned SourceStreamGlobalID = 0;
+      
+      // Remap source stream ID to GlobalID
+      if (IDS->BaseStreamID != 0) {
+        SourceStreamGlobalID = StreamIDMap.lookup(IDS->BaseStreamID);
+      }
+      
+      // Check if this stream references a link that wasn't emitted (loop-variant)
+      bool ActuallyLinked = IDS->IsBaseLinked;
+      if (ActuallyLinked && !EmittedLinkIDs.count(IDS->LinkID)) {
+        // The link was skipped because it was loop-variant
+        // Fall back to non-linked mode
+        LLVM_DEBUG(dbgs() << "    Warning: Indirect stream " << IDS->StreamID 
+                          << " references skipped link " << IDS->LinkID 
+                          << ", using non-linked mode\n");
+        ActuallyLinked = false;
+      }
+      
+      // Prepare base address argument:
+      // When ActuallyLinked=true: encode LinkID as pointer (backend extracts LinkID)
+      // When ActuallyLinked=false: pass actual constant pointer (backend uses this address)
+      Value *BaseArg = nullptr;
+      if (ActuallyLinked) {
+        // Base is dynamic - encode LinkID as pointer so backend knows which link to use
+        unsigned LinkGlobalID = LinkIDMap.lookup(IDS->LinkID);
+        BaseArg = Builder.CreateIntToPtr(Builder.getInt64(LinkGlobalID), 
+                                         PointerType::getUnqual(Builder.getContext()));
+      } else {
+        // Base is constant (e.g., global array) or non-linked - pass the actual pointer
+        BaseArg = IDS->BaseAddressValue;
+        if (!BaseArg) {
+          // Fallback: try to extract from SCEV if BaseAddressValue not set
+          if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(IDS->BaseAddress)) {
+            BaseArg = U->getValue();
+          }
+        }
+        
+        // CRITICAL: Check if the base address is loop-variant
+        // If it's computed inside the loop, we can't use it in the preheader
+        if (BaseArg) {
+          if (Instruction *BaseInst = dyn_cast<Instruction>(BaseArg)) {
+            if (L->contains(BaseInst->getParent())) {
+              // Base is loop-variant - skip this stream
+              LLVM_DEBUG(dbgs() << "    Warning: Indirect stream " << IDS->StreamID 
+                                << " has loop-variant base, skipping\n");
+              continue;  // Skip this stream entirely
+            }
+          }
+        }
+        
+        // If still null, use null pointer as safe fallback
+        if (!BaseArg) {
+          BaseArg = ConstantPointerNull::get(PointerType::getUnqual(Builder.getContext()));
+        }
+      }
+      
+      LLVM_DEBUG(dbgs() << "    IndirectStream GlobalID=" << GlobalID 
+                        << " (Analysis ID=" << IDS->StreamID << ")"
+                        << " SourceStream=" << SourceStreamGlobalID
+                        << " BL=" << ActuallyLinked
+                        << " BaseAddr=" << *BaseArg
+                        << " ElemSize=" << IDS->ElementSize << "\n");
+      
+      // Emit: call void @llvm.interstellar.configure.indirectstream(globalid, source, BL, base, elemsize, streamsize)
+      Builder.CreateCall(ConfigIndirectStreamFn, {
+        Builder.getInt32(GlobalID),
+        Builder.getInt32(SourceStreamGlobalID),
+        Builder.getInt1(ActuallyLinked),
+        BaseArg,
+        Builder.getInt32(IDS->ElementSize),
+        Builder.getInt32(0)  // Stream size - TODO: compute from analysis
+      });
+      
+      EmittedIndirectIDs.insert(IDS->StreamID);
+    }
+  }
+  
+  LLVM_DEBUG(dbgs() << "\n[IR Generation] Complete:\n");
+  LLVM_DEBUG(dbgs() << "  Emitted " << EmittedLinkIDs.size() << " link configs\n");
+  LLVM_DEBUG(dbgs() << "  Emitted " << EmittedLoopIDs.size() << " loop configs\n");
+  LLVM_DEBUG(dbgs() << "  Emitted " << EmittedStreamIDs.size() << " direct stream configs\n");
+  LLVM_DEBUG(dbgs() << "  Emitted " << EmittedIndirectIDs.size() << " indirect stream configs\n");
+}
+
+} // end anonymous namespace
+
+/// Main IR generation entry point
+/// Builds ID remapping tables and injects intrinsic calls
+static void generateHardwareDescriptorIR(
+    Function &F,
+    const SmallVectorImpl<LoopDescriptor> &Loops,
+    const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
+    const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
+    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars) {
+  
+  // Step 1: Build ID remapping tables (Analysis IDs → GlobalIDs)
+  DenseMap<unsigned, unsigned> LinkIDMap;
+  DenseMap<unsigned, unsigned> LoopIDMap;
+  DenseMap<unsigned, unsigned> StreamIDMap;
+  DenseMap<unsigned, unsigned> IndirectIDMap;
+  unsigned TotalDescriptorCount = 0;
+  
+  buildIDRemappingTables(LinkVars, Loops, DirectStreams, IndirectStreams,
+                        LinkIDMap, LoopIDMap, StreamIDMap, IndirectIDMap,
+                        TotalDescriptorCount);
+  
+  // Step 2: Inject intrinsic calls into loop preheaders
+  injectDescriptorIR(F, Loops, DirectStreams, IndirectStreams, LinkVars,
+                    LoopIDMap, StreamIDMap, IndirectIDMap, LinkIDMap);
 }
 
 void InterStellarAnalysisPass::printResults(raw_ostream &OS) const {

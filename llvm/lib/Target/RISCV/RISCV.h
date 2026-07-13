@@ -89,6 +89,14 @@ void initializeRISCVPostRAExpandPseudoPass(PassRegistry &);
 FunctionPass *createRISCVInsertReadWriteCSRPass();
 void initializeRISCVInsertReadWriteCSRPass(PassRegistry &);
 
+FunctionPass *createRISCVInterStellarCodeGenPass();
+void initializeRISCVInterStellarCodeGenPass(PassRegistry &);
+
+// DEPRECATED: InterStellar intrinsics are now lowered in the post-RA pass
+// (createRISCVInterStellarCodeGenPass) where we can extract register numbers
+// FunctionPass *createRISCVRemoveInterStellarIntrinsicsPass();
+// void initializeRISCVRemoveInterStellarIntrinsicsPass(PassRegistry &);
+
 FunctionPass *createRISCVInsertWriteVXRMPass();
 void initializeRISCVInsertWriteVXRMPass(PassRegistry &);
 

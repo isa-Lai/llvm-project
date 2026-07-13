@@ -1,8 +1,5 @@
-// PATTERN 1: Direct Streams on Array A
+// PATTERN 1: Direct Streams on Array A (No stdio version)
 // A[i]++, A[i+2]++, A[i*2]++, A[i*3+3]++
-
-#include <stdio.h>
-#include <stdlib.h>
 
 void pattern1_direct_streams(int *A, int N) {
     for (int i = 0; i < N; i++) {
@@ -26,18 +23,28 @@ void pattern1_direct_streams(int *A, int N) {
     }
 }
 
-int main() {
-    // Test 1: N = 50
-    int N1 = 50;
-    int *A1 = (int *)calloc(N1, sizeof(int));
-    pattern1_direct_streams(A1, N1);
-    free(A1);
+// Global array for testing constant base address
+#define GLOBAL_SIZE 200
+int GlobalArray[GLOBAL_SIZE];
+
+void pattern1_global_array(int N) {
+    // Initialize global array
+    for (int i = 0; i < GLOBAL_SIZE; i++) {
+        GlobalArray[i] = 0;
+    }
     
-    // Test 2: N = 100
-    int N2 = 100;
-    int *A2 = (int *)calloc(N2, sizeof(int));
-    pattern1_direct_streams(A2, N2);
-    free(A2);
-    
-    return 0;
+    for (int i = 0; i < N && i < GLOBAL_SIZE; i++) {
+        // Direct stream: GlobalArray[i] with unit stride, constant base
+        GlobalArray[i]++;
+        
+        // Direct stream: GlobalArray[i+5] with offset, constant base
+        if (i + 5 < GLOBAL_SIZE) {
+            GlobalArray[i + 5]++;
+        }
+        
+        // Direct stream: GlobalArray[i*2] with stride 8, constant base
+        if (i * 2 < GLOBAL_SIZE) {
+            GlobalArray[i * 2]++;
+        }
+    }
 }
