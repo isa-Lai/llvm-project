@@ -12,17 +12,19 @@
 // can extract the actual register numbers needed for the binary descriptors.
 //
 // Binary Descriptor Format (128-bit, stored in two 64-bit CSRs):
+//   All descriptors:
+//     [5:0]=Type, [1]=Valid, [0]=Active, [119:8+]=Type-specific fields
 //   Link (Type=0x03):
-//     [127:120]=Type, [119:112]=Reserved, [111:48]=Address,
+//     [5:0]=Type(3), [119:112]=Reserved, [111:48]=Address,
 //     [47:32]=Size, [31:0]=Reserved
 //   Loop (Type=0x00):
-//     [127:120]=Type, [119:114]=Parent, [113]=SL, [112]=EL,
+//     [5:0]=Type(0), [119:114]=Parent, [113]=SL, [112]=EL,
 //     [111:80]=Start, [79:48]=End, [47:32]=Step, [31:0]=PCOffset
 //   DirectStream (Type=0x01):
-//     [127:120]=Type, [119:114]=LoopID, [113]=BL, [112]=S,
+//     [5:0]=Type(1), [119:114]=LoopID, [113]=BL, [112]=S,
 //     [111:48]=Base, [47:32]=Stride, [31:0]=R/V
 //   IndirectStream (Type=0x02):
-//     [127:120]=Type, [119:114]=SourceStreamID, [113]=BL, [112]=S,
+//     [5:0]=Type(2), [119:114]=SourceStreamID, [113]=BL, [112]=S,
 //     [111:48]=Base, [47:32]=ElementSize, [31:0]=StreamSize
 //
 //===----------------------------------------------------------------------===//
@@ -121,8 +123,8 @@ void RISCVInterStellarCodeGen::emitDescriptorCSRWrites(
   
   // InterStellar CSRs use RV64 pair mapping per GlobalID:
   //   base = 0x800 + (2 * GlobalID)
-  //   base + 0 : bits [63:0]   (low)
-  //   base + 1 : bits [127:64] (high, contains type header at [127:120])
+  //   base + 0 : bits [63:0]   (becomes desc_word[0], contains type at bits [5:0])
+  //   base + 1 : bits [127:64] (becomes desc_word[1])
   unsigned CSR_LOW = 0x800 + (2 * GlobalID);
   unsigned CSR_HIGH = CSR_LOW + 1;
 
@@ -176,15 +178,21 @@ bool RISCVInterStellarCodeGen::processLinkPseudo(MachineBasicBlock &MBB,
   LLVM_DEBUG(dbgs() << "Processing Link Pseudo: GlobalID=" << GlobalID 
                     << ", RegNum=" << RegNum << ", Size=" << Size << "\n");
 
-  // Link descriptor layout:
-  // [127:120]=0x03, [119:112]=0, [111:48]=Address, [47:32]=Size, [31:0]=0.
+  // Hardware Link descriptor layout:
+  // MISA_Desc_t structure: uint8_t type:6, valid:1, active:1 (LSB to MSB)
+  // First byte of desc_word[0]: [5:0]=Type(3), [6]=Valid(1), [7]=Active(1)
+  // So the byte value = Type | (Valid << 6) | (Active << 7)
   const uint64_t Address = maskN(static_cast<uint64_t>(RegNum), 64);
-  const uint64_t AddressHigh48 = maskN(Address >> 16, 48);
-  const uint64_t AddressLow16 = maskN(Address, 16);
   const uint64_t Size16 = maskN(static_cast<uint64_t>(Size), 16);
 
-  const uint64_t DescriptorHigh = (0x03ULL << 56) | AddressHigh48;
-  const uint64_t DescriptorLow = (AddressLow16 << 48) | (Size16 << 32);
+  const uint64_t DescriptorLow = ((0x03ULL & 0x3FULL) << 0) |  // Type=3, shift to bits [5:0]
+                                  (0x1ULL << 6) |                 // Valid=1 in bit [1]
+                                  (0x1ULL << 7) |                 // Active=1 in bit [0]
+                                  (0x0ULL << 8) |                 // Reserved in bits [13:8]
+                                  (maskN(Address, 64) << 16);      // Address in bits [79:16]
+
+  const uint64_t DescriptorHigh = (Size16 << 0) |              // Size in bits [15:0]
+                                   (0x0ULL << 16);               // Reserved in bits [63:16]
 
   auto MBBI = MachineBasicBlock::iterator(MI);
   emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);
@@ -221,19 +229,24 @@ bool RISCVInterStellarCodeGen::processLoopPseudo(MachineBasicBlock &MBB,
   unsigned EndValue = EndOp.getImm();
   unsigned Step = StepOp.getImm();
 
-  // be.md loop descriptor layout:
-  // [127:120] Type=0x00, [119:114] Parent(6), [113] SL, [112] EL,
-  // [111:80] Start(32), [79:48] End(32), [47:32] Step(16), [31:0] PCOffset
-  // where PCOffset is currently encoded as 0.
-  uint64_t DescriptorHigh = (0x00ULL << 56) |
-                            (maskN(Parent, 6) << 50) |
-                            (maskN(StartLinked, 1) << 49) |
-                            (maskN(EndLinked, 1) << 48) |
-                            (maskN(StartValue, 32) << 16) |
-                            maskN((uint64_t)EndValue >> 16, 16);
+  // Hardware loop descriptor layout:
+  // DescriptorLow (becomes desc_word[0]): [5:0]=Type(0), [6]=Valid(1), [7]=Active(1),
+  //                                      [13:8]=Parent(6), [14]=SL, [15]=EL,
+  //                                      [47:16]=Start(32), [79:48]=End[15:0](16)
+  // DescriptorHigh (becomes desc_word[1]): [15:0]=End[31:16](16), [31:16]=Step(16),
+  //                                       [63:32]=PCOffset(32)
+  uint64_t DescriptorLow = ((0x00ULL & 0x3FULL) << 0) |  // Type=0 in bits [5:0]
+                           (0x1ULL << 6) |                 // Valid in bit [1]
+                           (0x1ULL << 7) |                 // Active in bit [0]
+                           (maskN(Parent, 6) << 8) |       // Parent in bits [13:8]
+                           (maskN(StartLinked, 1) << 14) | // SL in bit [14]
+                           (maskN(EndLinked, 1) << 15) |   // EL in bit [15]
+                           (maskN(StartValue, 32) << 16) | // Start in bits [47:16]
+                           (maskN(EndValue & 0xFFFF, 16) << 48); // End[15:0] in bits [63:48]
 
-  uint64_t DescriptorLow = (maskN(EndValue, 16) << 48) |
-                           (maskN(Step, 16) << 32);
+  uint64_t DescriptorHigh = (maskN((EndValue >> 16) & 0xFFFF, 16) << 0) | // End[31:16] in bits [15:0]
+                            (maskN(Step, 16) << 16) |       // Step in bits [31:16]
+                            (0x0ULL << 32);                  // PCOffset in bits [63:32] (currently 0)
 
   auto MBBI = MachineBasicBlock::iterator(MI);
   emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);
@@ -268,17 +281,21 @@ bool RISCVInterStellarCodeGen::processDirectStreamPseudo(MachineBasicBlock &MBB,
 
   uint64_t BaseAddress = BaseLinked ? BaseID : getPhysRegNumber(PtrOp);
 
-  // be.md directstream descriptor layout:
-  // [127:120] Type=0x01, [119:114] LoopID(6), [113] BL, [112] S,
-  // [111:48] BaseAddress(64), [47:32] Stride(16), [31:0] R/V(0)
-  // S (stream active) is currently unsupported and defaults to 0.
-  uint64_t DescriptorHigh = (0x01ULL << 56) |
-                            (maskN(LoopID, 6) << 50) |
-                            (maskN(BaseLinked, 1) << 49) |
-                            maskN(BaseAddress >> 16, 48);
+  // Hardware directstream descriptor layout:
+  // DescriptorLow (becomes desc_word[0]): [5:0]=Type(1), [6]=Valid(1), [7]=Active(1),
+  //                                      [13:8]=LoopID(6), [14]=BL, [15]=S(0),
+  //                                      [79:16]=BaseAddress(64)
+  // DescriptorHigh (becomes desc_word[1]): [15:0]=Stride(16), [63:16]=Reserved(0)
+  uint64_t DescriptorLow = ((0x01ULL & 0x3FULL) << 0) |  // Type=1 in bits [5:0]
+                           (0x1ULL << 6) |                 // Valid in bit [1]
+                           (0x1ULL << 7) |                 // Active in bit [0]
+                           (maskN(LoopID, 6) << 8) |       // LoopID in bits [13:8]
+                           (maskN(BaseLinked, 1) << 14) |  // BL in bit [14]
+                           (0x0ULL << 15) |                // S in bit [15] (unsupported)
+                           (maskN(BaseAddress, 64) << 16); // BaseAddress in bits [79:16]
 
-  uint64_t DescriptorLow = (maskN(BaseAddress, 16) << 48) |
-                           (maskN(Stride, 16) << 32);
+  uint64_t DescriptorHigh = maskN(Stride, 16) |   // Stride in bits [15:0]
+                           (0x0ULL << 16);       // Reserved in bits [63:16]
 
   auto MBBI = MachineBasicBlock::iterator(MI);
   emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);
@@ -317,18 +334,23 @@ bool RISCVInterStellarCodeGen::processIndirectStreamPseudo(MachineBasicBlock &MB
 
   uint64_t BaseAddress = BaseLinked ? BaseID : getPhysRegNumber(BasePtrOp);
 
-  // be.md indirectstream descriptor layout:
-  // [127:120] Type=0x02, [119:114] SourceStreamID(6), [113] BL, [112] S,
-  // [111:48] BaseAddress(64), [47:32] ElementSize(16), [31:0] StreamSize(32)
-  // S (stream active) is currently unsupported and defaults to 0.
-  uint64_t DescriptorHigh = (0x02ULL << 56) |
-                            (maskN(SourceStreamID, 6) << 50) |
-                            (maskN(BaseLinked, 1) << 49) |
-                            maskN(BaseAddress >> 16, 48);
+  // Hardware indirectstream descriptor layout:
+  // DescriptorLow (becomes desc_word[0]): [5:0]=Type(2), [6]=Valid(1), [7]=Active(1),
+  //                                      [13:8]=SourceStreamID(6), [14]=BL, [15]=S(0),
+  //                                      [79:16]=BaseAddress(64)
+  // DescriptorHigh (becomes desc_word[1]): [15:0]=ElementSize(16), [47:16]=StreamSize(32),
+  //                                       [63:48]=Reserved(0)
+  uint64_t DescriptorLow = ((0x02ULL & 0x3FULL) << 0) |  // Type=2 in bits [5:0]
+                           (0x1ULL << 6) |                 // Valid in bit [1]
+                           (0x1ULL << 7) |                 // Active in bit [0]
+                           (maskN(SourceStreamID, 6) << 8) | // SourceStreamID in bits [13:8]
+                           (maskN(BaseLinked, 1) << 14) |  // BL in bit [14]
+                           (0x0ULL << 15) |                // S in bit [15] (unsupported)
+                           (maskN(BaseAddress, 64) << 16); // BaseAddress in bits [79:16]
 
-  uint64_t DescriptorLow = (maskN(BaseAddress, 16) << 48) |
-                           (maskN(ElementSize, 16) << 32) |
-                           maskN(StreamSize, 32);
+  uint64_t DescriptorHigh = maskN(ElementSize, 16) |   // ElementSize in bits [15:0]
+                            (maskN(StreamSize, 32) << 16) | // StreamSize in bits [47:16]
+                            (0x0ULL << 48);                 // Reserved in bits [63:48]
 
   auto MBBI = MachineBasicBlock::iterator(MI);
   emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);

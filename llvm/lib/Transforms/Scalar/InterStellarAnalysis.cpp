@@ -22,8 +22,10 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
@@ -1017,6 +1019,41 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   return true;
 }
 
+/// Compute the allocated byte size of the target array for an indirect stream.
+/// Returns 0 if the size cannot be statically determined (e.g., pointer parameters).
+static uint64_t computeArrayFootprint(const SCEV *BaseSCEV,
+                                      Value *BaseAddressValue,
+                                      const DataLayout &DL) {
+  // Prefer the BaseAddressValue if available (set when base is linked/dynamic)
+  Value *BaseV = BaseAddressValue;
+  if (!BaseV) {
+    // For constant/global bases, BaseAddressValue may be null; extract from SCEV
+    if (const auto *U = dyn_cast_or_null<SCEVUnknown>(BaseSCEV))
+      BaseV = U->getValue();
+  }
+  if (!BaseV)
+    return 0;
+
+  // Strip through GEPs/casts to the underlying allocation
+  Value *Underlying = getUnderlyingObject(BaseV);
+  if (!Underlying)
+    return 0;
+
+  uint64_t Size = 0;
+  // Try LLVM's object size analysis (handles allocas, globals, some mallocs)
+  // Pass nullptr for TargetLibraryInfo - we'll fall back to direct type analysis
+  if (getObjectSize(Underlying, Size, DL, /*TLI=*/nullptr))
+    return Size;
+
+  // Fallback: directly query AllocaInst or GlobalVariable type sizes
+  if (const auto *AI = dyn_cast<AllocaInst>(Underlying))
+    return DL.getTypeAllocSize(AI->getAllocatedType());
+  if (const auto *GV = dyn_cast<GlobalVariable>(Underlying))
+    return DL.getTypeAllocSize(GV->getValueType());
+
+  return 0;  // Unknown size (e.g., pointer parameter)
+}
+
 bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
                                                            Instruction *MemInst,
                                                            Loop *L) {
@@ -1287,7 +1324,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   IDS.MemInst = MemInst;
   IDS.IsIndexComputed = !IsIndexFromStream;  // True for computed/random indices
   IDS.Loc = MemInst->getDebugLoc();
-  
+
   // Handle dynamic base address (e.g., A is a function parameter)
   if (IDS.IsBaseLinked) {
     IDS.BaseAddressValue = extractDynamicValue(BaseSCEV, L);
@@ -1297,7 +1334,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
       IDS.LinkID = getOrCreateLinkID(IDS.BaseAddressValue, Size);
     }
   }
-  
+
+  // Compute target array's allocated byte extent when statically known
+  // (After IsBaseLinked handling so BaseAddressValue is available if needed)
+  IDS.StreamSize = computeArrayFootprint(BaseSCEV, IDS.BaseAddressValue, F.getDataLayout());
+
   IndirectStreams.push_back(IDS);
   InstToStreamIDMap[MemInst] = IDS.StreamID;
   
@@ -1319,6 +1360,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
     dbgs() << "    Loop ID: " << IDS.LoopID << "\n";
     dbgs() << "    Base Address: " << *BaseSCEV << "\n";
     dbgs() << "    Element Size: " << IDS.ElementSize << " bytes\n";
+    dbgs() << "    Stream Size: " << IDS.StreamSize << " bytes\n";
     dbgs() << "    Base Linked: " << IDS.IsBaseLinked << "\n";
     if (IDS.IsIndexComputed) {
       dbgs() << "    Index Type: Computed/Random (no stream dependency)\n";
@@ -4496,7 +4538,7 @@ void injectDescriptorIR(
         Builder.getInt1(ActuallyLinked),
         BaseArg,
         Builder.getInt32(IDS->ElementSize),
-        Builder.getInt32(0)  // Stream size - TODO: compute from analysis
+        Builder.getInt32(IDS->StreamSize)  // Stream size (0 = unknown)
       });
       
       EmittedIndirectIDs.insert(IDS->StreamID);
