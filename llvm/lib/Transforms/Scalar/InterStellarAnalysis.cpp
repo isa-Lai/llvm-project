@@ -51,11 +51,70 @@ STATISTIC(NumLoopsAnalyzed, "Number of loops analyzed");
 
 namespace {
 
-/// Core stream analyzer - identifies memory access patterns and generates
-/// hardware descriptors for direct/indirect streams, loops, and link variables.
+// Descriptor data structures (internal to this pass; no external users).
+/// Data structure to represent a direct stream descriptor
+struct DirectStreamDescriptor {
+  unsigned StreamID = 0;
+  unsigned LoopID = 0;
+  const SCEV *BaseAddress = nullptr;
+  Value *BaseAddressValue = nullptr;
+  int64_t Stride = 0;
+  bool IsBaseLinked = false;  // Base Linked (BL) flag
+  unsigned LinkID = 0;        // ID of the Link Variable Descriptor if base is dynamic
+  Instruction *MemInst = nullptr;
+  DebugLoc Loc;               // Source location of the memory access
+};
+
+/// Data structure to represent an indirect stream descriptor
+struct IndirectStreamDescriptor {
+  unsigned StreamID = 0;
+  unsigned LoopID = 0;
+  unsigned BaseStreamID = 0;  // The stream that provides indices (0 if computed/random)
+  const SCEV *BaseAddress = nullptr;  // Base address of the indirectly accessed array
+  Value *BaseAddressValue = nullptr;  // IR Value if base is dynamic
+  int64_t ElementSize = 0;    // Size of elements being accessed (in bytes)
+  uint64_t StreamSize = 0;    // Total memory footprint of the target array (bytes), 0 = unknown
+  bool IsBaseLinked = false;  // Base Linked (BL) flag
+  unsigned LinkID = 0;  // Link Descriptor ID if base is dynamic
+  Instruction *MemInst = nullptr;  // Source load/store instruction
+  bool IsIndexComputed = false;  // True if index is computed (not from a stream)
+  DebugLoc Loc;               // Source location of the memory access
+};
+
+/// Data structure to represent a loop descriptor
+struct LoopDescriptor {
+  unsigned LoopID = 0;
+  unsigned ParentLoopID = 0;
+  Loop *L = nullptr;
+  const SCEV *StartValue = nullptr;
+  const SCEV *EndValue = nullptr;
+  const SCEV *StepValue = nullptr;
+  Value *StartValueDynamic = nullptr;  // IR Value if start is dynamic
+  Value *EndValueDynamic = nullptr;    // IR Value if end is dynamic
+  bool IsStartLinked = false;          // Start Linked (SL) flag
+  bool IsEndLinked = false;            // End Linked (EL) flag
+  unsigned StartLinkID = 0;            // Link Descriptor ID if SL=1
+  unsigned EndLinkID = 0;              // Link Descriptor ID if EL=1
+  DebugLoc Loc;                        // Source location of the loop
+  
+  // Virtual loop metadata (for merged loops)
+  bool IsVirtual = false;              // True if this is a virtual merged loop
+  unsigned MergedFromInnerLoop = 0;    // Original inner loop ID (if virtual)
+  unsigned MergedToOuterLoop = 0;      // Original outer loop ID (if virtual)
+  SmallVector<unsigned, 2> MergedDimensions; // Link IDs of merged dimensions
+};
+
+/// Data structure to represent a link variable descriptor
+struct LinkVariableDescriptor {
+  unsigned LinkID = 0;
+  Value *DynamicValue = nullptr;
+  unsigned SizeInBytes = 0;
+};
+
 /// Strip wrapping sext/zext/trunc casts from a SCEV.
 static const SCEV *stripSCEVCasts(const SCEV *S) {
-  S = stripSCEVCasts(S);
+  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S))
+    S = Cast->getOperand();
   return S;
 }
 
@@ -105,11 +164,13 @@ void printAllDescriptors(raw_ostream &OS,
                          const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
                          const SmallVectorImpl<LinkVariableDescriptor> &LinkVars);
 
+/// Core stream analyzer - identifies memory access patterns and generates
+/// hardware descriptors for direct/indirect streams, loops, and link variables.
 class InterStellarStreamAnalyzer {
 public:
   InterStellarStreamAnalyzer(Function &F, LoopInfo &LI, ScalarEvolution &SE)
       : F(F), LI(LI), SE(SE), NextStreamID(0), NextLoopID(0), NextLinkID(0) {}
-  
+
   /// Run the analysis on the function
   bool analyze();
   
@@ -3431,6 +3492,63 @@ void buildIDRemappingTables(
 /// Inject intrinsic calls into loop preheaders
 /// Emits configuration intrinsics in dependency order:
 /// Links → Loops → DirectStreams → IndirectStreams
+/// The referenced link may have been skipped (loop-variant); such streams
+/// fall back to non-linked mode.
+static bool resolveActuallyLinked(bool IsBaseLinked, unsigned LinkID,
+                                  const DenseSet<unsigned> &EmittedLinkIDs,
+                                  unsigned StreamIDForDebug,
+                                  const char *Kind) {
+  if (IsBaseLinked && !EmittedLinkIDs.count(LinkID)) {
+    LLVM_DEBUG(dbgs() << "    Warning: " << Kind << " " << StreamIDForDebug
+                      << " references skipped link " << LinkID
+                      << ", using non-linked mode\n");
+    return false;
+  }
+  return IsBaseLinked;
+}
+
+/// Prepare the base-address operand of a stream configure intrinsic.
+/// Linked bases encode the link's GlobalID as a pointer (the backend extracts
+/// it); constant bases pass the actual pointer. Returns nullopt when the
+/// stream must be skipped: a base computed inside the loop cannot be hoisted
+/// into the preheader.
+static std::optional<Value *>
+prepareStreamBaseArg(IRBuilder<> &Builder, Loop *L, bool ActuallyLinked,
+                     unsigned LinkID,
+                     const DenseMap<unsigned, unsigned> &LinkIDMap,
+                     Value *BaseAddressValue, const SCEV *BaseAddress,
+                     unsigned StreamIDForDebug) {
+  if (ActuallyLinked) {
+    unsigned LinkGlobalID = LinkIDMap.lookup(LinkID);
+    return Builder.CreateIntToPtr(Builder.getInt64(LinkGlobalID),
+                                  PointerType::getUnqual(Builder.getContext()));
+  }
+
+  Value *BaseArg = BaseAddressValue;
+  if (!BaseArg) {
+    // Fallback: try to extract from SCEV if BaseAddressValue is not set
+    if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(BaseAddress))
+      BaseArg = U->getValue();
+  }
+
+  // A base computed inside the loop can't be used in the preheader.
+  if (BaseArg) {
+    if (Instruction *BaseInst = dyn_cast<Instruction>(BaseArg)) {
+      if (L->contains(BaseInst->getParent())) {
+        LLVM_DEBUG(dbgs() << "    Warning: Stream " << StreamIDForDebug
+                          << " has loop-variant base, skipping\n");
+        return std::nullopt;
+      }
+    }
+  }
+
+  // If still null, use a null pointer as safe fallback.
+  if (!BaseArg)
+    BaseArg =
+        ConstantPointerNull::get(PointerType::getUnqual(Builder.getContext()));
+  return BaseArg;
+}
+
 void injectDescriptorIR(
     Function &F,
     const SmallVectorImpl<LoopDescriptor> &Loops,
@@ -3705,59 +3823,21 @@ void injectDescriptorIR(
       unsigned LoopGlobalID = LoopIDMap.lookup(DS->LoopID);
       
       // Check if this stream references a link that wasn't emitted (loop-variant)
-      bool ActuallyLinked = DS->IsBaseLinked;
-      if (ActuallyLinked && !EmittedLinkIDs.count(DS->LinkID)) {
-        // The link was skipped because it was loop-variant
-        // Fall back to non-linked mode
-        LLVM_DEBUG(dbgs() << "    Warning: Stream " << DS->StreamID 
-                          << " references skipped link " << DS->LinkID 
-                          << ", using non-linked mode\n");
-        ActuallyLinked = false;
-      }
-      
-      // Prepare base address argument:
-      // When ActuallyLinked=true: encode LinkID as pointer (backend extracts LinkID)
-      // When ActuallyLinked=false: pass actual constant pointer (backend uses this address)
-      Value *BaseArg = nullptr;
-      if (ActuallyLinked) {
-        // Base is dynamic - encode LinkID as pointer so backend knows which link to use
-        unsigned LinkGlobalID = LinkIDMap.lookup(DS->LinkID);
-        BaseArg = Builder.CreateIntToPtr(Builder.getInt64(LinkGlobalID), 
-                                         PointerType::getUnqual(Builder.getContext()));
-      } else {
-        // Base is constant (e.g., global array) or non-linked - pass the actual pointer
-        BaseArg = DS->BaseAddressValue;
-        if (!BaseArg) {
-          // Fallback: try to extract from SCEV if BaseAddressValue not set
-          if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(DS->BaseAddress)) {
-            BaseArg = U->getValue();
-          }
-        }
-        
-        // CRITICAL: Check if the base address is loop-variant
-        // If it's computed inside the loop, we can't use it in the preheader
-        if (BaseArg) {
-          if (Instruction *BaseInst = dyn_cast<Instruction>(BaseArg)) {
-            if (L->contains(BaseInst->getParent())) {
-              // Base is loop-variant - skip this stream
-              LLVM_DEBUG(dbgs() << "    Warning: Stream " << DS->StreamID 
-                                << " has loop-variant base, skipping\n");
-              continue;  // Skip this stream entirely
-            }
-          }
-        }
-        
-        // If still null, use null pointer as safe fallback
-        if (!BaseArg) {
-          BaseArg = ConstantPointerNull::get(PointerType::getUnqual(Builder.getContext()));
-        }
-      }
+      bool ActuallyLinked = resolveActuallyLinked(DS->IsBaseLinked, DS->LinkID,
+                                                  EmittedLinkIDs, DS->StreamID,
+                                                  "Stream");
+
+      std::optional<Value *> BaseArg = prepareStreamBaseArg(
+          Builder, L, ActuallyLinked, DS->LinkID, LinkIDMap,
+          DS->BaseAddressValue, DS->BaseAddress, DS->StreamID);
+      if (!BaseArg)
+        continue; // loop-variant base - skip this stream entirely
       
       LLVM_DEBUG(dbgs() << "    DirectStream GlobalID=" << GlobalID 
                         << " (Analysis ID=" << DS->StreamID << ")"
                         << " Loop=" << LoopGlobalID
                         << " BL=" << ActuallyLinked
-                        << " BaseAddr=" << *BaseArg
+                        << " BaseAddr=" << **BaseArg
                         << " Stride=" << DS->Stride << "\n");
       
       // Emit: call void @llvm.interstellar.configure.directstream(globalid, loop, BL, base, stride)
@@ -3765,7 +3845,7 @@ void injectDescriptorIR(
         Builder.getInt32(GlobalID),
         Builder.getInt32(LoopGlobalID),
         Builder.getInt1(ActuallyLinked),
-        BaseArg,
+        *BaseArg,
         Builder.getInt32(DS->Stride)
       });
       
@@ -3785,59 +3865,21 @@ void injectDescriptorIR(
       }
       
       // Check if this stream references a link that wasn't emitted (loop-variant)
-      bool ActuallyLinked = IDS->IsBaseLinked;
-      if (ActuallyLinked && !EmittedLinkIDs.count(IDS->LinkID)) {
-        // The link was skipped because it was loop-variant
-        // Fall back to non-linked mode
-        LLVM_DEBUG(dbgs() << "    Warning: Indirect stream " << IDS->StreamID 
-                          << " references skipped link " << IDS->LinkID 
-                          << ", using non-linked mode\n");
-        ActuallyLinked = false;
-      }
-      
-      // Prepare base address argument:
-      // When ActuallyLinked=true: encode LinkID as pointer (backend extracts LinkID)
-      // When ActuallyLinked=false: pass actual constant pointer (backend uses this address)
-      Value *BaseArg = nullptr;
-      if (ActuallyLinked) {
-        // Base is dynamic - encode LinkID as pointer so backend knows which link to use
-        unsigned LinkGlobalID = LinkIDMap.lookup(IDS->LinkID);
-        BaseArg = Builder.CreateIntToPtr(Builder.getInt64(LinkGlobalID), 
-                                         PointerType::getUnqual(Builder.getContext()));
-      } else {
-        // Base is constant (e.g., global array) or non-linked - pass the actual pointer
-        BaseArg = IDS->BaseAddressValue;
-        if (!BaseArg) {
-          // Fallback: try to extract from SCEV if BaseAddressValue not set
-          if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(IDS->BaseAddress)) {
-            BaseArg = U->getValue();
-          }
-        }
-        
-        // CRITICAL: Check if the base address is loop-variant
-        // If it's computed inside the loop, we can't use it in the preheader
-        if (BaseArg) {
-          if (Instruction *BaseInst = dyn_cast<Instruction>(BaseArg)) {
-            if (L->contains(BaseInst->getParent())) {
-              // Base is loop-variant - skip this stream
-              LLVM_DEBUG(dbgs() << "    Warning: Indirect stream " << IDS->StreamID 
-                                << " has loop-variant base, skipping\n");
-              continue;  // Skip this stream entirely
-            }
-          }
-        }
-        
-        // If still null, use null pointer as safe fallback
-        if (!BaseArg) {
-          BaseArg = ConstantPointerNull::get(PointerType::getUnqual(Builder.getContext()));
-        }
-      }
+      bool ActuallyLinked = resolveActuallyLinked(IDS->IsBaseLinked, IDS->LinkID,
+                                                  EmittedLinkIDs, IDS->StreamID,
+                                                  "Indirect stream");
+
+      std::optional<Value *> BaseArg = prepareStreamBaseArg(
+          Builder, L, ActuallyLinked, IDS->LinkID, LinkIDMap,
+          IDS->BaseAddressValue, IDS->BaseAddress, IDS->StreamID);
+      if (!BaseArg)
+        continue; // loop-variant base - skip this stream entirely
       
       LLVM_DEBUG(dbgs() << "    IndirectStream GlobalID=" << GlobalID 
                         << " (Analysis ID=" << IDS->StreamID << ")"
                         << " SourceStream=" << SourceStreamGlobalID
                         << " BL=" << ActuallyLinked
-                        << " BaseAddr=" << *BaseArg
+                        << " BaseAddr=" << **BaseArg
                         << " ElemSize=" << IDS->ElementSize << "\n");
       
       // Emit: call void @llvm.interstellar.configure.indirectstream(globalid, source, BL, base, elemsize, streamsize)
@@ -3845,7 +3887,7 @@ void injectDescriptorIR(
         Builder.getInt32(GlobalID),
         Builder.getInt32(SourceStreamGlobalID),
         Builder.getInt1(ActuallyLinked),
-        BaseArg,
+        *BaseArg,
         Builder.getInt32(IDS->ElementSize),
         Builder.getInt32(IDS->StreamSize)  // Stream size (0 = unknown)
       });
