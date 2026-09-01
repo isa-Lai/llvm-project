@@ -93,9 +93,7 @@ struct LinkVariableDescriptor {
 class InterStellarAnalysisPass : public PassInfoMixin<InterStellarAnalysisPass> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
-  
-  void printResults(raw_ostream &OS) const;
-  
+
   static bool isRequired() { return true; }
 };
 

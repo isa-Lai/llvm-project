@@ -7,7 +7,10 @@ PURPOSE
   contract is INSTRUCTION IDENTITY: analysis internals and phase1 IR may
   change, but the generated RISC-V (CSR-write descriptor setup + kernel code)
   must not. Gates:
-    G1  phase1.s / phase1.o byte-identical per pattern   (baseline/check_gate.sh)
+    G1  phase1.s identical except .ident (clang stamps the build-tree git hash
+      there, so it changes with every commit); phase1.o compared via
+      instruction disassembly (excludes .comment/version bytes)
+      (baseline/check_gate.sh)
     G2  .riscv binaries byte-identical                   (binary.sha256)
     G3  gem5 simInsts exact: 119,470 (complete_test) / 119,175 (simple_test),
         kernel output correct ("Sum: ... expected: ...")

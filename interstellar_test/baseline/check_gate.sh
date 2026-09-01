@@ -38,14 +38,27 @@ for p in "${PATTERNS[@]}"; do
             ../build/bin/clang --target=riscv64-unknown-linux-gnu -march=rv64gc \
                 -c test_backend.s -o test_backend.o 2>/dev/null
     fi
+    # Version-stamp normalization: clang embeds the build-tree git hash in
+    # `.ident` (.s) and the .comment section (.o), so those bytes change with
+    # every commit even when the code is identical. Compare .s without .ident
+    # lines, and .o via instruction disassembly (excludes .comment).
     for f in test_backend.s:phase1.s test_backend.o:phase1.o; do
         fresh="${f%%:*}"; golden="${f##*:}"
-        if [ -f "$base/$golden" ] || [ -f "$fresh" ]; then
-            if ! cmp -s "$base/$golden" "$fresh"; then
-                echo "GATE FAIL pattern$p: $golden differs"
-                FAIL=1
-            fi
-        fi   # both missing (patternA) = match
+        if [ ! -f "$base/$golden" ] && [ ! -f "$fresh" ]; then
+            continue   # both missing (patternA) = match
+        fi
+        case "$golden" in
+            phase1.s)
+                diff <(grep -v '^[[:space:]]*\.ident' "$base/$golden" 2>/dev/null) \
+                     <(grep -v '^[[:space:]]*\.ident' "$fresh" 2>/dev/null) >/dev/null ;;
+            phase1.o)
+                diff <(../build/bin/llvm-objdump -d "$base/$golden" 2>/dev/null | grep -v 'file format') \
+                     <(../build/bin/llvm-objdump -d "$fresh" 2>/dev/null | grep -v 'file format') >/dev/null ;;
+        esac
+        if [ $? -ne 0 ]; then
+            echo "GATE FAIL pattern$p: $golden differs"
+            FAIL=1
+        fi
     done
     if [ $VERBOSE -eq 1 ]; then
         if ! diff -q "$base/intrinsics.txt" \
