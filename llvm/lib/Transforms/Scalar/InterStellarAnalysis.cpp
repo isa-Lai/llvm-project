@@ -263,8 +263,8 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
             
             auto extractBoundFromBlock = [&](BasicBlock *BB) -> bool {
               if (!BB) return false;
-              BranchInst *BI = dyn_cast<BranchInst>(BB->getTerminator());
-              if (BI && BI->isConditional()) {
+              CondBrInst *BI = dyn_cast<CondBrInst>(BB->getTerminator());
+              if (BI) {
                 if (ICmpInst *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
                   // Check which operand is the induction variable
                   Value *Op0 = Cmp->getOperand(0);
@@ -1037,6 +1037,12 @@ static uint64_t computeArrayFootprint(const SCEV *BaseSCEV,
   // Strip through GEPs/casts to the underlying allocation
   Value *Underlying = getUnderlyingObject(BaseV);
   if (!Underlying)
+    return 0;
+
+  // getObjectSize requires a pointer. extractDynamicValue's leaf fallback can
+  // hand back non-pointer values (e.g., an i32 index), and
+  // DataLayout::getIndexTypeSizeInBits asserts on non-pointer types.
+  if (!Underlying->getType()->isPointerTy())
     return 0;
 
   uint64_t Size = 0;
