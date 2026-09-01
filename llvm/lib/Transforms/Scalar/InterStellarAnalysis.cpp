@@ -2308,1081 +2308,1111 @@ static void generateHardwareDescriptorIR(
 // InterStellarAnalysisPass Implementation (New Pass Manager)
 //===----------------------------------------------------------------------===//
 
-PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
-                                                 FunctionAnalysisManager &AM) {
-  auto &LI = AM.getResult<LoopAnalysis>(F);
-  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  
-  // Early exit if no loops
-  if (LI.empty()) {
-    return PreservedAnalyses::all();
+//===----------------------------------------------------------------------===//
+// Pipeline stage functions
+//===----------------------------------------------------------------------===//
+//
+// InterStellarAnalysisPass::run() is a thin driver over these stages, executed
+// in order:
+//
+//   deduplicateDirectStreams / deduplicateIndirectStreams   (Stage 1.1)
+//   analyzeLinearizationFeasibility                         (Stage 1.2)
+//   removeStreamLessLoops                                   (Stage 1.5)
+//   applyLoopMerges                                         (Stage 3)
+//   removeUnusedLoops                                       (Stage 3.1)
+//
+// All stage state lives in InterstellarPipelineContext so code motion from the
+// former monolithic run() stays literal.
+
+/// Shared state for the intraprocedural pipeline stages of the pass.
+struct InterstellarPipelineContext {
+  Function &F;
+  ScalarEvolution &SE;
+  DominatorTree &DT;
+
+  SmallVector<DirectStreamDescriptor, 8> Streams;
+  SmallVector<IndirectStreamDescriptor, 4> IndirectStreams;
+  SmallVector<LoopDescriptor, 4> Loops;
+  SmallVector<LinkVariableDescriptor, 4> LinkVars;
+  SmallVector<StreamMergeCandidate, 4> MergeCandidates;
+  DenseMap<unsigned, const LoopDescriptor *> LoopIDToDescriptor;
+  unsigned NextLinkID = 0;
+  SmallVector<unsigned, 4> AppliedMerges;
+
+  InterstellarPipelineContext(Function &F, ScalarEvolution &SE, DominatorTree &DT)
+      : F(F), SE(SE), DT(DT) {}
+};
+
+static const SCEVAddRecExpr *findAddRecForLoop(const SCEV *S,
+                                            const Loop *TargetLoop) {
+  if (!S || !TargetLoop)
+    return nullptr;
+
+  // Direct match: top-level is AddRecExpr for target loop
+  if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    if (AR->getLoop() == TargetLoop)
+      return AR;
+    // For nested AddRecs, search the start value (base)
+    // Example: {{%base,+,400}<%Loop0>,+,40}<%Loop1>
+    // When searching for Loop0, we need to look inside the outer AddRec's start value
+    if (auto *Found = findAddRecForLoop(AR->getStart(), TargetLoop))
+      return Found;
   }
-  
-  LLVM_DEBUG(dbgs() << "\n"
-                    << "╔═══════════════════════════════════════════════════╗\n"
-                    << "║  InterStellar Pass 1: Local Stream Analysis       ║\n"
-                    << "╚═══════════════════════════════════════════════════╝\n");
-  
-  LLVM_DEBUG(dbgs() << "Running InterStellar Pass 1 on function: "
-                    << F.getName() << "\n");
-  
-  // ============================================================
-  // PASS 1: LOCAL STREAM ANALYSIS
-  // ============================================================
-  // Identifies raw memory access patterns within each function:
-  // - Direct streams (affine patterns like A[i])
-  // - Indirect streams (index-based patterns like A[B[i]])
-  // - Loop contexts (bounds, nesting, induction variables)
-  // - Dynamic values (link variables for runtime values)
-  //
-  // Output: Raw stream descriptors (may contain duplicates)
-  // ============================================================
-  
-  // Create analyzer and run Pass 1 analysis
-  InterStellarStreamAnalyzer Analyzer(F, LI, SE);
-  Analyzer.analyze();
-  
-  // Print Pass 1 results
-  LLVM_DEBUG(Analyzer.print(dbgs()));
-  
-  // ============================================================
-  // PASS 2: INTRAPROCEDURAL OPTIMIZATION (Stage 1 only)
-  // ============================================================
-  // We can run Stage 1 of Pass 2 here (intraprocedural analysis).
-  // Stages 2 & 3 require module-level infrastructure.
-  //
-  // Stage 1.1: Stream redundancy elimination (dominance analysis)
-  // Stage 1.2: Linearization feasibility analysis (SCEV-based)
-  // ============================================================
-  
-  SmallVector<DirectStreamDescriptor, 8> Streams = Analyzer.getDirectStreams();
-  SmallVector<LoopDescriptor, 4> Loops = Analyzer.getLoopDescriptors();
-  SmallVector<IndirectStreamDescriptor, 4> IndirectStreams = Analyzer.getIndirectStreams();
-  
-  // Run Pass 2 if there are any loops (even without streams)
-  // Stage 1.5 will clean up empty loops before merge analysis
-  if (!Loops.empty()) {
-    auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-    
-    LLVM_DEBUG(dbgs() << "\n"
-                      << "╔═══════════════════════════════════════════════════╗\n"
-                      << "║  InterStellar Pass 2: Stage 1 (Intraprocedural)   ║\n"
-                      << "╚═══════════════════════════════════════════════════╝\n");
-    
-    // Stage 1.1: Eliminate redundant streams using dominance analysis
-    // Only run if there are streams to deduplicate
-    if (!Streams.empty()) {
-      LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Redundancy Analysis\n");
-      
-      SmallVector<SmallVector<unsigned, 2>, 4> StreamGroups;
-      SmallVector<bool, 8> Processed(Streams.size(), false);
-    
-    for (size_t i = 0; i < Streams.size(); ++i) {
-      if (Processed[i])
-        continue;
-      
-      const auto &DS_i = Streams[i];
-      SmallVector<unsigned, 2> Group;
-      Group.push_back(i);
-      Processed[i] = true;
-      
-      // Find all streams with matching signature
-      for (size_t j = i + 1; j < Streams.size(); ++j) {
-        if (Processed[j])
-          continue;
-        
-        const auto &DS_j = Streams[j];
-        if (DS_i.LoopID == DS_j.LoopID &&
-            DS_i.BaseAddress == DS_j.BaseAddress &&
-            DS_i.Stride == DS_j.Stride) {
-          Group.push_back(j);
-          Processed[j] = true;
-        }
-      }
-      
-      if (Group.size() > 1) {
-        StreamGroups.push_back(std::move(Group));
-      }
-    }
-    
-    // Track which streams should be removed (redundant streams)
-    SmallPtrSet<const DirectStreamDescriptor *, 8> StreamsToRemove;
-    
-    for (const auto &Group : StreamGroups) {
-      LLVM_DEBUG(dbgs() << "  Found " << Group.size() 
-                        << " duplicate streams:\n");
-      
-      // Find dominating instruction
-      Instruction *DominatingInst = nullptr;
-      unsigned PrimaryIdx = Group[0];
-      
-      for (unsigned Idx : Group) {
-        LLVM_DEBUG(dbgs() << "    Stream #" << Streams[Idx].StreamID);
-        // Print source location if available
-        if (Streams[Idx].Loc) {
-          LLVM_DEBUG(dbgs() << " at ");
-          LLVM_DEBUG(Streams[Idx].Loc.print(dbgs()));
-        }
-        LLVM_DEBUG(dbgs() << "\n");
-        
-        Instruction *CurrentInst = Streams[Idx].MemInst;
-        if (!CurrentInst)
-          continue;
-        
-        if (!DominatingInst || DT.dominates(CurrentInst, DominatingInst)) {
-          DominatingInst = CurrentInst;
-          PrimaryIdx = Idx;
-        }
-      }
-      
-      LLVM_DEBUG(dbgs() << "    → Primary stream: #" << Streams[PrimaryIdx].StreamID);
-      if (Streams[PrimaryIdx].Loc) {
-        LLVM_DEBUG(dbgs() << " at ");
-        LLVM_DEBUG(Streams[PrimaryIdx].Loc.print(dbgs()));
-      }
-      LLVM_DEBUG(dbgs() << "\n");
-      
-      // Mark all non-primary streams for removal
-      for (unsigned Idx : Group) {
-        if (Idx != PrimaryIdx) {
-          StreamsToRemove.insert(&Streams[Idx]);
-        }
-      }
-    }
-    
-    // Filter out redundant streams - keep only primary streams
-    SmallVector<DirectStreamDescriptor, 8> FilteredStreams;
-    for (const auto &DS : Streams) {
-      if (!StreamsToRemove.count(&DS)) {
-        FilteredStreams.push_back(DS);
-      }
-    }
-    
-    // Replace Streams with the filtered list for subsequent stages
-    Streams = std::move(FilteredStreams);
-    
-    // Stage 1.1: Also analyze indirect stream redundancy
-    // Indirect streams should be deduplicated based on base address, element size,
-    // and index source (either a specific stream ID or computed/random)
-    
-    if (!IndirectStreams.empty()) {
-      LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Indirect Stream Redundancy Analysis\n");
-      
-      SmallVector<SmallVector<unsigned, 2>, 4> IndirectStreamGroups;
-      SmallVector<bool, 8> IndirectProcessed(IndirectStreams.size(), false);
-      
-      // Track which indirect streams should be removed (redundant streams)
-      SmallPtrSet<const IndirectStreamDescriptor *, 8> IndirectStreamsToRemove;
-      
-      for (size_t i = 0; i < IndirectStreams.size(); ++i) {
-        if (IndirectProcessed[i])
-          continue;
-        
-        const auto &IDS_i = IndirectStreams[i];
-        SmallVector<unsigned, 2> Group;
-        Group.push_back(i);
-        IndirectProcessed[i] = true;
-        
-        // Find all indirect streams with matching signature
-        // Signature: {LoopID, BaseAddress, ElementSize, IsIndexComputed, BaseStreamID}
-        for (size_t j = i + 1; j < IndirectStreams.size(); ++j) {
-          if (IndirectProcessed[j])
-            continue;
-          
-          const auto &IDS_j = IndirectStreams[j];
-          
-          // Check if signatures match
-          if (IDS_i.LoopID == IDS_j.LoopID &&
-              IDS_i.BaseAddress == IDS_j.BaseAddress &&
-              IDS_i.ElementSize == IDS_j.ElementSize &&
-              IDS_i.IsIndexComputed == IDS_j.IsIndexComputed &&
-              (IDS_i.IsIndexComputed || IDS_i.BaseStreamID == IDS_j.BaseStreamID)) {
-            Group.push_back(j);
-            IndirectProcessed[j] = true;
-          }
-        }
-        
-        if (Group.size() > 1) {
-          IndirectStreamGroups.push_back(std::move(Group));
-        }
-      }
-      
-      for (const auto &Group : IndirectStreamGroups) {
-        LLVM_DEBUG(dbgs() << "  Found " << Group.size() 
-                          << " duplicate indirect streams:\n");
-        
-        // Find dominating instruction (prefer LoadInst as primary)
-        Instruction *DominatingInst = nullptr;
-        unsigned PrimaryIdx = Group[0];
-        bool PreferLoad = false;
-        
-        for (unsigned Idx : Group) {
-          LLVM_DEBUG(dbgs() << "    Indirect Stream #" << IndirectStreams[Idx].StreamID);
-          // Print source location if available
-          if (IndirectStreams[Idx].Loc) {
-            LLVM_DEBUG(dbgs() << " at ");
-            LLVM_DEBUG(IndirectStreams[Idx].Loc.print(dbgs()));
-          }
-          LLVM_DEBUG(dbgs() << "\n");
-          
-          Instruction *CurrentInst = IndirectStreams[Idx].MemInst;
-          if (!CurrentInst)
-            continue;
-          
-          if (!DominatingInst) {
-            DominatingInst = CurrentInst;
-            PrimaryIdx = Idx;
-            PreferLoad = isa<LoadInst>(CurrentInst);
-          } else if (DT.dominates(CurrentInst, DominatingInst)) {
-            // This instruction dominates the current primary
-            DominatingInst = CurrentInst;
-            PrimaryIdx = Idx;
-            PreferLoad = isa<LoadInst>(CurrentInst);
-          } else if (DT.dominates(DominatingInst, CurrentInst)) {
-            // Current primary dominates this one - keep primary unless we prefer loads
-            if (!PreferLoad && isa<LoadInst>(CurrentInst)) {
-              // Same dominance level, but prefer load over store
-              DominatingInst = CurrentInst;
-              PrimaryIdx = Idx;
-              PreferLoad = true;
-            }
-          } else {
-            // No dominance relationship - prefer LoadInst as primary
-            if (!PreferLoad && isa<LoadInst>(CurrentInst)) {
-              DominatingInst = CurrentInst;
-              PrimaryIdx = Idx;
-              PreferLoad = true;
-            }
-          }
-        }
-        
-        LLVM_DEBUG(dbgs() << "    → Primary indirect stream: #" 
-                          << IndirectStreams[PrimaryIdx].StreamID);
-        if (IndirectStreams[PrimaryIdx].Loc) {
-          LLVM_DEBUG(dbgs() << " at ");
-          LLVM_DEBUG(IndirectStreams[PrimaryIdx].Loc.print(dbgs()));
-        }
-        LLVM_DEBUG(dbgs() << "\n");
-        
-        // Mark all non-primary indirect streams for removal
-        for (unsigned Idx : Group) {
-          if (Idx != PrimaryIdx) {
-            IndirectStreamsToRemove.insert(&IndirectStreams[Idx]);
-          }
-        }
-      }
-      
-      // Filter out redundant indirect streams - keep only primary streams
-      SmallVector<IndirectStreamDescriptor, 4> FilteredIndirectStreams;
-      for (const auto &IDS : IndirectStreams) {
-        if (!IndirectStreamsToRemove.count(&IDS)) {
-          FilteredIndirectStreams.push_back(IDS);
-        }
-      }
-      
-      // Replace IndirectStreams with the filtered list for subsequent stages
-      IndirectStreams = std::move(FilteredIndirectStreams);
-    }
-    
-    } // End: if (!Streams.empty()) - Stage 1.1
-    
-    // Helper function to extract AddRecExpr for a specific loop from complex SCEV
-    // Recursively searches through SCEV tree (AddExpr, MulExpr, CastExpr, etc.)
-    // Declared here for use in both Stage 1.2 and Stage 2
-    std::function<const SCEVAddRecExpr *(const SCEV *, const Loop *)> FindAddRecForLoop = 
-        [&](const SCEV *S, const Loop *TargetLoop) -> const SCEVAddRecExpr * {
-      if (!S || !TargetLoop)
-        return nullptr;
-      
-      // Direct match: top-level is AddRecExpr for target loop
-      if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+
+  // Search within AddExpr operands (e.g., "base + offset")
+  if (const SCEVAddExpr *Add = dyn_cast<SCEVAddExpr>(S)) {
+    for (const SCEV *Op : Add->operands()) {
+      if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Op)) {
         if (AR->getLoop() == TargetLoop)
           return AR;
-        // For nested AddRecs, search the start value (base)
-        // Example: {{%base,+,400}<%Loop0>,+,40}<%Loop1>
-        // When searching for Loop0, we need to look inside the outer AddRec's start value
-        if (auto *Found = FindAddRecForLoop(AR->getStart(), TargetLoop))
-          return Found;
       }
-      
-      // Search within AddExpr operands (e.g., "base + offset")
-      if (const SCEVAddExpr *Add = dyn_cast<SCEVAddExpr>(S)) {
-        for (const SCEV *Op : Add->operands()) {
-          if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Op)) {
-            if (AR->getLoop() == TargetLoop)
-              return AR;
-          }
-          // Recurse into complex operands
-          if (auto *Found = FindAddRecForLoop(Op, TargetLoop))
-            return Found;
-        }
-      }
-      
-      // Search within MulExpr operands (e.g., "4 * {0,+,stride}")
-      if (const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(S)) {
-        for (const SCEV *Op : Mul->operands()) {
-          if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Op)) {
-            if (AR->getLoop() == TargetLoop)
-              return AR;
-          }
-          // Recurse into complex operands
-          if (auto *Found = FindAddRecForLoop(Op, TargetLoop))
-            return Found;
-        }
-      }
-      
-      // Search through type casts (sext, zext, trunc)
-      if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
-        return FindAddRecForLoop(Cast->getOperand(), TargetLoop);
-      }
-      
-      return nullptr;
-    };
-    
-    // Build mapping from LoopID to Loop descriptor (used in Stage 1.2 and Stage 2)
-    DenseMap<unsigned, const LoopDescriptor *> LoopIDToDescriptor;
-    for (const auto &LD : Loops) {
-      LoopIDToDescriptor[LD.LoopID] = &LD;
+      // Recurse into complex operands
+      if (auto *Found = findAddRecForLoop(Op, TargetLoop))
+        return Found;
     }
-    
-    // Merge candidates (populated in Stage 1.2, used in Stage 2 & 3)
-    SmallVector<StreamMergeCandidate, 4> MergeCandidates;
-    
-    // Stage 1.2: Analyze merge feasibility for nested loops
-    // Only run if there are streams to analyze
-    if (!Streams.empty()) {
-      LLVM_DEBUG(dbgs() << "\n[Stage 1.2] Linearization Feasibility Analysis\n");
-    
-    for (const auto &DS : Streams) {
-      auto LoopIt = LoopIDToDescriptor.find(DS.LoopID);
-      if (LoopIt == LoopIDToDescriptor.end())
+  }
+
+  // Search within MulExpr operands (e.g., "4 * {0,+,stride}")
+  if (const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(S)) {
+    for (const SCEV *Op : Mul->operands()) {
+      if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Op)) {
+        if (AR->getLoop() == TargetLoop)
+          return AR;
+      }
+      // Recurse into complex operands
+      if (auto *Found = findAddRecForLoop(Op, TargetLoop))
+        return Found;
+    }
+  }
+
+  // Search through type casts (sext, zext, trunc)
+  if (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
+    return findAddRecForLoop(Cast->getOperand(), TargetLoop);
+  }
+
+  return nullptr;
+}
+
+/// Stage 1.1 (direct): group same-signature streams (LoopID, base SCEV,
+/// stride) and keep only the dominating instruction's stream.
+static void deduplicateDirectStreams(InterstellarPipelineContext &Ctx) {
+  LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Redundancy Analysis\n");
+
+  SmallVector<SmallVector<unsigned, 2>, 4> StreamGroups;
+  SmallVector<bool, 8> Processed(Ctx.Streams.size(), false);
+
+for (size_t i = 0; i < Ctx.Streams.size(); ++i) {
+  if (Processed[i])
+    continue;
+
+  const auto &DS_i = Ctx.Streams[i];
+  SmallVector<unsigned, 2> Group;
+  Group.push_back(i);
+  Processed[i] = true;
+
+  // Find all streams with matching signature
+  for (size_t j = i + 1; j < Ctx.Streams.size(); ++j) {
+    if (Processed[j])
+      continue;
+
+    const auto &DS_j = Ctx.Streams[j];
+    if (DS_i.LoopID == DS_j.LoopID &&
+        DS_i.BaseAddress == DS_j.BaseAddress &&
+        DS_i.Stride == DS_j.Stride) {
+      Group.push_back(j);
+      Processed[j] = true;
+    }
+  }
+
+  if (Group.size() > 1) {
+    StreamGroups.push_back(std::move(Group));
+  }
+}
+
+// Track which streams should be removed (redundant streams)
+SmallPtrSet<const DirectStreamDescriptor *, 8> StreamsToRemove;
+
+for (const auto &Group : StreamGroups) {
+  LLVM_DEBUG(dbgs() << "  Found " << Group.size() 
+                    << " duplicate streams:\n");
+
+  // Find dominating instruction
+  Instruction *DominatingInst = nullptr;
+  unsigned PrimaryIdx = Group[0];
+
+  for (unsigned Idx : Group) {
+    LLVM_DEBUG(dbgs() << "    Stream #" << Ctx.Streams[Idx].StreamID);
+    // Print source location if available
+    if (Ctx.Streams[Idx].Loc) {
+      LLVM_DEBUG(dbgs() << " at ");
+      LLVM_DEBUG(Ctx.Streams[Idx].Loc.print(dbgs()));
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    Instruction *CurrentInst = Ctx.Streams[Idx].MemInst;
+    if (!CurrentInst)
+      continue;
+
+    if (!DominatingInst || Ctx.DT.dominates(CurrentInst, DominatingInst)) {
+      DominatingInst = CurrentInst;
+      PrimaryIdx = Idx;
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "    → Primary stream: #" << Ctx.Streams[PrimaryIdx].StreamID);
+  if (Ctx.Streams[PrimaryIdx].Loc) {
+    LLVM_DEBUG(dbgs() << " at ");
+    LLVM_DEBUG(Ctx.Streams[PrimaryIdx].Loc.print(dbgs()));
+  }
+  LLVM_DEBUG(dbgs() << "\n");
+
+  // Mark all non-primary streams for removal
+  for (unsigned Idx : Group) {
+    if (Idx != PrimaryIdx) {
+      StreamsToRemove.insert(&Ctx.Streams[Idx]);
+    }
+  }
+}
+
+// Filter out redundant streams - keep only primary streams
+SmallVector<DirectStreamDescriptor, 8> FilteredStreams;
+for (const auto &DS : Ctx.Streams) {
+  if (!StreamsToRemove.count(&DS)) {
+    FilteredStreams.push_back(DS);
+  }
+}
+
+// Replace Ctx.Streams with the filtered list for subsequent stages
+Ctx.Streams = std::move(FilteredStreams);
+}
+
+/// Stage 1.1 (indirect): same-signature grouping with load-over-store
+/// preference for the primary. Runs only when direct streams exist —
+/// call sites keep it nested in the !Streams.empty() guard (pre-existing).
+static void deduplicateIndirectStreams(InterstellarPipelineContext &Ctx) {
+// Stage 1.1: Also analyze indirect stream redundancy
+// Indirect streams should be deduplicated based on base address, element size,
+// and index source (either a specific stream ID or computed/random)
+
+if (!Ctx.IndirectStreams.empty()) {
+  LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Indirect Stream Redundancy Analysis\n");
+
+  SmallVector<SmallVector<unsigned, 2>, 4> IndirectStreamGroups;
+  SmallVector<bool, 8> IndirectProcessed(Ctx.IndirectStreams.size(), false);
+
+  // Track which indirect streams should be removed (redundant streams)
+  SmallPtrSet<const IndirectStreamDescriptor *, 8> IndirectStreamsToRemove;
+
+  for (size_t i = 0; i < Ctx.IndirectStreams.size(); ++i) {
+    if (IndirectProcessed[i])
+      continue;
+
+    const auto &IDS_i = Ctx.IndirectStreams[i];
+    SmallVector<unsigned, 2> Group;
+    Group.push_back(i);
+    IndirectProcessed[i] = true;
+
+    // Find all indirect streams with matching signature
+    // Signature: {LoopID, BaseAddress, ElementSize, IsIndexComputed, BaseStreamID}
+    for (size_t j = i + 1; j < Ctx.IndirectStreams.size(); ++j) {
+      if (IndirectProcessed[j])
         continue;
-      
-      const LoopDescriptor *CurrentLD = LoopIt->second;
-      Loop *CurrentLoop = CurrentLD->L;
-      
-      if (!CurrentLoop)
+
+      const auto &IDS_j = Ctx.IndirectStreams[j];
+
+      // Check if signatures match
+      if (IDS_i.LoopID == IDS_j.LoopID &&
+          IDS_i.BaseAddress == IDS_j.BaseAddress &&
+          IDS_i.ElementSize == IDS_j.ElementSize &&
+          IDS_i.IsIndexComputed == IDS_j.IsIndexComputed &&
+          (IDS_i.IsIndexComputed || IDS_i.BaseStreamID == IDS_j.BaseStreamID)) {
+        Group.push_back(j);
+        IndirectProcessed[j] = true;
+      }
+    }
+
+    if (Group.size() > 1) {
+      IndirectStreamGroups.push_back(std::move(Group));
+    }
+  }
+
+  for (const auto &Group : IndirectStreamGroups) {
+    LLVM_DEBUG(dbgs() << "  Found " << Group.size() 
+                      << " duplicate indirect streams:\n");
+
+    // Find dominating instruction (prefer LoadInst as primary)
+    Instruction *DominatingInst = nullptr;
+    unsigned PrimaryIdx = Group[0];
+    bool PreferLoad = false;
+
+    for (unsigned Idx : Group) {
+      LLVM_DEBUG(dbgs() << "    Indirect Stream #" << Ctx.IndirectStreams[Idx].StreamID);
+      // Print source location if available
+      if (Ctx.IndirectStreams[Idx].Loc) {
+        LLVM_DEBUG(dbgs() << " at ");
+        LLVM_DEBUG(Ctx.IndirectStreams[Idx].Loc.print(dbgs()));
+      }
+      LLVM_DEBUG(dbgs() << "\n");
+
+      Instruction *CurrentInst = Ctx.IndirectStreams[Idx].MemInst;
+      if (!CurrentInst)
         continue;
-      
-      if (!CurrentLoop->getParentLoop())
-        continue;  // No parent loop, nothing to merge
-      
-      // Recursive multi-level analysis: Walk up the loop nest
-      // For each parent loop, check if we can linearize at that level
-      // Example: for i { for j { for k { A[i][j][k] } } }
-      //   - Level 1: k→j (if P matches dimension)
-      //   - Level 2: k-j→i (if M*P or just M matches dimension)
-      
-      Loop *ChildLoop = CurrentLoop;
-      const LoopDescriptor *ChildLD = CurrentLD;
-      const SCEV *CumulativeSpan = nullptr;
-      SmallVector<unsigned, 4> RequiredDimensions;
-      
-      // Start with the innermost loop's trip count and stride
-      // CRITICAL: Use the actual loop bound (EndValueDynamic) for symbolic comparison,
-      // not the SCEV (EndValue) which might be a backedge-taken count.
-      // For loop: for (k = 0; k < D3_dim3; k++)
-      //   - EndValue SCEV might be: (zext %D3_dim3 to i64) or (%D3_dim3 - 1) 
-      //   - EndValueDynamic is: %D3_dim3 (the actual IR value)
-      //   - We want to use %D3_dim3 for comparisons
-      const SCEV *InnerTripCount = ChildLD->EndValue;
-      
-      // If we have the dynamic value, create a SCEV from it for cleaner comparisons
+
+      if (!DominatingInst) {
+        DominatingInst = CurrentInst;
+        PrimaryIdx = Idx;
+        PreferLoad = isa<LoadInst>(CurrentInst);
+      } else if (Ctx.DT.dominates(CurrentInst, DominatingInst)) {
+        // This instruction dominates the current primary
+        DominatingInst = CurrentInst;
+        PrimaryIdx = Idx;
+        PreferLoad = isa<LoadInst>(CurrentInst);
+      } else if (Ctx.DT.dominates(DominatingInst, CurrentInst)) {
+        // Current primary dominates this one - keep primary unless we prefer loads
+        if (!PreferLoad && isa<LoadInst>(CurrentInst)) {
+          // Same dominance level, but prefer load over store
+          DominatingInst = CurrentInst;
+          PrimaryIdx = Idx;
+          PreferLoad = true;
+        }
+      } else {
+        // No dominance relationship - prefer LoadInst as primary
+        if (!PreferLoad && isa<LoadInst>(CurrentInst)) {
+          DominatingInst = CurrentInst;
+          PrimaryIdx = Idx;
+          PreferLoad = true;
+        }
+      }
+    }
+
+    LLVM_DEBUG(dbgs() << "    → Primary indirect stream: #" 
+                      << Ctx.IndirectStreams[PrimaryIdx].StreamID);
+    if (Ctx.IndirectStreams[PrimaryIdx].Loc) {
+      LLVM_DEBUG(dbgs() << " at ");
+      LLVM_DEBUG(Ctx.IndirectStreams[PrimaryIdx].Loc.print(dbgs()));
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    // Mark all non-primary indirect streams for removal
+    for (unsigned Idx : Group) {
+      if (Idx != PrimaryIdx) {
+        IndirectStreamsToRemove.insert(&Ctx.IndirectStreams[Idx]);
+      }
+    }
+  }
+
+  // Filter out redundant indirect streams - keep only primary streams
+  SmallVector<IndirectStreamDescriptor, 4> FilteredIndirectStreams;
+  for (const auto &IDS : Ctx.IndirectStreams) {
+    if (!IndirectStreamsToRemove.count(&IDS)) {
+      FilteredIndirectStreams.push_back(IDS);
+    }
+  }
+
+  // Replace Ctx.IndirectStreams with the filtered list for subsequent stages
+  Ctx.IndirectStreams = std::move(FilteredIndirectStreams);
+}
+
+}
+
+/// Stage 1.2: walk streams upward through parent loops and record merge
+/// candidates where multi-level linearization looks feasible.
+static void analyzeLinearizationFeasibility(InterstellarPipelineContext &Ctx) {
+// Stage 1.2: Analyze merge feasibility for nested loops
+// Only run if there are streams to analyze
+if (!Ctx.Streams.empty()) {
+  LLVM_DEBUG(dbgs() << "\n[Stage 1.2] Linearization Feasibility Analysis\n");
+
+for (const auto &DS : Ctx.Streams) {
+  auto LoopIt = Ctx.LoopIDToDescriptor.find(DS.LoopID);
+  if (LoopIt == Ctx.LoopIDToDescriptor.end())
+    continue;
+
+  const LoopDescriptor *CurrentLD = LoopIt->second;
+  Loop *CurrentLoop = CurrentLD->L;
+
+  if (!CurrentLoop)
+    continue;
+
+  if (!CurrentLoop->getParentLoop())
+    continue;  // No parent loop, nothing to merge
+
+  // Recursive multi-level analysis: Walk up the loop nest
+  // For each parent loop, check if we can linearize at that level
+  // Example: for i { for j { for k { A[i][j][k] } } }
+  //   - Level 1: k→j (if P matches dimension)
+  //   - Level 2: k-j→i (if M*P or just M matches dimension)
+
+  Loop *ChildLoop = CurrentLoop;
+  const LoopDescriptor *ChildLD = CurrentLD;
+  const SCEV *CumulativeSpan = nullptr;
+  SmallVector<unsigned, 4> RequiredDimensions;
+
+  // Start with the innermost loop's trip count and stride
+  // CRITICAL: Use the actual loop bound (EndValueDynamic) for symbolic comparison,
+  // not the SCEV (EndValue) which might be a backedge-taken count.
+  // For loop: for (k = 0; k < D3_dim3; k++)
+  //   - EndValue SCEV might be: (zext %D3_dim3 to i64) or (%D3_dim3 - 1) 
+  //   - EndValueDynamic is: %D3_dim3 (the actual IR value)
+  //   - We want to use %D3_dim3 for comparisons
+  const SCEV *InnerTripCount = ChildLD->EndValue;
+
+  // If we have the dynamic value, create a SCEV from it for cleaner comparisons
+  if (ChildLD->EndValueDynamic && ChildLD->IsEndLinked) {
+    // Use the SCEV of the actual end value (the IR Value)
+    // This gives us the clean symbolic expression without backedge adjustments
+    const SCEV *DynamicSCEV = Ctx.SE.getSCEV(ChildLD->EndValueDynamic);
+    if (DynamicSCEV) {
+      InnerTripCount = DynamicSCEV;
+      LLVM_DEBUG(dbgs() << "    Using dynamic end value for trip count: " 
+                        << *InnerTripCount << "\n");
+    }
+  }
+
+  if (!InnerTripCount)
+    continue;
+
+  // Track dimensions for this stream (used in Stage 2 interprocedural analysis)
+  if (ChildLD->IsEndLinked) {
+    RequiredDimensions.push_back(ChildLD->EndLinkID);
+  }
+
+  // Iterate through all parent loops (from immediate parent upward)
+  while (ChildLoop->getParentLoop()) {
+    Loop *ParentLoop = ChildLoop->getParentLoop();
+    unsigned ParentLoopID = ChildLD->ParentLoopID;
+
+    LLVM_DEBUG(dbgs() << "  Analyzing Stream #" << DS.StreamID 
+                      << " (Loop #" << DS.LoopID << " → Loop #" 
+                      << ParentLoopID << ")");
+    if (DS.Loc) {
+      LLVM_DEBUG(dbgs() << " at ");
+      LLVM_DEBUG(DS.Loc.print(dbgs()));
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    // Print full pointer SCEV for debugging
+    LLVM_DEBUG(dbgs() << "    Full pointer SCEV: " << *DS.BaseAddress << "\n");
+
+    // Calculate cumulative span for this nesting level
+    // For first iteration: span = inner_trip_count * stride
+    // For subsequent iterations: span = previous_span * current_trip_count
+    LLVM_DEBUG(dbgs() << "    Inner stride: " << DS.Stride << " bytes\n");
+    LLVM_DEBUG(dbgs() << "    Child trip count: " << *InnerTripCount << "\n");
+
+    // Ensure both operands have the same type to avoid SCEV assertion failure
+    Type *TripCountType = InnerTripCount->getType();
+    const SCEV *InnerStrideSCEV = Ctx.SE.getConstant(TripCountType, DS.Stride);
+
+    if (!CumulativeSpan) {
+      // First level: Span = TripCount * Stride
+      CumulativeSpan = Ctx.SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
+    } else {
+      // Deeper level: Span = PreviousSpan * CurrentTripCount
+      // Need to ensure types match
+      if (CumulativeSpan->getType() != TripCountType) {
+        CumulativeSpan = Ctx.SE.getSignExtendExpr(CumulativeSpan, TripCountType);
+      }
+      CumulativeSpan = Ctx.SE.getMulExpr(CumulativeSpan, InnerTripCount);
+    }
+
+    LLVM_DEBUG(dbgs() << "    Cumulative span at this level: " << *CumulativeSpan << "\n");
+
+    // Extract parent loop step from base address using helper function
+    LLVM_DEBUG(dbgs() << "    Analyzing SCEV structure...\n");
+
+    const SCEV *BaseStep = nullptr;
+    const SCEVAddRecExpr *ParentAddRec = findAddRecForLoop(DS.BaseAddress, ParentLoop);
+
+    if (ParentAddRec && ParentAddRec->isAffine()) {
+      // Found an AddRec for the parent loop - extract its step
+      const SCEV *RawStep = ParentAddRec->getStepRecurrence(Ctx.SE);
+
+      // Determine if step is already in bytes (pointer arithmetic) or index units
+      // If the AddRec type is a pointer type, step is already in bytes
+      // If the AddRec type is an integer type, step is in index units
+      bool StepIsAlreadyInBytes = ParentAddRec->getType()->isPointerTy();
+
+      LLVM_DEBUG(dbgs() << "      Parent step (raw): " << *RawStep << "\n");
+
+      if (StepIsAlreadyInBytes) {
+        // Step is already in bytes (e.g., {%ptr,+,40} for pointer arithmetic)
+        BaseStep = RawStep;
+        LLVM_DEBUG(dbgs() << "      Step is in bytes (pointer arithmetic)\n");
+      } else {
+        // Step is in index units (e.g., {0,+,%dim} for array indexing)
+        // Need to multiply by element size to get byte step
+        LLVM_DEBUG(dbgs() << "      Step is in index units (array indexing)\n");
+        LLVM_DEBUG(dbgs() << "      Element size: " << DS.Stride << " bytes\n");
+
+        Type *StepType = RawStep->getType();
+        const SCEV *ElementSizeSCEV = Ctx.SE.getConstant(StepType, DS.Stride);
+        BaseStep = Ctx.SE.getMulExpr(RawStep, ElementSizeSCEV);
+      }
+
+      LLVM_DEBUG(dbgs() << "      ✓ Found parent loop AddRec step\n");
+      LLVM_DEBUG(dbgs() << "    Parent step: " << *BaseStep << "\n");
+    }
+
+    if (!BaseStep) {
+      LLVM_DEBUG(dbgs() << "    ✗ Could not extract parent loop step - dimension not contiguous\n");
+      LLVM_DEBUG(dbgs() << "    ✗ STOPPING merge analysis: intermediate dimension is non-contiguous\n");
+      // CRITICAL: Stop here! We can only merge contiguous dimensions in order.
+      // If dimension j is non-contiguous (e.g., A[i][idx_j][k] where idx_j is data-dependent),
+      // we CANNOT merge k→i even if i is contiguous, because j breaks the continuity.
+      // Example: D3B[i][A[j]%10][k] - cannot merge k→j→i even though i is contiguous
+      // because the j dimension uses indirect indexing.
+      break;
+    }
+
+    // Check if linearizable at this nesting level
+    // For a stream to be linearizable, the cumulative span must equal the parent step
+    bool IsPotentiallyLinearizable = false;
+
+    // First try SCEV pointer equality (works for symbolic expressions)
+    if (CumulativeSpan == BaseStep) {
+      IsPotentiallyLinearizable = true;
+      LLVM_DEBUG(dbgs() << "    ✓ Symbolic match - linearizable!\n");
+    }
+    // For constants, compare values (handle different bit widths safely)
+    else if (isa<SCEVConstant>(CumulativeSpan) && isa<SCEVConstant>(BaseStep)) {
+      const SCEVConstant *SpanConst = cast<SCEVConstant>(CumulativeSpan);
+      const SCEVConstant *StepConst = cast<SCEVConstant>(BaseStep);
+
+      // Use sign-extended comparison to handle different bit widths
+      const APInt &SpanVal = SpanConst->getAPInt();
+      const APInt &StepVal = StepConst->getAPInt();
+
+      // Extend both to the maximum bit width before comparing
+      unsigned MaxWidth = std::max(SpanVal.getBitWidth(), StepVal.getBitWidth());
+      APInt SpanExtended = SpanVal.sext(MaxWidth);
+      APInt StepExtended = StepVal.sext(MaxWidth);
+
+      if (SpanExtended == StepExtended) {
+        IsPotentiallyLinearizable = true;
+        LLVM_DEBUG(dbgs() << "    ✓ Constants match - linearizable!\n");
+      }
+    }
+    // Try matching against stride×tripcount pattern
+    else if (const SCEVMulExpr *StepMul = dyn_cast<SCEVMulExpr>(BaseStep)) {
+      for (const SCEV *Op : StepMul->operands()) {
+        if (Op == InnerStrideSCEV || Op == InnerTripCount) {
+          const SCEV *ExpectedStep = Ctx.SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
+          if (ExpectedStep == BaseStep) {
+            IsPotentiallyLinearizable = true;
+            LLVM_DEBUG(dbgs() << "    ✓ Stride×tripcount match - linearizable!\n");
+            break;
+          }
+        }
+      }
+    }
+
+    if (IsPotentiallyLinearizable) {
+      StreamMergeCandidate Candidate;
+      Candidate.StreamID = DS.StreamID;
+      Candidate.InnerLoopID = DS.LoopID;
+      Candidate.OuterLoopID = ParentLoopID;
+      Candidate.RequiredDimensions = std::move(RequiredDimensions);
+
+      Ctx.MergeCandidates.push_back(Candidate);
+
+      LLVM_DEBUG(dbgs() << "    → Merge candidate created (level " 
+                        << Ctx.MergeCandidates.size() << ")\n");
+
+      // Reset RequiredDimensions for next iteration
+      RequiredDimensions.clear();
+      // Re-add dimensions we've accumulated so far for next level
+      if (ChildLD->IsEndLinked) {
+        RequiredDimensions.push_back(ChildLD->EndLinkID);
+      }
+    } else {
+      LLVM_DEBUG(dbgs() << "    ✗ Span/step mismatch - not linearizable at this level\n");
+    }
+
+    // Move to next parent loop (if any)
+    ChildLoop = ParentLoop;
+
+    // Find the parent loop's descriptor to get its trip count for next iteration
+    auto ParentLDIt = Ctx.LoopIDToDescriptor.find(ParentLoopID);
+    if (ParentLDIt != Ctx.LoopIDToDescriptor.end()) {
+      ChildLD = ParentLDIt->second;
+      InnerTripCount = ChildLD->EndValue;
+
+      // Apply the same EndValueDynamic normalization as we do initially
+      // This ensures we use clean symbolic expressions without backedge adjustments
       if (ChildLD->EndValueDynamic && ChildLD->IsEndLinked) {
-        // Use the SCEV of the actual end value (the IR Value)
-        // This gives us the clean symbolic expression without backedge adjustments
-        const SCEV *DynamicSCEV = SE.getSCEV(ChildLD->EndValueDynamic);
+        const SCEV *DynamicSCEV = Ctx.SE.getSCEV(ChildLD->EndValueDynamic);
         if (DynamicSCEV) {
           InnerTripCount = DynamicSCEV;
           LLVM_DEBUG(dbgs() << "    Using dynamic end value for trip count: " 
                             << *InnerTripCount << "\n");
         }
       }
-      
-      if (!InnerTripCount)
-        continue;
-      
-      // Track dimensions for this stream (used in Stage 2 interprocedural analysis)
-      if (ChildLD->IsEndLinked) {
+
+      if (ChildLD->IsEndLinked && InnerTripCount) {
         RequiredDimensions.push_back(ChildLD->EndLinkID);
       }
-      
-      // Iterate through all parent loops (from immediate parent upward)
-      while (ChildLoop->getParentLoop()) {
-        Loop *ParentLoop = ChildLoop->getParentLoop();
-        unsigned ParentLoopID = ChildLD->ParentLoopID;
-        
-        LLVM_DEBUG(dbgs() << "  Analyzing Stream #" << DS.StreamID 
-                          << " (Loop #" << DS.LoopID << " → Loop #" 
-                          << ParentLoopID << ")");
-        if (DS.Loc) {
-          LLVM_DEBUG(dbgs() << " at ");
-          LLVM_DEBUG(DS.Loc.print(dbgs()));
-        }
-        LLVM_DEBUG(dbgs() << "\n");
-        
-        // Print full pointer SCEV for debugging
-        LLVM_DEBUG(dbgs() << "    Full pointer SCEV: " << *DS.BaseAddress << "\n");
-        
-        // Calculate cumulative span for this nesting level
-        // For first iteration: span = inner_trip_count * stride
-        // For subsequent iterations: span = previous_span * current_trip_count
-        LLVM_DEBUG(dbgs() << "    Inner stride: " << DS.Stride << " bytes\n");
-        LLVM_DEBUG(dbgs() << "    Child trip count: " << *InnerTripCount << "\n");
-        
-        // Ensure both operands have the same type to avoid SCEV assertion failure
-        Type *TripCountType = InnerTripCount->getType();
-        const SCEV *InnerStrideSCEV = SE.getConstant(TripCountType, DS.Stride);
-        
-        if (!CumulativeSpan) {
-          // First level: Span = TripCount * Stride
-          CumulativeSpan = SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
-        } else {
-          // Deeper level: Span = PreviousSpan * CurrentTripCount
-          // Need to ensure types match
-          if (CumulativeSpan->getType() != TripCountType) {
-            CumulativeSpan = SE.getSignExtendExpr(CumulativeSpan, TripCountType);
-          }
-          CumulativeSpan = SE.getMulExpr(CumulativeSpan, InnerTripCount);
-        }
-        
-        LLVM_DEBUG(dbgs() << "    Cumulative span at this level: " << *CumulativeSpan << "\n");
-        
-        // Extract parent loop step from base address using helper function
-        LLVM_DEBUG(dbgs() << "    Analyzing SCEV structure...\n");
-        
-        const SCEV *BaseStep = nullptr;
-        const SCEVAddRecExpr *ParentAddRec = FindAddRecForLoop(DS.BaseAddress, ParentLoop);
-        
-        if (ParentAddRec && ParentAddRec->isAffine()) {
-          // Found an AddRec for the parent loop - extract its step
-          const SCEV *RawStep = ParentAddRec->getStepRecurrence(SE);
-          
-          // Determine if step is already in bytes (pointer arithmetic) or index units
-          // If the AddRec type is a pointer type, step is already in bytes
-          // If the AddRec type is an integer type, step is in index units
-          bool StepIsAlreadyInBytes = ParentAddRec->getType()->isPointerTy();
-          
-          LLVM_DEBUG(dbgs() << "      Parent step (raw): " << *RawStep << "\n");
-          
-          if (StepIsAlreadyInBytes) {
-            // Step is already in bytes (e.g., {%ptr,+,40} for pointer arithmetic)
-            BaseStep = RawStep;
-            LLVM_DEBUG(dbgs() << "      Step is in bytes (pointer arithmetic)\n");
-          } else {
-            // Step is in index units (e.g., {0,+,%dim} for array indexing)
-            // Need to multiply by element size to get byte step
-            LLVM_DEBUG(dbgs() << "      Step is in index units (array indexing)\n");
-            LLVM_DEBUG(dbgs() << "      Element size: " << DS.Stride << " bytes\n");
-            
-            Type *StepType = RawStep->getType();
-            const SCEV *ElementSizeSCEV = SE.getConstant(StepType, DS.Stride);
-            BaseStep = SE.getMulExpr(RawStep, ElementSizeSCEV);
-          }
-          
-          LLVM_DEBUG(dbgs() << "      ✓ Found parent loop AddRec step\n");
-          LLVM_DEBUG(dbgs() << "    Parent step: " << *BaseStep << "\n");
-        }
-        
-        if (!BaseStep) {
-          LLVM_DEBUG(dbgs() << "    ✗ Could not extract parent loop step - dimension not contiguous\n");
-          LLVM_DEBUG(dbgs() << "    ✗ STOPPING merge analysis: intermediate dimension is non-contiguous\n");
-          // CRITICAL: Stop here! We can only merge contiguous dimensions in order.
-          // If dimension j is non-contiguous (e.g., A[i][idx_j][k] where idx_j is data-dependent),
-          // we CANNOT merge k→i even if i is contiguous, because j breaks the continuity.
-          // Example: D3B[i][A[j]%10][k] - cannot merge k→j→i even though i is contiguous
-          // because the j dimension uses indirect indexing.
-          break;
-        }
-        
-        // Check if linearizable at this nesting level
-        // For a stream to be linearizable, the cumulative span must equal the parent step
-        bool IsPotentiallyLinearizable = false;
-        
-        // First try SCEV pointer equality (works for symbolic expressions)
-        if (CumulativeSpan == BaseStep) {
-          IsPotentiallyLinearizable = true;
-          LLVM_DEBUG(dbgs() << "    ✓ Symbolic match - linearizable!\n");
-        }
-        // For constants, compare values (handle different bit widths safely)
-        else if (isa<SCEVConstant>(CumulativeSpan) && isa<SCEVConstant>(BaseStep)) {
-          const SCEVConstant *SpanConst = cast<SCEVConstant>(CumulativeSpan);
-          const SCEVConstant *StepConst = cast<SCEVConstant>(BaseStep);
-          
-          // Use sign-extended comparison to handle different bit widths
-          const APInt &SpanVal = SpanConst->getAPInt();
-          const APInt &StepVal = StepConst->getAPInt();
-          
-          // Extend both to the maximum bit width before comparing
-          unsigned MaxWidth = std::max(SpanVal.getBitWidth(), StepVal.getBitWidth());
-          APInt SpanExtended = SpanVal.sext(MaxWidth);
-          APInt StepExtended = StepVal.sext(MaxWidth);
-          
-          if (SpanExtended == StepExtended) {
-            IsPotentiallyLinearizable = true;
-            LLVM_DEBUG(dbgs() << "    ✓ Constants match - linearizable!\n");
-          }
-        }
-        // Try matching against stride×tripcount pattern
-        else if (const SCEVMulExpr *StepMul = dyn_cast<SCEVMulExpr>(BaseStep)) {
-          for (const SCEV *Op : StepMul->operands()) {
-            if (Op == InnerStrideSCEV || Op == InnerTripCount) {
-              const SCEV *ExpectedStep = SE.getMulExpr(InnerTripCount, InnerStrideSCEV);
-              if (ExpectedStep == BaseStep) {
-                IsPotentiallyLinearizable = true;
-                LLVM_DEBUG(dbgs() << "    ✓ Stride×tripcount match - linearizable!\n");
-                break;
-              }
-            }
-          }
-        }
-        
-        if (IsPotentiallyLinearizable) {
-          StreamMergeCandidate Candidate;
-          Candidate.StreamID = DS.StreamID;
-          Candidate.InnerLoopID = DS.LoopID;
-          Candidate.OuterLoopID = ParentLoopID;
-          Candidate.RequiredDimensions = std::move(RequiredDimensions);
-          
-          MergeCandidates.push_back(Candidate);
-          
-          LLVM_DEBUG(dbgs() << "    → Merge candidate created (level " 
-                            << MergeCandidates.size() << ")\n");
-          
-          // Reset RequiredDimensions for next iteration
-          RequiredDimensions.clear();
-          // Re-add dimensions we've accumulated so far for next level
-          if (ChildLD->IsEndLinked) {
-            RequiredDimensions.push_back(ChildLD->EndLinkID);
-          }
-        } else {
-          LLVM_DEBUG(dbgs() << "    ✗ Span/step mismatch - not linearizable at this level\n");
-        }
-        
-        // Move to next parent loop (if any)
-        ChildLoop = ParentLoop;
-        
-        // Find the parent loop's descriptor to get its trip count for next iteration
-        auto ParentLDIt = LoopIDToDescriptor.find(ParentLoopID);
-        if (ParentLDIt != LoopIDToDescriptor.end()) {
-          ChildLD = ParentLDIt->second;
-          InnerTripCount = ChildLD->EndValue;
-          
-          // Apply the same EndValueDynamic normalization as we do initially
-          // This ensures we use clean symbolic expressions without backedge adjustments
-          if (ChildLD->EndValueDynamic && ChildLD->IsEndLinked) {
-            const SCEV *DynamicSCEV = SE.getSCEV(ChildLD->EndValueDynamic);
-            if (DynamicSCEV) {
-              InnerTripCount = DynamicSCEV;
-              LLVM_DEBUG(dbgs() << "    Using dynamic end value for trip count: " 
-                                << *InnerTripCount << "\n");
-            }
-          }
-          
-          if (ChildLD->IsEndLinked && InnerTripCount) {
-            RequiredDimensions.push_back(ChildLD->EndLinkID);
-          }
-        } else {
-          // No descriptor for parent loop, can't continue walking up
-          break;
-        }
-      }  // End while (walking up parent loops)
-    }  // End for (each stream)
-    
-    } // End: if (!Streams.empty()) - Stage 1.2
-    
-    // ============================================================
-    // STAGE 1.5: EARLY CLEANUP - REMOVE EMPTY LOOPS
-    // ============================================================
-    // Remove loops with no associated streams BEFORE merge analysis
-    // This optimization saves analysis time when loops have no streams
-    // (e.g., pure computation loops without memory accesses)
-    // This stage ALWAYS runs if there are any loops, even if no streams
-    //
-    // IMPORTANT: We must keep parent loops of loops with streams,
-    // as they may be needed for merge analysis in Stage 2.
-    // ============================================================
-    
-    LLVM_DEBUG(dbgs() << "\n[Stage 1.5] Early cleanup: Removing loops with no streams\n");
-    
-    // Count streams per loop
-    DenseMap<unsigned, unsigned> StreamCountPerLoop;
-    for (const auto &DS : Streams) {
-      StreamCountPerLoop[DS.LoopID]++;
+    } else {
+      // No descriptor for parent loop, can't continue walking up
+      break;
     }
-    
-    // Mark loops with streams as active (Stage 1.5 early cleanup)
-    DenseSet<unsigned> KeepLoopIDs;
-    for (const auto &LD : Loops) {
-      if (StreamCountPerLoop.lookup(LD.LoopID) > 0) {
+  }  // End while (walking up parent loops)
+}  // End for (each stream)
+
+} // End: if (!Ctx.Streams.empty()) - Stage 1.2
+}
+
+/// Stage 1.5: drop loops that carry no streams, keeping parents of kept
+/// loops. Returns true if any loops remain.
+static bool removeStreamLessLoops(InterstellarPipelineContext &Ctx) {
+// ============================================================
+// STAGE 1.5: EARLY CLEANUP - REMOVE EMPTY LOOPS
+// ============================================================
+// Remove loops with no associated streams BEFORE merge analysis
+// This optimization saves analysis time when loops have no streams
+// (e.g., pure computation loops without memory accesses)
+// This stage ALWAYS runs if there are any loops, even if no streams
+//
+// IMPORTANT: We must keep parent loops of loops with streams,
+// as they may be needed for merge analysis in Stage 2.
+// ============================================================
+
+LLVM_DEBUG(dbgs() << "\n[Stage 1.5] Early cleanup: Removing loops with no streams\n");
+
+// Count streams per loop
+DenseMap<unsigned, unsigned> StreamCountPerLoop;
+for (const auto &DS : Ctx.Streams) {
+  StreamCountPerLoop[DS.LoopID]++;
+}
+
+// Mark loops with streams as active (Stage 1.5 early cleanup)
+DenseSet<unsigned> KeepLoopIDs;
+for (const auto &LD : Ctx.Loops) {
+  if (StreamCountPerLoop.lookup(LD.LoopID) > 0) {
+    KeepLoopIDs.insert(LD.LoopID);
+  }
+}
+
+// Recursively mark parent loops as active
+// (they may be needed for merge analysis)
+bool FoundNewParent = true;
+while (FoundNewParent) {
+  FoundNewParent = false;
+  for (const auto &LD : Ctx.Loops) {
+    if (KeepLoopIDs.count(LD.LoopID)) {
+      continue;  // Already active
+    }
+
+    // Check if this loop is a parent of any active loop
+    for (const auto &ChildLD : Ctx.Loops) {
+      if (KeepLoopIDs.count(ChildLD.LoopID) && 
+          ChildLD.ParentLoopID == LD.LoopID) {
         KeepLoopIDs.insert(LD.LoopID);
+        FoundNewParent = true;
+        break;
       }
     }
-    
-    // Recursively mark parent loops as active
-    // (they may be needed for merge analysis)
-    bool FoundNewParent = true;
-    while (FoundNewParent) {
-      FoundNewParent = false;
-      for (const auto &LD : Loops) {
-        if (KeepLoopIDs.count(LD.LoopID)) {
-          continue;  // Already active
+  }
+}
+
+// Filter out loops with no streams and no active children
+SmallVector<LoopDescriptor, 4> FilteredLoops;
+unsigned RemovedCount = 0;
+
+for (const auto &LD : Ctx.Loops) {
+  if (KeepLoopIDs.count(LD.LoopID)) {
+    FilteredLoops.push_back(LD);
+  } else {
+    RemovedCount++;
+    LLVM_DEBUG(dbgs() << "  ✗ Removed Loop #" << LD.LoopID 
+                      << " (no streams, not a parent)\n");
+  }
+}
+
+if (RemovedCount > 0) {
+  Ctx.Loops = std::move(FilteredLoops);
+  LLVM_DEBUG(dbgs() << "  Removed " << RemovedCount 
+                    << " empty loop(s), " << Ctx.Loops.size() 
+                    << " loop(s) remaining\n");
+} else {
+  LLVM_DEBUG(dbgs() << "  No empty loops to remove\n");
+}
+
+  return !Ctx.Loops.empty();
+}
+
+/// Stage 3: apply the largest merge candidate per stream — create virtual
+/// merged loop descriptors (bounds multiplied at the entry block) and
+/// reassign the owning stream. ALL candidates are applied: there is no
+/// safety gating (pre-existing behavior, preserved).
+static void applyLoopMerges(InterstellarPipelineContext &Ctx) {
+if (!Ctx.MergeCandidates.empty()) {
+  LLVM_DEBUG(dbgs() << "\n═══ Merge Candidates Summary ═══\n");
+  LLVM_DEBUG(dbgs() << "Total candidates: " << Ctx.MergeCandidates.size() << "\n");
+  for (const auto &Candidate : Ctx.MergeCandidates) {
+    LLVM_DEBUG(dbgs() << "  Stream #" << Candidate.StreamID 
+                      << ": Loop #" << Candidate.InnerLoopID
+                      << " → Loop #" << Candidate.OuterLoopID);
+    if (!Candidate.RequiredDimensions.empty()) {
+      LLVM_DEBUG(dbgs() << " (requires " << Candidate.RequiredDimensions.size() 
+                        << " dimension(s))");
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+  }
+
+
+  // ============================================================
+  // STAGE 3: LOOP MERGE TRANSFORMATION
+  // ============================================================
+  // For each verified merge candidate, create virtual loop descriptors
+  // and update stream associations.
+  // ============================================================
+
+  if (!Ctx.MergeCandidates.empty()) {
+    LLVM_DEBUG(dbgs() << "\n[Stage 3] Loop Merge Transformation\n");
+    LLVM_DEBUG(dbgs() << "Creating virtual loop descriptors for safe merges...\n");
+
+    // Group merge candidates by stream ID and select largest merge for each stream
+    // When multiple merges exist (e.g., Loop #2→#1 and Loop #2→#0), only apply
+    // the largest one (Loop #2→#0) as it encompasses more loops.
+    DenseMap<unsigned, const StreamMergeCandidate *> LargestMergePerStream;
+    for (const auto &Candidate : Ctx.MergeCandidates) {
+      auto It = LargestMergePerStream.find(Candidate.StreamID);
+      if (It == LargestMergePerStream.end()) {
+        // First candidate for this stream
+        LargestMergePerStream[Candidate.StreamID] = &Candidate;
+      } else {
+        // Compare with existing candidate - prefer outer loop (Loop #0 > Loop #1)
+        // Outer loop ID is SMALLER (Loop #0 is outermost), so prefer SMALLER OuterLoopID
+        if (Candidate.OuterLoopID < It->second->OuterLoopID) {
+          LargestMergePerStream[Candidate.StreamID] = &Candidate;
+          LLVM_DEBUG(dbgs() << "  Replacing merge candidate for Stream #" 
+                            << Candidate.StreamID << ": Loop #" 
+                            << It->second->OuterLoopID << " → Loop #" 
+                            << Candidate.OuterLoopID << " (larger scope)\n");
         }
-        
-        // Check if this loop is a parent of any active loop
-        for (const auto &ChildLD : Loops) {
-          if (KeepLoopIDs.count(ChildLD.LoopID) && 
-              ChildLD.ParentLoopID == LD.LoopID) {
-            KeepLoopIDs.insert(LD.LoopID);
-            FoundNewParent = true;
+      }
+    }
+
+    // Track next available loop ID for virtual loops
+    unsigned NextVirtualLoopID = Ctx.Loops.size();
+
+    // Apply only the largest merge for each stream
+    for (const auto &Entry : LargestMergePerStream) {
+      const StreamMergeCandidate &Candidate = *Entry.second;
+
+      // Find inner and outer loop descriptors
+      const LoopDescriptor *InnerLD = nullptr;
+      const LoopDescriptor *OuterLD = nullptr;
+
+      for (const auto &LD : Ctx.Loops) {
+        if (LD.LoopID == Candidate.InnerLoopID) {
+          InnerLD = &LD;
+        }
+        if (LD.LoopID == Candidate.OuterLoopID) {
+          OuterLD = &LD;
+        }
+      }
+
+      if (!InnerLD || !OuterLD) {
+        LLVM_DEBUG(dbgs() << "  ⚠ Stream #" << Candidate.StreamID 
+                          << ": Could not find loop descriptors\n");
+        continue;
+      }
+
+      // Create virtual merged loop descriptor
+      // Note: candidates come straight from Stage 1.2 and ALL are applied
+      // (pre-existing behavior, preserved). No safety classification gates
+      // the merge.
+      // The loop bounds can be any SCEV expression (constant, variable, or arithmetic)
+      // We multiply them as SCEV expressions and use EndValueDynamic for IR values
+      LoopDescriptor VirtualLoop;
+      VirtualLoop.LoopID = NextVirtualLoopID++;
+      VirtualLoop.ParentLoopID = OuterLD->ParentLoopID;  // Inherit grandparent if any
+      VirtualLoop.L = OuterLD->L;  // Use outer loop's Loop* (for context)
+      VirtualLoop.Loc = OuterLD->Loc;  // Use outer loop's location (outermost, line 8 for 2D)
+
+      // Virtual loop always starts at 0
+      VirtualLoop.StartValue = Ctx.SE.getConstant(APInt(64, 0, true));
+      VirtualLoop.IsStartLinked = false;
+      VirtualLoop.StartLinkID = 0;
+
+      // End value is the product of all merged loop bounds
+      // For example: rows * cols for 2D, or dim1 * dim2 * dim3 for 3D
+      // Collect all dimensions from innermost to outermost (INCLUSIVE)
+      const SCEV *VirtualEndValue = nullptr;
+      Value *VirtualEndValueIR = nullptr;
+      SmallVector<unsigned, 4> MergedLinkIDs;
+
+      // Build list of all loops from inner to outer (inclusive)
+      SmallVector<const LoopDescriptor *, 4> LoopChain;
+      unsigned CurrentLoopID = Candidate.InnerLoopID;
+
+      LLVM_DEBUG(dbgs() << "  Building loop chain from Inner #" << Candidate.InnerLoopID 
+                        << " to Outer #" << Candidate.OuterLoopID << "\n");
+
+      while (true) {
+        const LoopDescriptor *CurrentLD = nullptr;
+        for (const auto &LD : Ctx.Loops) {
+          if (LD.LoopID == CurrentLoopID) {
+            CurrentLD = &LD;
             break;
           }
         }
+
+        if (!CurrentLD) {
+          LLVM_DEBUG(dbgs() << "    ! Loop #" << CurrentLoopID << " not found\n");
+          break;
+        }
+
+        LoopChain.push_back(CurrentLD);
+        LLVM_DEBUG(dbgs() << "    + Added Loop #" << CurrentLoopID << "\n");
+
+        // Check if we've reached the outer loop (inclusive)
+        if (CurrentLoopID == Candidate.OuterLoopID) {
+          LLVM_DEBUG(dbgs() << "    ✓ Reached outer loop #" << Candidate.OuterLoopID << "\n");
+          break;
+        }
+
+        // Move to parent loop
+        CurrentLoopID = CurrentLD->ParentLoopID;
+        LLVM_DEBUG(dbgs() << "    → Moving to parent Loop #" << CurrentLoopID << "\n");
       }
-    }
-    
-    // Filter out loops with no streams and no active children
-    SmallVector<LoopDescriptor, 4> FilteredLoops;
-    unsigned RemovedCount = 0;
-    
-    for (const auto &LD : Loops) {
-      if (KeepLoopIDs.count(LD.LoopID)) {
-        FilteredLoops.push_back(LD);
+
+      LLVM_DEBUG(dbgs() << "  Loop chain size: " << LoopChain.size() << "\n");
+
+      // Create IRBuilder once for all multiplications
+      // It will insert instructions sequentially at entry block
+      BasicBlock &EntryBB = Ctx.F.getEntryBlock();
+      IRBuilder<> Builder(&EntryBB, EntryBB.getFirstInsertionPt());
+
+      // Create SCEVExpander to materialize SCEV expressions at entry block
+      // This ensures instructions like %sub (from N-1) are properly placed
+      SCEVExpander Expander(Ctx.SE, "interstellar");
+
+      // Now multiply all dimensions: innermost * ... * outermost
+      unsigned MulCount = 0;  // Counter for unique mul instruction names
+      for (const LoopDescriptor *LD : LoopChain) {
+        const SCEV *Bound = LD->EndValue;
+        Value *BoundIR = nullptr;
+
+        // Use EndValueDynamic for cleaner symbolic expression
+        if (LD->EndValueDynamic && LD->IsEndLinked) {
+          const SCEV *DynamicSCEV = Ctx.SE.getSCEV(LD->EndValueDynamic);
+          if (DynamicSCEV) {
+            Bound = DynamicSCEV;
+          }
+          MergedLinkIDs.push_back(LD->EndLinkID);
+        }
+
+        if (Bound) {
+          // Materialize the bound value at entry block using SCEVExpander
+          // This handles cases like N-1 where %sub instruction needs to be created
+          if (!isa<SCEVConstant>(Bound)) {
+            BoundIR = Expander.expandCodeFor(Bound, Bound->getType(), 
+                                              &*EntryBB.getFirstInsertionPt());
+          }
+
+          if (!VirtualEndValue) {
+            VirtualEndValue = Bound;
+            VirtualEndValueIR = BoundIR;
+          } else {
+            VirtualEndValue = Ctx.SE.getMulExpr(VirtualEndValue, Bound);
+            // Need to create IR multiplication if we have dynamic values
+            if (VirtualEndValueIR && BoundIR) {
+              // Use unique name for each multiplication to avoid conflicts
+              // For 2D: %merged_loop_bound = mul i32 %dim2, %dim1
+              // For 3D: %merged_loop_bound = mul i32 %dim3, %dim2
+              //         %merged_loop_bound2 = mul i32 %merged_loop_bound, %dim1
+              std::string MulName = MulCount == 0 ? "merged_loop_bound" 
+                                                   : "merged_loop_bound" + std::to_string(MulCount + 1);
+              VirtualEndValueIR = Builder.CreateMul(VirtualEndValueIR, BoundIR, MulName);
+              MulCount++;
+            }
+          }
+        }
+      }
+
+      VirtualLoop.EndValue = VirtualEndValue;
+      VirtualLoop.EndValueDynamic = VirtualEndValueIR;
+
+      // Check if the result is a constant
+      // If all loop bounds are constants, the product is also constant (no LinkVariable needed)
+      bool IsConstantBound = isa<SCEVConstant>(VirtualEndValue);
+      VirtualLoop.IsEndLinked = (VirtualEndValueIR != nullptr) && !IsConstantBound;
+
+      // Create new link variable for the merged bound value (only if dynamic)
+      if (VirtualEndValueIR && !IsConstantBound) {
+        // The merged bound is a new value (mul instruction), needs its own LinkID
+        LinkVariableDescriptor NewLinkVar;
+        NewLinkVar.LinkID = Ctx.NextLinkID++;
+        NewLinkVar.DynamicValue = VirtualEndValueIR;
+        NewLinkVar.SizeInBytes = 4;  // 4 bytes for i32
+        Ctx.LinkVars.push_back(NewLinkVar);
+
+        VirtualLoop.EndLinkID = NewLinkVar.LinkID;
+
+        LLVM_DEBUG(dbgs() << "      Created Link Variable for merged bound:\n");
+        LLVM_DEBUG(dbgs() << "        Link ID: " << NewLinkVar.LinkID << "\n");
+        LLVM_DEBUG(dbgs() << "        Value: " << *VirtualEndValueIR << "\n");
       } else {
-        RemovedCount++;
-        LLVM_DEBUG(dbgs() << "  ✗ Removed Loop #" << LD.LoopID 
-                          << " (no streams, not a parent)\n");
+        VirtualLoop.EndLinkID = 0; // No link for constants
+        if (IsConstantBound) {
+          LLVM_DEBUG(dbgs() << "      Merged bound is constant: " << *VirtualEndValue << "\n");
+        }
+      }
+
+      // Step is always 1 for virtual flat loops
+      VirtualLoop.StepValue = Ctx.SE.getConstant(APInt(64, 1, true));
+
+      // Mark as virtual and record merge info (for internal tracking)
+      VirtualLoop.IsVirtual = true;
+      VirtualLoop.MergedFromInnerLoop = Candidate.InnerLoopID;
+      VirtualLoop.MergedToOuterLoop = Candidate.OuterLoopID;
+      VirtualLoop.MergedDimensions = std::move(MergedLinkIDs);
+
+      // Add to loops collection
+      Ctx.Loops.push_back(VirtualLoop);
+      Ctx.AppliedMerges.push_back(Candidate.StreamID);
+
+      LLVM_DEBUG(dbgs() << "\n  ✓ Created Virtual Loop #" << VirtualLoop.LoopID 
+                        << " (merges Loop #" << Candidate.InnerLoopID 
+                        << " → Loop #" << Candidate.OuterLoopID << ")\n");
+      LLVM_DEBUG(dbgs() << "      Start: 0\n");
+      LLVM_DEBUG(dbgs() << "      End:   " << *VirtualEndValue << "\n");
+      LLVM_DEBUG(dbgs() << "      Step:  1\n");
+      LLVM_DEBUG(dbgs() << "      Merged dimensions: " << MergedLinkIDs.size() << "\n");
+
+      // Update stream to use virtual loop
+      for (auto &DS : Ctx.Streams) {
+        if (DS.StreamID == Candidate.StreamID) {
+          unsigned OldLoopID = DS.LoopID;
+          DS.LoopID = VirtualLoop.LoopID;
+
+          LLVM_DEBUG(dbgs() << "      → Stream #" << DS.StreamID 
+                            << " reassigned: Loop #" << OldLoopID 
+                            << " → Virtual Loop #" << VirtualLoop.LoopID << "\n");
+          break;
+        }
       }
     }
-    
-    if (RemovedCount > 0) {
-      Loops = std::move(FilteredLoops);
-      LLVM_DEBUG(dbgs() << "  Removed " << RemovedCount 
-                        << " empty loop(s), " << Loops.size() 
-                        << " loop(s) remaining\n");
+  }
+} // End: if (!Ctx.MergeCandidates.empty()) - Pattern Classification & Merge Application
+}
+
+/// Stage 3.1: drop loop descriptors not reachable as "active" (streams or
+/// virtual) or as parents of active loops.
+static void removeUnusedLoops(InterstellarPipelineContext &Ctx) {
+  // ============================================================
+  // STAGE 3.1: CLEANUP UNUSED LOOP DESCRIPTORS
+  // ============================================================
+  // This stage ALWAYS runs, even if no merges were applied
+  // Remove loop descriptors that have no streams associated with them
+  // UNLESS they are parents of loops that will be kept
+  //
+  // Algorithm: Two-pass approach to handle transitive parent relationships
+  // Pass 1: Mark loops with streams or virtual loops as "active"
+  // Pass 2: Recursively mark parents of active loops as "active"
+  // ============================================================
+
+  LLVM_DEBUG(dbgs() << "\n[Stage 3.1] Cleaning up unused loop descriptors\n");
+
+  // Count streams per loop (both direct and indirect streams)
+  DenseMap<unsigned, unsigned> StreamsPerLoop;
+  for (const auto &DS : Ctx.Streams) {
+    StreamsPerLoop[DS.LoopID]++;
+  }
+  for (const auto &IDS : Ctx.IndirectStreams) {
+    StreamsPerLoop[IDS.LoopID]++;
+  }
+
+  // Pass 1: Mark loops that are directly active (have streams or are virtual)
+  DenseSet<unsigned> ActiveLoopIDs;
+  for (const auto &LD : Ctx.Loops) {
+    if (StreamsPerLoop.lookup(LD.LoopID) > 0 || LD.IsVirtual) {
+      ActiveLoopIDs.insert(LD.LoopID);
+    }
+  }
+
+  // Pass 2: Recursively mark parent loops as active
+  // Continue until no new parents are marked (fixed-point iteration)
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (const auto &LD : Ctx.Loops) {
+      // Skip if already marked active
+      if (ActiveLoopIDs.count(LD.LoopID)) {
+        continue;
+      }
+
+      // Check if this loop is a parent of any active loop
+      bool IsParentOfActive = false;
+      for (const auto &OtherLD : Ctx.Loops) {
+        // Only consider active loops
+        if (!ActiveLoopIDs.count(OtherLD.LoopID)) {
+          continue;
+        }
+
+        // Check if current loop is the parent of OtherLD
+        bool IsParentOfThis = (OtherLD.ParentLoopID == LD.LoopID);
+
+        // Special case for Loop #0 virtual loops only:
+        // Root-level virtual: ParentLoopID=0 AND MergedToOuterLoop=0 (fully merged to top)
+        // These should NOT be considered children of Loop #0 for preservation
+        if (LD.LoopID == 0 && OtherLD.IsVirtual && IsParentOfThis) {
+          if (OtherLD.MergedToOuterLoop == 0) {
+            continue;  // Don't keep Loop #0 for root-level virtual loops
+          }
+        }
+
+        if (IsParentOfThis) {
+          IsParentOfActive = true;
+          break;
+        }
+      }
+
+      if (IsParentOfActive) {
+        ActiveLoopIDs.insert(LD.LoopID);
+        Changed = true;  // Continue iteration to mark grandparents
+      }
+    }
+  }
+
+  // Build filtered loop list and track removed loops (Stage 3.1)
+  SmallVector<LoopDescriptor, 4> ActiveLoops;
+  SmallPtrSet<const LoopDescriptor *, 4> RemovedLoops;
+
+  for (const auto &LD : Ctx.Loops) {
+    if (ActiveLoopIDs.count(LD.LoopID)) {
+      ActiveLoops.push_back(LD);
     } else {
-      LLVM_DEBUG(dbgs() << "  No empty loops to remove\n");
+      RemovedLoops.insert(&LD);
+      LLVM_DEBUG(dbgs() << "  ✗ Removed Loop #" << LD.LoopID 
+                        << " (no streams, not a parent of active loops)\n");
     }
-    
-    // Early exit: If no loops remain, skip merge analysis entirely
-    if (Loops.empty()) {
-      LLVM_DEBUG(dbgs() << "\n[Stage 1.5] No loops remaining after cleanup\n");
-      LLVM_DEBUG(dbgs() << "Skipping Stage 2 (Pattern Classification)\n");
-      LLVM_DEBUG(dbgs() << "Skipping Stage 3 (Loop Merge Transformation)\n");
-      
-      // Print final results with remaining streams (if any)
-      SmallVector<LinkVariableDescriptor, 4> LinkVars = Analyzer.getLinkVariables();
-      LLVM_DEBUG(printAllDescriptors(dbgs(), Loops, Streams, IndirectStreams, LinkVars));
-      
-      // Analysis complete - return
-      return PreservedAnalyses::all();
-    }
-    
-    // Get LinkVariables early - needed for Stage 3 merges and final output
-    SmallVector<LinkVariableDescriptor, 4> LinkVars = Analyzer.getLinkVariables();
-    unsigned NextLinkID = LinkVars.empty() ? 0 : LinkVars.back().LinkID + 1;
-    
-    // Track which merge candidates are actually applied (used in Stage 3 summary)
-    SmallVector<unsigned, 4> AppliedMerges;
-    
-    if (!MergeCandidates.empty()) {
-      LLVM_DEBUG(dbgs() << "\n═══ Merge Candidates Summary ═══\n");
-      LLVM_DEBUG(dbgs() << "Total candidates: " << MergeCandidates.size() << "\n");
-      for (const auto &Candidate : MergeCandidates) {
-        LLVM_DEBUG(dbgs() << "  Stream #" << Candidate.StreamID 
-                          << ": Loop #" << Candidate.InnerLoopID
-                          << " → Loop #" << Candidate.OuterLoopID);
-        if (!Candidate.RequiredDimensions.empty()) {
-          LLVM_DEBUG(dbgs() << " (requires " << Candidate.RequiredDimensions.size() 
-                            << " dimension(s))");
-        }
-        LLVM_DEBUG(dbgs() << "\n");
-      }
-      
-      
-      // ============================================================
-      // STAGE 3: LOOP MERGE TRANSFORMATION
-      // ============================================================
-      // For each verified merge candidate, create virtual loop descriptors
-      // and update stream associations.
-      // ============================================================
-      
-      if (!MergeCandidates.empty()) {
-        LLVM_DEBUG(dbgs() << "\n[Stage 3] Loop Merge Transformation\n");
-        LLVM_DEBUG(dbgs() << "Creating virtual loop descriptors for safe merges...\n");
-        
-        // Group merge candidates by stream ID and select largest merge for each stream
-        // When multiple merges exist (e.g., Loop #2→#1 and Loop #2→#0), only apply
-        // the largest one (Loop #2→#0) as it encompasses more loops.
-        DenseMap<unsigned, const StreamMergeCandidate *> LargestMergePerStream;
-        for (const auto &Candidate : MergeCandidates) {
-          auto It = LargestMergePerStream.find(Candidate.StreamID);
-          if (It == LargestMergePerStream.end()) {
-            // First candidate for this stream
-            LargestMergePerStream[Candidate.StreamID] = &Candidate;
-          } else {
-            // Compare with existing candidate - prefer outer loop (Loop #0 > Loop #1)
-            // Outer loop ID is SMALLER (Loop #0 is outermost), so prefer SMALLER OuterLoopID
-            if (Candidate.OuterLoopID < It->second->OuterLoopID) {
-              LargestMergePerStream[Candidate.StreamID] = &Candidate;
-              LLVM_DEBUG(dbgs() << "  Replacing merge candidate for Stream #" 
-                                << Candidate.StreamID << ": Loop #" 
-                                << It->second->OuterLoopID << " → Loop #" 
-                                << Candidate.OuterLoopID << " (larger scope)\n");
-            }
-          }
-        }
-        
-        // Track next available loop ID for virtual loops
-        unsigned NextVirtualLoopID = Loops.size();
-        
-        // Apply only the largest merge for each stream
-        for (const auto &Entry : LargestMergePerStream) {
-          const StreamMergeCandidate &Candidate = *Entry.second;
-          
-          // Find inner and outer loop descriptors
-          const LoopDescriptor *InnerLD = nullptr;
-          const LoopDescriptor *OuterLD = nullptr;
-          
-          for (const auto &LD : Loops) {
-            if (LD.LoopID == Candidate.InnerLoopID) {
-              InnerLD = &LD;
-            }
-            if (LD.LoopID == Candidate.OuterLoopID) {
-              OuterLD = &LD;
-            }
-          }
-          
-          if (!InnerLD || !OuterLD) {
-            LLVM_DEBUG(dbgs() << "  ⚠ Stream #" << Candidate.StreamID 
-                              << ": Could not find loop descriptors\n");
-            continue;
-          }
-          
-          // Create virtual merged loop descriptor
-          // Note: candidates come straight from Stage 1.2 and ALL are applied
-          // (pre-existing behavior, preserved). No safety classification gates
-          // the merge.
-          // The loop bounds can be any SCEV expression (constant, variable, or arithmetic)
-          // We multiply them as SCEV expressions and use EndValueDynamic for IR values
-          LoopDescriptor VirtualLoop;
-          VirtualLoop.LoopID = NextVirtualLoopID++;
-          VirtualLoop.ParentLoopID = OuterLD->ParentLoopID;  // Inherit grandparent if any
-          VirtualLoop.L = OuterLD->L;  // Use outer loop's Loop* (for context)
-          VirtualLoop.Loc = OuterLD->Loc;  // Use outer loop's location (outermost, line 8 for 2D)
-          
-          // Virtual loop always starts at 0
-          VirtualLoop.StartValue = SE.getConstant(APInt(64, 0, true));
-          VirtualLoop.IsStartLinked = false;
-          VirtualLoop.StartLinkID = 0;
-          
-          // End value is the product of all merged loop bounds
-          // For example: rows * cols for 2D, or dim1 * dim2 * dim3 for 3D
-          // Collect all dimensions from innermost to outermost (INCLUSIVE)
-          const SCEV *VirtualEndValue = nullptr;
-          Value *VirtualEndValueIR = nullptr;
-          SmallVector<unsigned, 4> MergedLinkIDs;
-          
-          // Build list of all loops from inner to outer (inclusive)
-          SmallVector<const LoopDescriptor *, 4> LoopChain;
-          unsigned CurrentLoopID = Candidate.InnerLoopID;
-          
-          LLVM_DEBUG(dbgs() << "  Building loop chain from Inner #" << Candidate.InnerLoopID 
-                            << " to Outer #" << Candidate.OuterLoopID << "\n");
-          
-          while (true) {
-            const LoopDescriptor *CurrentLD = nullptr;
-            for (const auto &LD : Loops) {
-              if (LD.LoopID == CurrentLoopID) {
-                CurrentLD = &LD;
-                break;
-              }
-            }
-            
-            if (!CurrentLD) {
-              LLVM_DEBUG(dbgs() << "    ! Loop #" << CurrentLoopID << " not found\n");
-              break;
-            }
-            
-            LoopChain.push_back(CurrentLD);
-            LLVM_DEBUG(dbgs() << "    + Added Loop #" << CurrentLoopID << "\n");
-            
-            // Check if we've reached the outer loop (inclusive)
-            if (CurrentLoopID == Candidate.OuterLoopID) {
-              LLVM_DEBUG(dbgs() << "    ✓ Reached outer loop #" << Candidate.OuterLoopID << "\n");
-              break;
-            }
-            
-            // Move to parent loop
-            CurrentLoopID = CurrentLD->ParentLoopID;
-            LLVM_DEBUG(dbgs() << "    → Moving to parent Loop #" << CurrentLoopID << "\n");
-          }
-          
-          LLVM_DEBUG(dbgs() << "  Loop chain size: " << LoopChain.size() << "\n");
-          
-          // Create IRBuilder once for all multiplications
-          // It will insert instructions sequentially at entry block
-          BasicBlock &EntryBB = F.getEntryBlock();
-          IRBuilder<> Builder(&EntryBB, EntryBB.getFirstInsertionPt());
-          
-          // Create SCEVExpander to materialize SCEV expressions at entry block
-          // This ensures instructions like %sub (from N-1) are properly placed
-          SCEVExpander Expander(SE, "interstellar");
-          
-          // Now multiply all dimensions: innermost * ... * outermost
-          unsigned MulCount = 0;  // Counter for unique mul instruction names
-          for (const LoopDescriptor *LD : LoopChain) {
-            const SCEV *Bound = LD->EndValue;
-            Value *BoundIR = nullptr;
-            
-            // Use EndValueDynamic for cleaner symbolic expression
-            if (LD->EndValueDynamic && LD->IsEndLinked) {
-              const SCEV *DynamicSCEV = SE.getSCEV(LD->EndValueDynamic);
-              if (DynamicSCEV) {
-                Bound = DynamicSCEV;
-              }
-              MergedLinkIDs.push_back(LD->EndLinkID);
-            }
-            
-            if (Bound) {
-              // Materialize the bound value at entry block using SCEVExpander
-              // This handles cases like N-1 where %sub instruction needs to be created
-              if (!isa<SCEVConstant>(Bound)) {
-                BoundIR = Expander.expandCodeFor(Bound, Bound->getType(), 
-                                                  &*EntryBB.getFirstInsertionPt());
-              }
-              
-              if (!VirtualEndValue) {
-                VirtualEndValue = Bound;
-                VirtualEndValueIR = BoundIR;
-              } else {
-                VirtualEndValue = SE.getMulExpr(VirtualEndValue, Bound);
-                // Need to create IR multiplication if we have dynamic values
-                if (VirtualEndValueIR && BoundIR) {
-                  // Use unique name for each multiplication to avoid conflicts
-                  // For 2D: %merged_loop_bound = mul i32 %dim2, %dim1
-                  // For 3D: %merged_loop_bound = mul i32 %dim3, %dim2
-                  //         %merged_loop_bound2 = mul i32 %merged_loop_bound, %dim1
-                  std::string MulName = MulCount == 0 ? "merged_loop_bound" 
-                                                       : "merged_loop_bound" + std::to_string(MulCount + 1);
-                  VirtualEndValueIR = Builder.CreateMul(VirtualEndValueIR, BoundIR, MulName);
-                  MulCount++;
-                }
-              }
-            }
-          }
-          
-          VirtualLoop.EndValue = VirtualEndValue;
-          VirtualLoop.EndValueDynamic = VirtualEndValueIR;
-          
-          // Check if the result is a constant
-          // If all loop bounds are constants, the product is also constant (no LinkVariable needed)
-          bool IsConstantBound = isa<SCEVConstant>(VirtualEndValue);
-          VirtualLoop.IsEndLinked = (VirtualEndValueIR != nullptr) && !IsConstantBound;
-          
-          // Create new link variable for the merged bound value (only if dynamic)
-          if (VirtualEndValueIR && !IsConstantBound) {
-            // The merged bound is a new value (mul instruction), needs its own LinkID
-            LinkVariableDescriptor NewLinkVar;
-            NewLinkVar.LinkID = NextLinkID++;
-            NewLinkVar.DynamicValue = VirtualEndValueIR;
-            NewLinkVar.SizeInBytes = 4;  // 4 bytes for i32
-            LinkVars.push_back(NewLinkVar);
-            
-            VirtualLoop.EndLinkID = NewLinkVar.LinkID;
-            
-            LLVM_DEBUG(dbgs() << "      Created Link Variable for merged bound:\n");
-            LLVM_DEBUG(dbgs() << "        Link ID: " << NewLinkVar.LinkID << "\n");
-            LLVM_DEBUG(dbgs() << "        Value: " << *VirtualEndValueIR << "\n");
-          } else {
-            VirtualLoop.EndLinkID = 0; // No link for constants
-            if (IsConstantBound) {
-              LLVM_DEBUG(dbgs() << "      Merged bound is constant: " << *VirtualEndValue << "\n");
-            }
-          }
-          
-          // Step is always 1 for virtual flat loops
-          VirtualLoop.StepValue = SE.getConstant(APInt(64, 1, true));
-          
-          // Mark as virtual and record merge info (for internal tracking)
-          VirtualLoop.IsVirtual = true;
-          VirtualLoop.MergedFromInnerLoop = Candidate.InnerLoopID;
-          VirtualLoop.MergedToOuterLoop = Candidate.OuterLoopID;
-          VirtualLoop.MergedDimensions = std::move(MergedLinkIDs);
-          
-          // Add to loops collection
-          Loops.push_back(VirtualLoop);
-          AppliedMerges.push_back(Candidate.StreamID);
-          
-          LLVM_DEBUG(dbgs() << "\n  ✓ Created Virtual Loop #" << VirtualLoop.LoopID 
-                            << " (merges Loop #" << Candidate.InnerLoopID 
-                            << " → Loop #" << Candidate.OuterLoopID << ")\n");
-          LLVM_DEBUG(dbgs() << "      Start: 0\n");
-          LLVM_DEBUG(dbgs() << "      End:   " << *VirtualEndValue << "\n");
-          LLVM_DEBUG(dbgs() << "      Step:  1\n");
-          LLVM_DEBUG(dbgs() << "      Merged dimensions: " << MergedLinkIDs.size() << "\n");
-          
-          // Update stream to use virtual loop
-          for (auto &DS : Streams) {
-            if (DS.StreamID == Candidate.StreamID) {
-              unsigned OldLoopID = DS.LoopID;
-              DS.LoopID = VirtualLoop.LoopID;
-              
-              LLVM_DEBUG(dbgs() << "      → Stream #" << DS.StreamID 
-                                << " reassigned: Loop #" << OldLoopID 
-                                << " → Virtual Loop #" << VirtualLoop.LoopID << "\n");
-              break;
-            }
-          }
-        }
-      }
-    } // End: if (!MergeCandidates.empty()) - Pattern Classification & Merge Application
-      
-      // ============================================================
-      // STAGE 3.1: CLEANUP UNUSED LOOP DESCRIPTORS
-      // ============================================================
-      // This stage ALWAYS runs, even if no merges were applied
-      // Remove loop descriptors that have no streams associated with them
-      // UNLESS they are parents of loops that will be kept
-      //
-      // Algorithm: Two-pass approach to handle transitive parent relationships
-      // Pass 1: Mark loops with streams or virtual loops as "active"
-      // Pass 2: Recursively mark parents of active loops as "active"
-      // ============================================================
-      
-      LLVM_DEBUG(dbgs() << "\n[Stage 3.1] Cleaning up unused loop descriptors\n");
-      
-      // Count streams per loop (both direct and indirect streams)
-      DenseMap<unsigned, unsigned> StreamsPerLoop;
-      for (const auto &DS : Streams) {
-        StreamsPerLoop[DS.LoopID]++;
-      }
-      for (const auto &IDS : IndirectStreams) {
-        StreamsPerLoop[IDS.LoopID]++;
-      }
-      
-      // Pass 1: Mark loops that are directly active (have streams or are virtual)
-      DenseSet<unsigned> ActiveLoopIDs;
-      for (const auto &LD : Loops) {
-        if (StreamsPerLoop.lookup(LD.LoopID) > 0 || LD.IsVirtual) {
-          ActiveLoopIDs.insert(LD.LoopID);
-        }
-      }
-      
-      // Pass 2: Recursively mark parent loops as active
-      // Continue until no new parents are marked (fixed-point iteration)
-      bool Changed = true;
-      while (Changed) {
-        Changed = false;
-        for (const auto &LD : Loops) {
-          // Skip if already marked active
-          if (ActiveLoopIDs.count(LD.LoopID)) {
-            continue;
-          }
-          
-          // Check if this loop is a parent of any active loop
-          bool IsParentOfActive = false;
-          for (const auto &OtherLD : Loops) {
-            // Only consider active loops
-            if (!ActiveLoopIDs.count(OtherLD.LoopID)) {
-              continue;
-            }
-            
-            // Check if current loop is the parent of OtherLD
-            bool IsParentOfThis = (OtherLD.ParentLoopID == LD.LoopID);
-            
-            // Special case for Loop #0 virtual loops only:
-            // Root-level virtual: ParentLoopID=0 AND MergedToOuterLoop=0 (fully merged to top)
-            // These should NOT be considered children of Loop #0 for preservation
-            if (LD.LoopID == 0 && OtherLD.IsVirtual && IsParentOfThis) {
-              if (OtherLD.MergedToOuterLoop == 0) {
-                continue;  // Don't keep Loop #0 for root-level virtual loops
-              }
-            }
-            
-            if (IsParentOfThis) {
-              IsParentOfActive = true;
-              break;
-            }
-          }
-          
-          if (IsParentOfActive) {
-            ActiveLoopIDs.insert(LD.LoopID);
-            Changed = true;  // Continue iteration to mark grandparents
-          }
-        }
-      }
-      
-      // Build filtered loop list and track removed loops (Stage 3.1)
-      SmallVector<LoopDescriptor, 4> ActiveLoops;
-      SmallPtrSet<const LoopDescriptor *, 4> RemovedLoops;
-      
-      for (const auto &LD : Loops) {
-        if (ActiveLoopIDs.count(LD.LoopID)) {
-          ActiveLoops.push_back(LD);
-        } else {
-          RemovedLoops.insert(&LD);
-          LLVM_DEBUG(dbgs() << "  ✗ Removed Loop #" << LD.LoopID 
-                            << " (no streams, not a parent of active loops)\n");
-        }
-      }
-      
-      // Update loops collection
-      if (RemovedLoops.size() > 0) {
-        Loops = std::move(ActiveLoops);
-        LLVM_DEBUG(dbgs() << "  Removed " << RemovedLoops.size() 
-                          << " unused loop descriptor(s)\n");
-      } else {
-        LLVM_DEBUG(dbgs() << "  No unused loops to remove\n");
-      }
-      
-      // ============================================================
-      // STAGE 3: SUMMARY
-      // ============================================================
-      // This always runs to show final results
-      LLVM_DEBUG(dbgs() << "\n[Stage 3] Summary:\n");
-      LLVM_DEBUG(dbgs() << "  Applied " << AppliedMerges.size() << " merge(s)\n");
-      LLVM_DEBUG(dbgs() << "  Active loops: " << Loops.size() << "\n");
-      LLVM_DEBUG(dbgs() << "  Active streams: " << Streams.size() << "\n");
-      
-      // ============================================================
-      // FINAL OUTPUT: Print all descriptors
-      // ============================================================
-      
-      // Use the filtered IndirectStreams from Stage 1.1 (duplicates removed)
-      // Use the updated LinkVars from Stage 3 (which includes new link IDs for merged bounds)
-      
-      LLVM_DEBUG(printAllDescriptors(dbgs(), Loops, Streams, IndirectStreams, LinkVars));
-      
-      // ============================================================
-      // PHASE 1: IR GENERATION
-      // ============================================================
-      // Generate LLVM IR intrinsic calls to configure hardware descriptors.
-      // This phase transforms the analysis results into executable IR that
-      // the backend will lower to CSR writes.
-      //
-      // Process:
-      // 1. Assign unified GlobalIDs (0-indexed, non-overlapping across all types)
-      // 2. Emit intrinsic calls in loop preheaders
-      // 3. Ordering: Links → Loops → DirectStreams → IndirectStreams
-      // ============================================================
-      
-      LLVM_DEBUG(dbgs() << "\n"
-                        << "╔═══════════════════════════════════════════════════╗\n"
-                        << "║  Phase 1: IR Generation                            ║\n"
-                        << "╚═══════════════════════════════════════════════════╝\n");
-      
-      // Generate IR only if we have descriptors to configure
-      if (!LinkVars.empty() || !Loops.empty() || 
-          !Streams.empty() || !IndirectStreams.empty()) {
-        generateHardwareDescriptorIR(F, Loops, Streams, IndirectStreams, LinkVars);
-      } else {
-        LLVM_DEBUG(dbgs() << "No descriptors to generate IR for\n");
-      }
-  } // End: if (!Loops.empty())
-  
-  // IMPORTANT: Since we now modify the IR by injecting intrinsic calls,
-  // we must return PreservedAnalyses::none() to notify the pass manager.
+  }
+
+  // Update loops collection
+  if (RemovedLoops.size() > 0) {
+    Ctx.Loops = std::move(ActiveLoops);
+    LLVM_DEBUG(dbgs() << "  Removed " << RemovedLoops.size() 
+                      << " unused loop descriptor(s)\n");
+  } else {
+    LLVM_DEBUG(dbgs() << "  No unused loops to remove\n");
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// InterStellarAnalysisPass Implementation (New Pass Manager)
+//===----------------------------------------------------------------------===//
+
+PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
+                                                 FunctionAnalysisManager &AM) {
+  auto &LI = AM.getResult<LoopAnalysis>(F);
+  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+
+  // Early exit if no loops
+  if (LI.empty()) {
+    return PreservedAnalyses::all();
+  }
+
+  LLVM_DEBUG(dbgs() << "\n"
+                    << "╔═══════════════════════════════════════════════════╗\n"
+                    << "║  InterStellar Pass 1: Local Stream Analysis       ║\n"
+                    << "╚═══════════════════════════════════════════════════╝\n");
+
+  LLVM_DEBUG(dbgs() << "Running InterStellar Pass 1 on function: "
+                    << F.getName() << "\n");
+
+  // PASS 1: LOCAL STREAM ANALYSIS
+  // Identifies raw memory access patterns within each function:
+  // - Direct streams (affine patterns like A[i])
+  // - Indirect streams (index-based patterns like A[B[i]])
+  // - Loop contexts (bounds, nesting, induction variables)
+  // - Dynamic values (link variables for runtime values)
+  InterStellarStreamAnalyzer Analyzer(F, LI, SE);
+  Analyzer.analyze();
+
+  LLVM_DEBUG(Analyzer.print(dbgs()));
+
+  SmallVector<DirectStreamDescriptor, 8> Streams = Analyzer.getDirectStreams();
+  SmallVector<LoopDescriptor, 4> Loops = Analyzer.getLoopDescriptors();
+  SmallVector<IndirectStreamDescriptor, 4> IndirectStreams = Analyzer.getIndirectStreams();
+  SmallVector<LinkVariableDescriptor, 4> LinkVars = Analyzer.getLinkVariables();
+
+  // Run Pass 2 only if there are any loops (even without streams)
+  if (Loops.empty())
+    return PreservedAnalyses::none();
+
+  InterstellarPipelineContext Ctx(F, SE, AM.getResult<DominatorTreeAnalysis>(F));
+  Ctx.Streams = std::move(Streams);
+  Ctx.Loops = std::move(Loops);
+  Ctx.IndirectStreams = std::move(IndirectStreams);
+  Ctx.LinkVars = std::move(LinkVars);
+  // LinkVars only grow (Stage 3 appends), so the starting ID computed here is
+  // the value the former inline code used at the same point in the pipeline.
+  Ctx.NextLinkID = Ctx.LinkVars.empty() ? 0 : Ctx.LinkVars.back().LinkID + 1;
+
+  LLVM_DEBUG(dbgs() << "\n"
+                    << "╔═══════════════════════════════════════════════════╗\n"
+                    << "║  InterStellar Pass 2: Stage 1 (Intraprocedural)   ║\n"
+                    << "╚═══════════════════════════════════════════════════╝\n");
+
+  // Stage 1.1: dominance-based stream dedup. The indirect pass stays nested
+  // inside the !Streams.empty() guard — pre-existing structure, preserved.
+  if (!Ctx.Streams.empty()) {
+    deduplicateDirectStreams(Ctx);
+    deduplicateIndirectStreams(Ctx);
+  }
+
+  // LoopID -> descriptor map. Points into Ctx.Loops; every read happens
+  // before Stage 1.5 reassigns Ctx.Loops, so do not rebuild it afterwards.
+  for (const auto &LD : Ctx.Loops)
+    Ctx.LoopIDToDescriptor[LD.LoopID] = &LD;
+
+  // Stage 1.2: linearization feasibility -> merge candidates
+  analyzeLinearizationFeasibility(Ctx);
+
+  // Stage 1.5: remove stream-less loops; early-out when nothing remains
+  if (!removeStreamLessLoops(Ctx)) {
+    LLVM_DEBUG(dbgs() << "\n[Stage 1.5] No loops remaining after cleanup\n");
+    LLVM_DEBUG(dbgs() << "Skipping Stage 2 (Pattern Classification)\n");
+    LLVM_DEBUG(dbgs() << "Skipping Stage 3 (Loop Merge Transformation)\n");
+    LLVM_DEBUG(printAllDescriptors(dbgs(), Ctx.Loops, Ctx.Streams,
+                                   Ctx.IndirectStreams, Ctx.LinkVars));
+    return PreservedAnalyses::all();
+  }
+
+  // Stage 3: merge transformation; Stage 3.1: unused-loop cleanup
+  applyLoopMerges(Ctx);
+  removeUnusedLoops(Ctx);
+
+  LLVM_DEBUG(dbgs() << "\n[Stage 3] Summary:\n");
+  LLVM_DEBUG(dbgs() << "  Applied " << Ctx.AppliedMerges.size() << " merge(s)\n");
+  LLVM_DEBUG(dbgs() << "  Active loops: " << Ctx.Loops.size() << "\n");
+  LLVM_DEBUG(dbgs() << "  Active streams: " << Ctx.Streams.size() << "\n");
+
+  LLVM_DEBUG(printAllDescriptors(dbgs(), Ctx.Loops, Ctx.Streams,
+                                 Ctx.IndirectStreams, Ctx.LinkVars));
+
+  // PHASE 1: IR GENERATION
+  // Assign unified GlobalIDs (Links -> Loops -> Direct -> Indirect) and emit
+  // the llvm.interstellar.configure.* intrinsic calls the backend lowers to
+  // CSR writes.
+  LLVM_DEBUG(dbgs() << "\n"
+                    << "╔═══════════════════════════════════════════════════╗\n"
+                    << "║  Phase 1: IR Generation                            ║\n"
+                    << "╚═══════════════════════════════════════════════════╝\n");
+
+  if (!Ctx.LinkVars.empty() || !Ctx.Loops.empty() ||
+      !Ctx.Streams.empty() || !Ctx.IndirectStreams.empty()) {
+    generateHardwareDescriptorIR(F, Ctx.Loops, Ctx.Streams,
+                                 Ctx.IndirectStreams, Ctx.LinkVars);
+  } else {
+    LLVM_DEBUG(dbgs() << "No descriptors to generate IR for\n");
+  }
+
+  // IR was modified (intrinsic calls injected).
   return PreservedAnalyses::none();
 }
 
