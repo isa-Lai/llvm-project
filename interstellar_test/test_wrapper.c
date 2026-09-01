@@ -1,2 +1,2 @@
-extern void pattern1_direct_streams();
+extern void gather();
 int main() { return 0; }
