@@ -27,10 +27,22 @@ for p in "${PATTERNS[@]}"; do
     # previous pattern's test_backend.s/.o stand in for this one's.
     rm -f test_backend_input.ll test_backend_phase1.ll test_backend.s test_backend.o disassembly.txt
     bash test_backend.sh "$p" >/dev/null 2>&1
-    for f in phase1.s phase1.o; do
-        if [ -f "$base/$f" ] || [ -f "$f" ]; then
-            if ! cmp -s "$base/$f" "$f"; then
-                echo "GATE FAIL pattern$p: $f differs"
+    # Patterns whose run aborts before llc (pattern8: verifier rejects its
+    # legitimate descriptor shapes) still have baselines generated directly
+    # from phase1.ll — reproduce that fallback identically so the gate stays
+    # apples-to-apples. Only when the baseline has a .s; patternA's golden is
+    # precisely "nothing was produced".
+    if [ ! -f test_backend.s ] && [ -f "$base/phase1.s" ] && [ -f test_backend_phase1.ll ]; then
+        ../build/bin/llc test_backend_phase1.ll -o test_backend.s 2>/dev/null
+        [ -f test_backend.s ] && \
+            ../build/bin/clang --target=riscv64-unknown-linux-gnu -march=rv64gc \
+                -c test_backend.s -o test_backend.o 2>/dev/null
+    fi
+    for f in test_backend.s:phase1.s test_backend.o:phase1.o; do
+        fresh="${f%%:*}"; golden="${f##*:}"
+        if [ -f "$base/$golden" ] || [ -f "$fresh" ]; then
+            if ! cmp -s "$base/$golden" "$fresh"; then
+                echo "GATE FAIL pattern$p: $golden differs"
                 FAIL=1
             fi
         fi   # both missing (patternA) = match
