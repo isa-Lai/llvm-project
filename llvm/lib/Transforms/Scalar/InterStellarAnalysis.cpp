@@ -23,6 +23,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
+#include "llvm/Analysis/IVDescriptors.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -52,6 +53,50 @@ namespace {
 
 /// Core stream analyzer - identifies memory access patterns and generates
 /// hardware descriptors for direct/indirect streams, loops, and link variables.
+/// Strip wrapping sext/zext/trunc casts from a SCEV.
+static const SCEV *stripSCEVCasts(const SCEV *S) {
+  S = stripSCEVCasts(S);
+  return S;
+}
+
+/// Last index operand of a GEP (the innermost subscript).
+static Value *getLastGEPIndex(GetElementPtrInst *GEP) {
+  Value *Index = nullptr;
+  for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt)
+    Index = IdxIt->get();
+  return Index;
+}
+
+/// Allocated size of a GEP's pointee element: peel one array level off the
+/// source type (array parameters decay, e.g. int A[][10] -> int).
+static int64_t getPointeeElementSize(GetElementPtrInst *GEP,
+                                     const DataLayout &DL) {
+  Type *ElementType = GEP->getSourceElementType();
+  if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType))
+    ElementType = ArrTy->getElementType();
+  return DL.getTypeAllocSize(ElementType);
+}
+
+/// Byte size recorded for a link variable: pointers count as 8.
+static unsigned sizeInBytesForLink(Type *Ty, const DataLayout &DL) {
+  return Ty->isPointerTy() ? 8u : (unsigned)DL.getTypeAllocSize(Ty);
+}
+
+/// Which loop owns this AddRec as a stream when analyzed from L: L itself,
+/// an ancestor of L, or null (an inner/unrelated loop - caller rejects).
+static Loop *resolveOwningLoop(const SCEVAddRecExpr *AR, Loop *L) {
+  const Loop *ARLoop = AR->getLoop();
+  if (ARLoop == L)
+    return L;
+  if (L->contains(ARLoop))
+    return nullptr; // inner-loop recurrence, not this loop's stream
+  for (Loop *Parent = L->getParentLoop(); Parent;
+       Parent = Parent->getParentLoop())
+    if (ARLoop == Parent)
+      return Parent; // outer-loop stream
+  return nullptr;    // unrelated loop
+}
+
 /// Shared per-descriptor dump; defined below. Both the analyzer's Pass-1
 /// summary and the pass's final summary render through it.
 void printAllDescriptors(raw_ostream &OS,
@@ -205,12 +250,16 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
     // Extract final value (upper/lower bound)
     Value &FinalIV = Bounds->getFinalIVValue();
     LD.EndValue = SE.getSCEV(&FinalIV);
-    
+    // The bound IR value is exactly what the compare uses at runtime — keep
+    // it for the link-variable path (the former code re-derived it via
+    // extractDynamicValue with the same result for these shapes).
+    LD.EndValueDynamic = &FinalIV;
+
     // Extract step value
     if (Value *StepVal = Bounds->getStepValue()) {
       LD.StepValue = SE.getSCEV(StepVal);
     }
-    
+
     FoundBounds = true;
   } else {
     // Fallback: Try getInductionVariable() + analyze PHI directly
@@ -218,24 +267,17 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
     
     PHINode *IndVar = L->getInductionVariable(SE);
     
-    // If getInductionVariable() fails, try to find any PHI in the header that looks like an IV
+    // If getInductionVariable() fails, scan header PHIs with the canonical
+    // InductionDescriptor recognition (the former hand-rolled "first affine
+    // PHI" scan could bind to the wrong IV in multi-induction loops).
     if (!IndVar) {
       LLVM_DEBUG(dbgs() << "  getInductionVariable() returned null, scanning header PHIs\n");
-      BasicBlock *Header = L->getHeader();
-      for (PHINode &Phi : Header->phis()) {
-        // Only analyze PHI nodes with SCEVable types (integer types)
-        if (!SE.isSCEVable(Phi.getType())) {
-          LLVM_DEBUG(dbgs() << "    Skipping non-SCEVable PHI: " << Phi << "\n");
-          continue;
-        }
-        
-        const SCEV *PhiSCEV = SE.getSCEV(&Phi);
-        if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PhiSCEV)) {
-          if (AR->getLoop() == L && AR->isAffine()) {
-            IndVar = &Phi;
-            LLVM_DEBUG(dbgs() << "  Found affine PHI: " << Phi << "\n");
-            break;
-          }
+      InductionDescriptor ID;
+      for (PHINode &Phi : L->getHeader()->phis()) {
+        if (InductionDescriptor::isInductionPHI(&Phi, L, &SE, ID)) {
+          IndVar = &Phi;
+          LLVM_DEBUG(dbgs() << "  Found induction PHI: " << Phi << "\n");
+          break;
         }
       }
     }
@@ -493,34 +535,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     //   - Inner loop sees AddRec {A,+,M*4}<%outer> for base (outer loop induction)
     //   - This outer-loop AddRec is loop-invariant for inner loop
     //   - It should be used as the base address, not rejected
-    const Loop *ARLoop = AR->getLoop();
-    Loop *StreamLoop = nullptr;
-    
-    if (ARLoop == L) {
-      // Direct AddRec case: belongs to current loop (simple pattern like A[i])
-      StreamLoop = L;
-    } else if (L->contains(ARLoop)) {
-      // AddRec belongs to an inner loop (nested inside current loop)
-      // This shouldn't happen when analyzing memory accesses in current loop
-      LLVM_DEBUG(dbgs() << "  AddRec belongs to inner loop, skipping\n");
+    Loop *StreamLoop = resolveOwningLoop(AR, L);
+    if (!StreamLoop) {
+      // AddRec belongs to an inner or unrelated loop
+      LLVM_DEBUG(dbgs() << "  AddRec belongs to inner or unrelated loop, skipping\n");
       return false;
-    } else {
-      // Check if AddRec belongs to any parent loop
-      Loop *ParentLoop = L->getParentLoop();
-      while (ParentLoop) {
-        if (ARLoop == ParentLoop) {
-          StreamLoop = ParentLoop;
-          LLVM_DEBUG(dbgs() << "  AddRec belongs to parent loop (outer loop stream)\n");
-          break;
-        }
-        ParentLoop = ParentLoop->getParentLoop();
-      }
-      
-      if (!StreamLoop) {
-        // AddRec belongs to unrelated loop
-        LLVM_DEBUG(dbgs() << "  AddRec belongs to unrelated loop\n");
-        return false;
-      }
     }
     
     // Verify it's affine
@@ -569,9 +588,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // For multi-dim or complex: GEP might have multiple indices
   // We focus on the last index which represents the actual array subscript
   Value *Index = nullptr;
-  for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
-    Index = IdxIt->get(); // Get the last index
-  }
+  Index = getLastGEPIndex(GEP);
   
   if (!Index) {
     return false;
@@ -607,9 +624,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   
   // Unwrap casts first
   const SCEV *UnwrappedIndexSCEV = IndexSCEV;
-  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(UnwrappedIndexSCEV)) {
-    UnwrappedIndexSCEV = Cast->getOperand();
-  }
+  UnwrappedIndexSCEV = stripSCEVCasts(UnwrappedIndexSCEV);
   
   // Check if the index is a sum of loop-invariant and loop-variant parts
   if (const SCEVAddExpr *AddExpr = dyn_cast<SCEVAddExpr>(UnwrappedIndexSCEV)) {
@@ -618,9 +633,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     for (const SCEV *Op : AddExpr->operands()) {
       // Unwrap casts on operands
       const SCEV *UnwrappedOp = Op;
-      while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(UnwrappedOp)) {
-        UnwrappedOp = Cast->getOperand();
-      }
+      UnwrappedOp = stripSCEVCasts(UnwrappedOp);
       
       // Check if this operand is an affine AddRec for the current loop
       if (const SCEVAddRecExpr *OpAR = dyn_cast<SCEVAddRecExpr>(UnwrappedOp)) {
@@ -696,11 +709,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
         return false;
       }
       
-      Type *ElementType = GEP->getSourceElementType();
-      if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
-        ElementType = ArrTy->getElementType();
-      }
-      int64_t ElementSize = getTypeSizeInBytes(ElementType);
+      int64_t ElementSize = getPointeeElementSize(GEP, F.getDataLayout());
       int64_t StepValue = StepConst->getAPInt().getSExtValue();
       int64_t MemoryStride = StepValue * ElementSize;
       
@@ -750,9 +759,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   const SCEV *IndVarSCEV = SE.getSCEV(IndVar);
   
   // Handle cast expressions (sext, zext, etc.) - unwrap to get the underlying AddRec
-  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(IndVarSCEV)) {
-    IndVarSCEV = Cast->getOperand();
-  }
+  IndVarSCEV = stripSCEVCasts(IndVarSCEV);
   
   // Handle add expressions with offsets (e.g., i+2 becomes {start+2, +, step})
   // CRITICAL: Verify all non-AddRec operands are loop-invariant.
@@ -767,9 +774,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
     for (const SCEV *Op : AddExpr->operands()) {
       // Unwrap casts on operands
       const SCEV *UnwrappedOp = Op;
-      while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(UnwrappedOp)) {
-        UnwrappedOp = Cast->getOperand();
-      }
+      UnwrappedOp = stripSCEVCasts(UnwrappedOp);
       
       if (const SCEVAddRecExpr *OpAR = dyn_cast<SCEVAddRecExpr>(UnwrappedOp)) {
         if (!FoundAR) {
@@ -833,35 +838,11 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   // Check if AddRec belongs to this loop or any parent loop
   // For nested loops, A[i] where i is the outer loop variable should be
   // detected as a direct stream of the outer loop, even when analyzed from inner loop
-  const Loop *ARLoop = AR->getLoop();
-  Loop *StreamLoop = nullptr;
-  
-  if (ARLoop == L) {
-    // Direct case: AddRec belongs to current loop (e.g., inner loop analyzing B[j])
-    StreamLoop = L;
-  } else if (L->contains(ARLoop)) {
-    // AddRec belongs to an inner loop - not applicable for this analysis context
-    LLVM_DEBUG(dbgs() << "  AddRec belongs to inner loop, skipping\n");
+  Loop *StreamLoop = resolveOwningLoop(AR, L);
+  if (!StreamLoop) {
+    // AddRec belongs to an inner or unrelated loop
+    LLVM_DEBUG(dbgs() << "  AddRec belongs to inner or unrelated loop, skipping\n");
     return false;
-  } else {
-    // Check if AddRec belongs to any parent loop
-    // For nested loops: A[i] analyzed from inner loop, where i is outer loop variable
-    Loop *ParentLoop = L->getParentLoop();
-    while (ParentLoop) {
-      if (ARLoop == ParentLoop) {
-        // Found it! This stream belongs to the parent loop
-        StreamLoop = ParentLoop;
-        LLVM_DEBUG(dbgs() << "  AddRec belongs to parent loop (outer loop stream)\n");
-        break;
-      }
-      ParentLoop = ParentLoop->getParentLoop();
-    }
-    
-    if (!StreamLoop) {
-      // AddRec belongs to unrelated loop
-      LLVM_DEBUG(dbgs() << "  AddRec belongs to unrelated loop\n");
-      return false;
-    }
   }
   
   // Check if it's affine (linear: start + stride * i)
@@ -906,12 +887,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeDirectStream(Value *Ptr,
   }
   
   // Calculate memory stride: index_step * element_size
-  Type *ElementType = GEP->getSourceElementType();
-  // For array types like [1000 x i32], get the actual element type
-  if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
-    ElementType = ArrTy->getElementType();
-  }
-  int64_t ElementSize = getTypeSizeInBytes(ElementType);
+  int64_t ElementSize = getPointeeElementSize(GEP, F.getDataLayout());
   int64_t IndexStepVal = IndexStepConst->getAPInt().getSExtValue();
   int64_t MemoryStride = IndexStepVal * ElementSize;
   
@@ -1125,9 +1101,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   }
   
   Value *Index = nullptr;
-  for (auto IdxIt = RootGEP->idx_begin(); IdxIt != RootGEP->idx_end(); ++IdxIt) {
-    Index = IdxIt->get(); // Get the last index
-  }
+  Index = getLastGEPIndex(RootGEP);
   
   if (!Index) {
     return false;
@@ -1274,14 +1248,9 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   const SCEV *BaseSCEV = SE.getSCEV(BasePtr);
   
   // Calculate element size from the root GEP (the one with the indirect index)
-  Type *ElementType = RootGEP->getSourceElementType();
-  if (ArrayType *ArrTy = dyn_cast<ArrayType>(ElementType)) {
-    ElementType = ArrTy->getElementType();
-  }
-  int64_t ElemSize = getTypeSizeInBytes(ElementType);
+  int64_t ElemSize = getPointeeElementSize(RootGEP, F.getDataLayout());
   
   LLVM_DEBUG(dbgs() << "    Base pointer: " << *BasePtr << "\n");
-  LLVM_DEBUG(dbgs() << "    Element type: " << *ElementType << "\n");
   LLVM_DEBUG(dbgs() << "    Element size: " << ElemSize << " bytes\n");
   
   // Determine the correct loop ID for this indirect stream
@@ -1341,8 +1310,7 @@ bool InterStellarStreamAnalyzer::tryAnalyzeIndirectStream(Value *Ptr,
   if (IDS.IsBaseLinked) {
     IDS.BaseAddressValue = extractDynamicValue(BaseSCEV, L);
     if (IDS.BaseAddressValue) {
-      Type *BaseTy = IDS.BaseAddressValue->getType();
-      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+      unsigned Size = sizeInBytesForLink(IDS.BaseAddressValue->getType(), F.getDataLayout());
       IDS.LinkID = getOrCreateLinkID(IDS.BaseAddressValue, Size);
     }
   }
@@ -1411,9 +1379,7 @@ std::optional<unsigned> InterStellarStreamAnalyzer::getStreamSource(Value *V, Lo
       // Get the index of this GEP
       if (GEP->getNumIndices() > 0) {
         Value *Index = nullptr;
-        for (auto IdxIt = GEP->idx_begin(); IdxIt != GEP->idx_end(); ++IdxIt) {
-          Index = IdxIt->get();
-        }
+        Index = getLastGEPIndex(GEP);
         
         if (Index) {
           // Unwrap casts
@@ -1612,7 +1578,9 @@ bool InterStellarStreamAnalyzer::isEffectivelyLoopInvariant(const SCEV *S, Loop 
     if (!VisitingSCEVs.insert(CurS).second)
       return true; // already on recursion stack; treat as invariant to break cycle
 
-    // First, check the standard case.
+    // First, check the standard case. SE.isLoopInvariant already accepts
+    // AddRecs of any loop containing L (outer-loop IVs are invariant here),
+    // so only expressions it rejects reach the code below.
     if (SE.isLoopInvariant(CurS, L)) {
       VisitingSCEVs.erase(CurS);
       return true;
@@ -1620,29 +1588,12 @@ bool InterStellarStreamAnalyzer::isEffectivelyLoopInvariant(const SCEV *S, Loop 
 
     // Unwrap casts.
     const SCEV *Unwrapped = CurS;
-    while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Unwrapped))
-      Unwrapped = Cast->getOperand();
+    Unwrapped = stripSCEVCasts(Unwrapped);
 
-    // Check for AddRecExpr from parent loops (loop-invariant for current loop).
-    if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Unwrapped)) {
-      const Loop *ARLoop = AR->getLoop();
-
-      // If AddRec is for the current loop, it's NOT invariant.
-      if (ARLoop == L) {
-        VisitingSCEVs.erase(CurS);
-        return false;
-      }
-
-      // If AddRec is for a parent loop, it's effectively invariant for current loop.
-      for (Loop *ParentLoop = L->getParentLoop(); ParentLoop;
-           ParentLoop = ParentLoop->getParentLoop()) {
-        if (ARLoop == ParentLoop) {
-          VisitingSCEVs.erase(CurS);
-          return true; // Depends on outer loop, invariant for current loop.
-        }
-      }
-
-      // AddRec for unrelated loop or inner loop - not invariant.
+    // An AddRec that SE.isLoopInvariant rejected is either this loop's own
+    // IV or an unrelated/inner loop recurrence — never effectively invariant.
+    // (Everything else falls through to the permissive value recursion.)
+    if (isa<SCEVAddRecExpr>(Unwrapped)) {
       VisitingSCEVs.erase(CurS);
       return false;
     }
@@ -1760,9 +1711,7 @@ Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {
   // register during code generation.
   
   // Unwrap any cast expressions
-  while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(S)) {
-    S = Cast->getOperand();
-  }
+  S = stripSCEVCasts(S);
   
   // If it's a simple unknown (single variable), return it directly
   if (const SCEVUnknown *Unknown = dyn_cast<SCEVUnknown>(S)) {
@@ -1857,9 +1806,7 @@ Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {
       const SCEV *InstSCEV = SE.getSCEV(&I);
       
       // Unwrap casts from InstSCEV for comparison
-      while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(InstSCEV)) {
-        InstSCEV = Cast->getOperand();
-      }
+      InstSCEV = stripSCEVCasts(InstSCEV);
       
       if (InstSCEV == Target) {
         LLVM_DEBUG(dbgs() << "  Found instruction for SCEV: " << I << "\n");
@@ -1890,8 +1837,7 @@ Value *InterStellarStreamAnalyzer::extractDynamicValue(const SCEV *S, Loop *L) {
       // Count dynamic operands
       SmallVector<const SCEV *, 4> DynamicOps;
       for (const SCEV *Op : Add->operands()) {
-        while (const SCEVCastExpr *Cast = dyn_cast<SCEVCastExpr>(Op))
-          Op = Cast->getOperand();
+        Op = stripSCEVCasts(Op);
         if (isa<SCEVUnknown>(Op))
           DynamicOps.push_back(Op);
       }
@@ -2055,8 +2001,7 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
     
     if (BaseVal) {
       DS.BaseAddressValue = BaseVal;
-      Type *BaseTy = BaseVal->getType();
-      unsigned Size = BaseTy->isPointerTy() ? 8 : getTypeSizeInBytes(BaseTy);
+      unsigned Size = sizeInBytesForLink(BaseVal->getType(), F.getDataLayout());
       DS.LinkID = getOrCreateLinkID(BaseVal, Size);
       ++NumDynamicBases;
     }
