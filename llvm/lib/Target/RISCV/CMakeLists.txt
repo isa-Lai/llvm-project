@@ -49,6 +49,7 @@ add_llvm_target(RISCVCodeGen
   RISCVInsertReadWriteCSR.cpp
   RISCVInsertVSETVLI.cpp
   RISCVInsertWriteVXRM.cpp
+  RISCVInterStellarCodeGen.cpp
   RISCVInstrInfo.cpp
   RISCVInterleavedAccess.cpp
   RISCVISelDAGToDAG.cpp

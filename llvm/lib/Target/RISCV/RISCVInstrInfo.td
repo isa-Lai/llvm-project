@@ -141,6 +141,26 @@ def riscv_set_csr  : RVSDNode<"SET_CSR",
                                                     SDTCisInt<1>]>,
                                [SDNPHasChain]>;
 
+// InterStellar descriptor nodes. These preserve register operands through
+// compilation until post-RA expansion when physical register numbers are known.
+// Each node takes descriptor parameters and returns a chain.
+// No type constraints - we'll handle type conversions in lowering.
+def riscv_interstellar_configure_link : RVSDNode<"INTERSTELLAR_CONFIGURE_LINK",
+                                                 SDTypeProfile<0, -1, []>,
+                                                 [SDNPHasChain, SDNPVariadic]>;
+
+def riscv_interstellar_loop : RVSDNode<"INTERSTELLAR_LOOP",
+                                        SDTypeProfile<0, -1, []>,
+                                        [SDNPHasChain, SDNPVariadic]>;
+
+def riscv_interstellar_directstream : RVSDNode<"INTERSTELLAR_DIRECTSTREAM",
+                                                SDTypeProfile<0, -1, []>,
+                                                [SDNPHasChain, SDNPVariadic]>;
+
+def riscv_interstellar_indirectstream : RVSDNode<"INTERSTELLAR_INDIRECTSTREAM",
+                                                  SDTypeProfile<0, -1, []>,
+                                                  [SDNPHasChain, SDNPVariadic]>;
+
 // A read of the 64-bit counter CSR on a 32-bit target (returns (Lo, Hi)).
 // It takes a chain operand and another two target constant operands (the
 // CSR numbers of the low and high parts of the counter).
@@ -2484,6 +2504,12 @@ include "RISCVInstrInfoXMips.td"
 include "RISCVInstrInfoXAndes.td"
 include "RISCVInstrInfoXSpacemiT.td"
 include "RISCVInstrInfoXAIF.td"
+
+//===----------------------------------------------------------------------===//
+// InterStellar Hardware Prefetch Configuration
+//===----------------------------------------------------------------------===//
+
+include "RISCVInstrInfoInterStellar.td"
 
 //===----------------------------------------------------------------------===//
 // Global ISel

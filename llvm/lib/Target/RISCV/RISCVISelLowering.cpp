@@ -981,6 +981,18 @@ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::CLEAR_CACHE, MVT::Other, Custom);
   }
 
+  // InterStellar configuration intrinsics are side-effecting void intrinsics
+  // that carry mixed-width operands (e.g. i32 + pointer) and need target
+  // custom lowering on both RV32 and RV64, regardless of RVV support.
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::i1, Custom);
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::i8, Custom);
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::i16, Custom);
+  if (Subtarget.is64Bit())
+    setOperationAction(ISD::INTRINSIC_VOID, MVT::i32, Custom);
+  else
+    setOperationAction(ISD::INTRINSIC_VOID, MVT::i64, Custom);
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::Other, Custom);
+
   if (Subtarget.hasVInstructions()) {
     setBooleanVectorContents(ZeroOrNegativeOneBooleanContent);
 
@@ -998,8 +1010,7 @@ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
       setOperationAction({ISD::INTRINSIC_WO_CHAIN, ISD::INTRINSIC_W_CHAIN},
                          MVT::i64, Custom);
 
-    setOperationAction({ISD::INTRINSIC_W_CHAIN, ISD::INTRINSIC_VOID},
-                       MVT::Other, Custom);
+    setOperationAction(ISD::INTRINSIC_W_CHAIN, MVT::Other, Custom);
 
     static const unsigned IntegerVPOps[] = {
         ISD::VP_SDIV,        ISD::VP_UDIV,        ISD::VP_SREM,
@@ -13522,6 +13533,109 @@ SDValue RISCVTargetLowering::LowerINTRINSIC_VOID(SDValue Op,
     return getVCIXISDNodeVOID(Op, DAG, RISCVISD::SF_VC_VVW_SE);
   case Intrinsic::riscv_sf_vc_fvw_se:
     return getVCIXISDNodeVOID(Op, DAG, RISCVISD::SF_VC_FVW_SE);
+  
+  // InterStellar hardware configuration intrinsics
+  // Lower directly to pseudo-instructions to bypass type legalization issues.
+  // These pseudos preserve register operands through register allocation, then  
+  // are expanded post-RA to actual CSR writes with physical register numbers.
+  case Intrinsic::interstellar_configure_link: {
+    SDLoc DL(Op);
+    MVT XLenVT = Subtarget.getXLenVT();
+    SDValue Chain = Op.getOperand(0);
+
+    auto ToTargetImm = [&](SDValue V) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return DAG.getTargetConstant(C->getZExtValue(), DL, XLenVT);
+      LLVM_DEBUG(dbgs() << "InterStellar link expects constant immediate\n");
+      return DAG.getTargetConstant(0, DL, XLenVT);
+    };
+
+    SDValue GlobalID = ToTargetImm(Op.getOperand(2));
+    SDValue Ptr = Op.getOperand(3);
+    SDValue Size = ToTargetImm(Op.getOperand(4));
+
+    SDValue Ops[] = {GlobalID, Ptr, Size, Chain};
+    return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarLink, DL,
+                                       MVT::Other, Ops), 0);
+  }
+  case Intrinsic::interstellar_configure_loop: {
+    SDLoc DL(Op);
+    MVT XLenVT = Subtarget.getXLenVT();
+    SDValue Chain = Op.getOperand(0);
+
+    auto ToTargetImm = [&](SDValue V) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return DAG.getTargetConstant(C->getZExtValue(), DL, XLenVT);
+      LLVM_DEBUG(dbgs() << "InterStellar loop expects constant immediate\n");
+      return DAG.getTargetConstant(0, DL, XLenVT);
+    };
+
+    SmallVector<SDValue, 8> Ops;
+    for (unsigned i = 2; i < Op.getNumOperands(); ++i)
+      Ops.push_back(ToTargetImm(Op.getOperand(i)));
+    Ops.push_back(Chain);
+
+    return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarLoop, DL,
+                                       MVT::Other, Ops), 0);
+  }
+  case Intrinsic::interstellar_configure_directstream: {
+    SDLoc DL(Op);
+    MVT XLenVT = Subtarget.getXLenVT();
+    SDValue Chain = Op.getOperand(0);
+
+    auto ToTargetImm = [&](SDValue V) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return DAG.getTargetConstant(C->getZExtValue(), DL, XLenVT);
+      LLVM_DEBUG(dbgs() << "InterStellar directstream expects constant immediate\n");
+      return DAG.getTargetConstant(0, DL, XLenVT);
+    };
+
+    SDValue GlobalID = ToTargetImm(Op.getOperand(2));
+    SDValue LoopID = ToTargetImm(Op.getOperand(3));
+    SDValue IsLinked = ToTargetImm(Op.getOperand(4));
+    SDValue Ptr = Op.getOperand(5);
+    SDValue BaseID = DAG.getTargetConstant(0, DL, XLenVT);
+    if (auto *IsLinkedC = dyn_cast<ConstantSDNode>(Op.getOperand(4));
+        IsLinkedC && IsLinkedC->getZExtValue() != 0) {
+      BaseID = ToTargetImm(Op.getOperand(5));
+      Ptr = DAG.getRegister(RISCV::X0, XLenVT);
+    }
+    SDValue Stride = ToTargetImm(Op.getOperand(6));
+
+    SDValue Ops[] = {GlobalID, LoopID, IsLinked, Ptr, BaseID, Stride, Chain};
+    return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarDirectStream, DL,
+                                       MVT::Other, Ops), 0);
+  }
+  case Intrinsic::interstellar_configure_indirectstream: {
+    SDLoc DL(Op);
+    MVT XLenVT = Subtarget.getXLenVT();
+    SDValue Chain = Op.getOperand(0);
+
+    auto ToTargetImm = [&](SDValue V) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return DAG.getTargetConstant(C->getZExtValue(), DL, XLenVT);
+      LLVM_DEBUG(dbgs() << "InterStellar indirectstream expects constant immediate\n");
+      return DAG.getTargetConstant(0, DL, XLenVT);
+    };
+
+    SDValue GlobalID = ToTargetImm(Op.getOperand(2));
+    SDValue LoopID = ToTargetImm(Op.getOperand(3));
+    SDValue IsLinked = ToTargetImm(Op.getOperand(4));
+    SDValue BasePtr = Op.getOperand(5);
+    SDValue BaseID = DAG.getTargetConstant(0, DL, XLenVT);
+    if (auto *IsLinkedC = dyn_cast<ConstantSDNode>(Op.getOperand(4));
+        IsLinkedC && IsLinkedC->getZExtValue() != 0) {
+      BaseID = ToTargetImm(Op.getOperand(5));
+      BasePtr = DAG.getRegister(RISCV::X0, XLenVT);
+    }
+    SDValue ElementSize = ToTargetImm(Op.getOperand(6));
+    SDValue IndexArraySize = ToTargetImm(Op.getOperand(7));
+
+    SDValue Ops[] = {GlobalID, LoopID, IsLinked, BasePtr, BaseID, ElementSize,
+                     IndexArraySize, Chain};
+    return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarIndirectStream, DL,
+                                       MVT::Other, Ops), 0);
+  }
   }
 
   return lowerVectorIntrinsicScalars(Op, DAG, Subtarget);

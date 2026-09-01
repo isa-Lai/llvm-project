@@ -2914,6 +2914,43 @@ def int_protected_field_ptr :
                         [IntrNoMem, ImmArg<ArgIndex<2>>]>;
 
 //===----------------------------------------------------------------------===//
+// InterStellar Hardware Configuration Intrinsics
+//===----------------------------------------------------------------------===//
+// These intrinsics configure the InterStellar memory prefetching hardware
+// by providing loop and memory access pattern information. They are generated
+// by the InterStellarAnalysis pass and lowered to CSR writes by the backend.
+
+// Configure a link variable (runtime value like pointer or loop bound)
+// Args: GlobalID, Pointer to value, Size in bytes
+def int_interstellar_configure_link :
+    DefaultAttrsIntrinsic<[],
+                          [llvm_i32_ty, llvm_ptr_ty, llvm_i32_ty],
+                          [IntrHasSideEffects, IntrWillReturn]>;
+
+// Configure a loop descriptor
+// Args: GlobalID, ParentLinkID, isNested, isIncreasing, LowerBound, UpperBound, Step
+def int_interstellar_configure_loop :
+    DefaultAttrsIntrinsic<[],
+                          [llvm_i32_ty, llvm_i32_ty, llvm_i1_ty, llvm_i1_ty, 
+                           llvm_i32_ty, llvm_i32_ty, llvm_i32_ty],
+                          [IntrHasSideEffects, IntrWillReturn]>;
+
+// Configure a direct stream descriptor (strided memory access)
+// Args: GlobalID, LoopID, isWrite, BaseAddress (ptr or link ID), ElementSize
+def int_interstellar_configure_directstream :
+    DefaultAttrsIntrinsic<[],
+                          [llvm_i32_ty, llvm_i32_ty, llvm_i1_ty, llvm_ptr_ty, llvm_i32_ty],
+                          [IntrHasSideEffects, IntrWillReturn]>;
+
+// Configure an indirect stream descriptor (indexed memory access)
+// Args: GlobalID, SourceLinkID, isWrite, BaseAddress (ptr or link ID), ElementSize, IndexArraySize
+def int_interstellar_configure_indirectstream :
+    DefaultAttrsIntrinsic<[],
+                          [llvm_i32_ty, llvm_i32_ty, llvm_i1_ty, llvm_ptr_ty, 
+                           llvm_i32_ty, llvm_i32_ty],
+                          [IntrHasSideEffects, IntrWillReturn]>;
+
+//===----------------------------------------------------------------------===//
 // Target-specific intrinsics
 //===----------------------------------------------------------------------===//
 

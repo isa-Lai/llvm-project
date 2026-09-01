@@ -3245,6 +3245,7 @@ void RISCVDAGToDAGISel::Select(SDNode *Node) {
     ReplaceNode(Node, Load);
     return;
   }
+
   case RISCVISD::LPAD_CALL:
   case RISCVISD::LPAD_CALL_INDIRECT: {
     bool IsIndirect = Opcode == RISCVISD::LPAD_CALL_INDIRECT;
@@ -3280,7 +3281,7 @@ void RISCVDAGToDAGISel::Select(SDNode *Node) {
                 CurDAG->getMachineNode(PseudoOpc, DL, Node->getVTList(), Ops));
     return;
   }
-  case ISD::PREFETCH:
+  case ISD::PREFETCH: {
     // MIPS's prefetch instruction already encodes the hint within the
     // instruction itself, so no extra NTL hint is needed.
     if (Subtarget->hasVendorXMIPSCBOP())
@@ -3314,6 +3315,16 @@ void RISCVDAGToDAGISel::Select(SDNode *Node) {
     if (NontemporalLevel & 0b10)
       MMO->setFlags(MONontemporalBit1);
     break;
+  }
+  
+  // InterStellar configuration - now lowered directly to machine nodes
+  // to avoid type legalization issues with i32 vs i64 operands.
+  // The cases below are kept for reference but should not be reached.
+  case RISCVISD::INTERSTELLAR_CONFIGURE_LINK:
+  case RISCVISD::INTERSTELLAR_LOOP:
+  case RISCVISD::INTERSTELLAR_DIRECTSTREAM:
+  case RISCVISD::INTERSTELLAR_INDIRECTSTREAM:
+    llvm_unreachable("InterStellar nodes should be lowered directly to machine nodes");
   }
 
   // Select the default instruction.
