@@ -52,6 +52,14 @@ namespace {
 
 /// Core stream analyzer - identifies memory access patterns and generates
 /// hardware descriptors for direct/indirect streams, loops, and link variables.
+/// Shared per-descriptor dump; defined below. Both the analyzer's Pass-1
+/// summary and the pass's final summary render through it.
+void printAllDescriptors(raw_ostream &OS,
+                         const SmallVectorImpl<LoopDescriptor> &Loops,
+                         const SmallVectorImpl<DirectStreamDescriptor> &Streams,
+                         const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
+                         const SmallVectorImpl<LinkVariableDescriptor> &LinkVars);
+
 class InterStellarStreamAnalyzer {
 public:
   InterStellarStreamAnalyzer(Function &F, LoopInfo &LI, ScalarEvolution &SE)
@@ -2079,189 +2087,17 @@ void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
   OS << "╔═══════════════════════════════════════════════════════════════╗\n";
   OS << "║     InterStellar Stream Analysis Results for Function: " << F.getName() << " ║\n";
   OS << "╚═══════════════════════════════════════════════════════════════╝\n\n";
-  
+
   OS << " Statistics:\n";
   OS << "   • Loops analyzed: " << LoopDescriptors.size() << "\n";
   OS << "   • Direct streams: " << DirectStreams.size() << "\n";
-  OS << "   • Link variables: " << LinkVariables.size() << "\n\n";
-  
-  if (!LoopDescriptors.empty()) {
-    OS << " Loop Descriptors (Hardware CSR Format):\n";
-    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    for (const auto &LD : LoopDescriptors) {
-      OS << "Loop ID: " << LD.LoopID;
-      
-      // Check if this loop has a parent
-      // ParentLoopID field semantics:
-      //   - ParentLoopID > 0: Always has a parent (for both regular and virtual loops)
-      //   - ParentLoopID == 0 AND LoopID != 0 AND IsVirtual == false: Has parent Loop #0 (regular nested loop)
-      //   - ParentLoopID == 0 AND IsVirtual == true AND MergedToOuterLoop > 0: Has parent Loop #0 (nested virtual)
-      //   - ParentLoopID == 0 AND (LoopID == 0 OR (IsVirtual == true AND MergedToOuterLoop == 0)): NO parent
-      bool hasParent = false;
-      if (LD.ParentLoopID > 0) {
-        hasParent = true;
-      } else if (LD.ParentLoopID == 0 && LD.LoopID != 0 && !LD.IsVirtual) {
-        // Regular loop (not Loop #0) with ParentLoopID=0 means parent is Loop #0
-        hasParent = true;
-      } else if (LD.ParentLoopID == 0 && LD.IsVirtual && LD.MergedToOuterLoop > 0) {
-        // Virtual loop with partial merge: parent is Loop #0
-        hasParent = true;
-      }
-      
-      if (hasParent) {
-        OS << " (nested inside Loop " << LD.ParentLoopID << ")";
-      }
-      OS << "\n";
-      
-      
-      // Print loop source location
-      if (LD.Loc) {
-        OS << "  ├─ Source Location: ";
-        LD.Loc.print(OS);
-        OS << "\n";
-      }
-      
-      // Parent Loop ID (if nested)
-      if (hasParent) {
-        OS << "  ├─ Parent Loop: " << LD.ParentLoopID << " [Nesting Level]\n";
-      }
-      
-      // Start Value
-      OS << "  ├─ Start Value: ";
-      if (LD.StartValue) {
-        OS << *LD.StartValue;
-        if (LD.IsStartLinked) {
-          OS << "   [SL=1, Dynamic, LinkID=" << LD.StartLinkID << "]";
-          if (LD.StartValueDynamic) {
-            OS << "\n  │              = " << *LD.StartValueDynamic;
-          }
-        } else {
-          OS << "  [SL=0, Constant]";
-        }
-      } else {
-        OS << "(unknown)";
-      }
-      OS << "\n";
-      
-      // End Value
-      OS << "  ├─ End Value:   ";
-      if (LD.EndValue) {
-        OS << *LD.EndValue;
-        if (LD.IsEndLinked) {
-          OS << "   [EL=1, Dynamic, LinkID=" << LD.EndLinkID << "]";
-          if (LD.EndValueDynamic) {
-            OS << "\n  │              = " << *LD.EndValueDynamic;
-          }
-        } else {
-          OS << "  [EL=0, Constant]";
-        }
-      } else {
-        OS << "(unknown)";
-      }
-      OS << "\n";
-      
-      // Step Value
-      OS << "  └─ Step Value:  ";
-      if (LD.StepValue) {
-        OS << *LD.StepValue;
-      } else {
-        OS << "(unknown)";
-      }
-      OS << "\n\n";
-    }
-  }
-  
-  if (!DirectStreams.empty()) {
-    OS << "  Direct Streams (Constant Stride Patterns):\n";
-    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    for (const auto &DS : DirectStreams) {
-      OS << "Stream ID: " << DS.StreamID << " (Loop " << DS.LoopID << ")\n";
-      
-      // Source location
-      if (DS.Loc) {
-        OS << "  ├─ Source Location: ";
-        DS.Loc.print(OS);
-        OS << "\n";
-      }
-      
-      // Base Address
-      OS << "  ├─ Base Address: " << *DS.BaseAddress;
-      if (DS.IsBaseLinked) {
-        OS << "   [BL=1, Dynamic, LinkID=" << DS.LinkID << "]";
-        if (DS.BaseAddressValue) {
-          OS << "\n  │              = " << *DS.BaseAddressValue;
-        }
-      } else {
-        OS << "  [BL=0, Static]";
-      }
-      OS << "\n";
-      
-      // Stride
-      OS << "  ├─ Stride:       " << DS.Stride << " bytes\n";
-      
-      // Source instruction
-      if (DS.MemInst) {
-        OS << "  └─ Source:       " << *DS.MemInst << "\n";
-      }
-      OS << "\n";
-    }
-  }
-  
-  if (!IndirectStreams.empty()) {
-    OS << "  Indirect Streams (Index-Based Access Patterns like A[B[i]]):\n";
-    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    for (const auto &IDS : IndirectStreams) {
-      OS << "Stream ID: " << IDS.StreamID << " (Loop " << IDS.LoopID << ")\n";
-      
-      // Source location
-      if (IDS.Loc) {
-        OS << "  ├─ Source Location: ";
-        IDS.Loc.print(OS);
-        OS << "\n";
-      }
-      
-      // Base Address
-      OS << "  ├─ Base Address:   " << *IDS.BaseAddress;
-      if (IDS.IsBaseLinked) {
-        OS << "   [BL=1, Dynamic, LinkID=" << IDS.LinkID << "]";
-        if (IDS.BaseAddressValue) {
-          OS << "\n  │                = " << *IDS.BaseAddressValue;
-        }
-      } else {
-        OS << "  [BL=0, Static]";
-      }
-      OS << "\n";
-      
-      // Element Size
-      OS << "  ├─ Element Size:   " << IDS.ElementSize << " bytes\n";
-      
-      // Index Source Stream or Computed
-      if (IDS.IsIndexComputed) {
-        OS << "  ├─ Index Type:     COMPUTED/RANDOM (no stream dependency)\n";
-      } else {
-        OS << "  ├─ Index Stream:   Stream #" << IDS.BaseStreamID 
-           << " (indices provided by this stream)\n";
-      }
-      
-      // Source instruction
-      if (IDS.MemInst) {
-        OS << "  └─ Source:         " << *IDS.MemInst << "\n";
-      }
-      OS << "\n";
-    }
-  }
-  
-  if (!LinkVariables.empty()) {
-    OS << "  Link Variable Descriptors (Dynamic Runtime Values):\n";
-    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    for (const auto &LV : LinkVariables) {
-      OS << "Link ID: " << LV.LinkID << "\n";
-      OS << "  ├─ IR Value:  " << *LV.DynamicValue << "\n";
-      OS << "  └─ Size:      " << LV.SizeInBytes << " bytes\n";
-    }
-  }
-  
-  OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+  OS << "   • Indirect streams: " << IndirectStreams.size() << "\n";
+  OS << "   • Link variables: " << LinkVariables.size() << "\n";
+
+  // Reuse the shared per-descriptor dump (defined below) so the Pass-1
+  // summary and the final summary render identically.
+  printAllDescriptors(OS, LoopDescriptors, DirectStreams, IndirectStreams,
+                      LinkVariables);
 }
 
 } // anonymous namespace
@@ -2288,180 +2124,170 @@ struct StreamMergeCandidate {
 
 namespace {
 
-/// Print all loop and stream descriptors in a structured format
-/// This function is reusable across different stages of the pass
+/// Whether a loop descriptor should be shown as nested under a parent.
+///
+/// ParentLoopID == 0 is ambiguous in the descriptor encoding: it means "no
+/// parent" only for Loop #0 itself (and for fully-merged virtual loops); for
+/// every other regular loop it means the parent is Loop #0.
+static bool loopHasVisibleParent(const LoopDescriptor &LD) {
+  if (LD.ParentLoopID > 0)
+    return true;
+  if (LD.ParentLoopID == 0 && LD.LoopID != 0 && !LD.IsVirtual)
+    return true; // Regular loop: parent is Loop #0
+  if (LD.ParentLoopID == 0 && LD.IsVirtual && LD.MergedToOuterLoop > 0)
+    return true; // Partially merged virtual loop: parent is Loop #0
+  return false;
+}
+
+static void printLoopDescriptor(raw_ostream &OS, const LoopDescriptor &LD) {
+  OS << "Loop ID: " << LD.LoopID << "\n";
+
+  if (LD.Loc) {
+    OS << "  ├─ Source Location: ";
+    LD.Loc.print(OS);
+    OS << "\n";
+  }
+
+  if (loopHasVisibleParent(LD))
+    OS << "  ├─ Parent Loop: " << LD.ParentLoopID << " [Nesting Level]\n";
+
+  OS << "  ├─ Start Value: ";
+  if (LD.StartValue)
+    OS << *LD.StartValue;
+  else
+    OS << "unknown";
+  if (LD.IsStartLinked)
+    OS << "  [SL=1, LinkID=" << LD.StartLinkID << "]";
+  else
+    OS << "  [SL=0, Constant]";
+  OS << "\n";
+
+  OS << "  ├─ End Value:   ";
+  if (LD.EndValueDynamic && LD.IsEndLinked)
+    OS << *LD.EndValueDynamic << "   [EL=1, Dynamic, LinkID=" << LD.EndLinkID << "]";
+  else if (LD.EndValue)
+    OS << *LD.EndValue << "  [EL=0, Constant]";
+  else
+    OS << "unknown";
+  OS << "\n";
+
+  OS << "  └─ Step Value:  ";
+  if (LD.StepValue)
+    OS << *LD.StepValue;
+  else
+    OS << "unknown";
+  OS << "\n\n";
+}
+
+static void printDirectStreamDescriptor(raw_ostream &OS,
+                                        const DirectStreamDescriptor &DS) {
+  OS << "Stream ID: " << DS.StreamID << " (Loop " << DS.LoopID << ")\n";
+
+  if (DS.Loc) {
+    OS << "  ├─ Source Location: ";
+    DS.Loc.print(OS);
+    OS << "\n";
+  }
+
+  OS << "  ├─ Base Address: ";
+  if (DS.BaseAddress)
+    OS << *DS.BaseAddress;
+  else
+    OS << "unknown";
+  if (DS.IsBaseLinked)
+    OS << "   [BL=1, Dynamic, LinkID=" << DS.LinkID << "]";
+  OS << "\n";
+
+  OS << "  ├─ Stride:       " << DS.Stride << " bytes\n";
+
+  if (DS.MemInst)
+    OS << "  └─ Source:       " << *DS.MemInst << "\n";
+
+  OS << "\n";
+}
+
+static void printIndirectStreamDescriptor(raw_ostream &OS,
+                                          const IndirectStreamDescriptor &IS) {
+  OS << "Stream ID: " << IS.StreamID << " (Loop " << IS.LoopID << ")\n";
+
+  if (IS.Loc) {
+    OS << "  ├─ Source Location: ";
+    IS.Loc.print(OS);
+    OS << "\n";
+  }
+
+  OS << "  ├─ Base Address:   ";
+  if (IS.BaseAddressValue)
+    OS << *IS.BaseAddressValue;
+  if (IS.IsBaseLinked)
+    OS << "   [BL=1, Dynamic, LinkID=" << IS.LinkID << "]";
+  OS << "\n";
+
+  OS << "  ├─ Element Size:   " << IS.ElementSize << " bytes\n";
+
+  if (IS.IsIndexComputed)
+    OS << "  ├─ Index Type:     COMPUTED/RANDOM (no stream dependency)\n";
+  else
+    OS << "  ├─ Index Stream:   Stream #" << IS.BaseStreamID
+       << " (indices provided by this stream)\n";
+
+  if (IS.MemInst)
+    OS << "  └─ Source:         " << *IS.MemInst << "\n";
+
+  OS << "\n";
+}
+
+static void printLinkVariable(raw_ostream &OS, const LinkVariableDescriptor &LV) {
+  OS << "Link ID: " << LV.LinkID << "\n";
+  OS << "  ├─ IR Value:  ";
+  if (LV.DynamicValue)
+    OS << *LV.DynamicValue;
+  else
+    OS << "unknown";
+  OS << "\n";
+  OS << "  └─ Size:      " << LV.SizeInBytes << " bytes\n";
+  OS << "\n";
+}
+
+/// Print all loop and stream descriptors (Pass-1 summary and final summary).
 void printAllDescriptors(raw_ostream &OS,
                         const SmallVectorImpl<LoopDescriptor> &Loops,
                         const SmallVectorImpl<DirectStreamDescriptor> &Streams,
                         const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
                         const SmallVectorImpl<LinkVariableDescriptor> &LinkVars) {
-  
   OS << "\n╔═══════════════════════════════════════════════════════════════╗\n";
   OS << "║     Final Stream and Loop Descriptors                          ║\n";
   OS << "╚═══════════════════════════════════════════════════════════════╝\n";
-  
-  // Print Loop Descriptors
-  OS << "\n Loop Descriptors:\n";
-  OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-  
-  for (const auto &LD : Loops) {
-    // Virtual loops are presented as normal loops (no special marking)
-    OS << "Loop ID: " << LD.LoopID;
-    OS << "\n";
-    
-    if (LD.Loc) {
-      OS << "  ├─ Source Location: ";
-      LD.Loc.print(OS);
-      OS << "\n";
-    }
-    
-    // Check if this loop has a parent
-    // ParentLoopID field semantics:
-    //   - ParentLoopID > 0: Always has a parent (for both regular and virtual loops)
-    //   - ParentLoopID == 0 AND LoopID != 0 AND IsVirtual == false: Has parent Loop #0 (regular nested loop)
-    //   - ParentLoopID == 0 AND IsVirtual == true AND MergedToOuterLoop > 0: Has parent Loop #0 (nested virtual)
-    //   - ParentLoopID == 0 AND (LoopID == 0 OR (IsVirtual == true AND MergedToOuterLoop == 0)): NO parent
-    bool hasParent = false;
-    if (LD.ParentLoopID > 0) {
-      hasParent = true;
-    } else if (LD.ParentLoopID == 0 && LD.LoopID != 0 && !LD.IsVirtual) {
-      // Regular loop (not Loop #0) with ParentLoopID=0 means parent is Loop #0
-      hasParent = true;
-    } else if (LD.ParentLoopID == 0 && LD.IsVirtual && LD.MergedToOuterLoop > 0) {
-      // Virtual loop with partial merge: parent is Loop #0
-      hasParent = true;
-    }
-    
-    if (hasParent) {
-      OS << "  ├─ Parent Loop: " << LD.ParentLoopID << " [Nesting Level]\n";
-    }
-    
-    OS << "  ├─ Start Value: ";
-    if (LD.StartValue) {
-      OS << *LD.StartValue;
-    } else {
-      OS << "unknown";
-    }
-    if (LD.IsStartLinked) {
-      OS << "  [SL=1, LinkID=" << LD.StartLinkID << "]";
-    } else {
-      OS << "  [SL=0, Constant]";
-    }
-    OS << "\n";
-    
-    OS << "  ├─ End Value:   ";
-    if (LD.EndValueDynamic && LD.IsEndLinked) {
-      OS << *LD.EndValueDynamic;
-      OS << "   [EL=1, Dynamic, LinkID=" << LD.EndLinkID << "]";
-    } else if (LD.EndValue) {
-      OS << *LD.EndValue;
-      OS << "  [EL=0, Constant]";
-    } else {
-      OS << "unknown";
-    }
-    OS << "\n";
-    
-    OS << "  └─ Step Value:  ";
-    if (LD.StepValue) {
-      OS << *LD.StepValue;
-    } else {
-      OS << "unknown";
-    }
-    OS << "\n";
-    
-    OS << "\n";
+
+  if (!Loops.empty()) {
+    OS << "\n Loop Descriptors:\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    // Virtual loops are presented as normal loops (no special marking).
+    for (const auto &LD : Loops)
+      printLoopDescriptor(OS, LD);
   }
-  
-  // Print Direct Stream Descriptors
-  OS << "  Direct Streams:\n";
-  OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-  
-  for (const auto &DS : Streams) {
-    OS << "Stream ID: " << DS.StreamID << " (Loop " << DS.LoopID << ")\n";
-    
-    if (DS.Loc) {
-      OS << "  ├─ Source Location: ";
-      DS.Loc.print(OS);
-      OS << "\n";
-    }
-    
-    OS << "  ├─ Base Address: ";
-    if (DS.BaseAddress) {
-      OS << *DS.BaseAddress;
-    } else {
-      OS << "unknown";
-    }
-    if (DS.IsBaseLinked) {
-      OS << "   [BL=1, Dynamic, LinkID=" << DS.LinkID << "]";
-    }
-    OS << "\n";
-    
-    OS << "  ├─ Stride:       " << DS.Stride << " bytes\n";
-    
-    if (DS.MemInst) {
-      OS << "  └─ Source:       " << *DS.MemInst << "\n";
-    }
-    
-    OS << "\n";
+
+  if (!Streams.empty()) {
+    OS << "  Direct Streams:\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    for (const auto &DS : Streams)
+      printDirectStreamDescriptor(OS, DS);
   }
-  
-  // Print Indirect Streams if any
+
   if (!IndirectStreams.empty()) {
     OS << "  Indirect Streams:\n";
     OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    
-    for (const auto &IS : IndirectStreams) {
-      OS << "Stream ID: " << IS.StreamID << " (Loop " << IS.LoopID << ")\n";
-      
-      if (IS.Loc) {
-        OS << "  ├─ Source Location: ";
-        IS.Loc.print(OS);
-        OS << "\n";
-      }
-      
-      OS << "  ├─ Base Address:   ";
-      if (IS.BaseAddressValue) {
-        OS << *IS.BaseAddressValue;
-      }
-      if (IS.IsBaseLinked) {
-        OS << "   [BL=1, Dynamic, LinkID=" << IS.LinkID << "]";
-      }
-      OS << "\n";
-      
-      OS << "  ├─ Element Size:   " << IS.ElementSize << " bytes\n";
-      
-      if (IS.IsIndexComputed) {
-        OS << "  ├─ Index Type:     COMPUTED/RANDOM (no stream dependency)\n";
-      } else {
-        OS << "  ├─ Index Stream:   Stream #" << IS.BaseStreamID 
-           << " (indices provided by this stream)\n";
-      }
-      
-      if (IS.MemInst) {
-        OS << "  └─ Source:         " << *IS.MemInst << "\n";
-      }
-      
-      OS << "\n";
-    }
+    for (const auto &IS : IndirectStreams)
+      printIndirectStreamDescriptor(OS, IS);
   }
-  
-  // Print Link Variables
-  OS << "  Link Variable Descriptors:\n";
-  OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-  
-  for (const auto &LV : LinkVars) {
-    OS << "Link ID: " << LV.LinkID << "\n";
-    OS << "  ├─ IR Value:  ";
-    if (LV.DynamicValue) {
-      OS << *LV.DynamicValue;
-    } else {
-      OS << "unknown";
-    }
-    OS << "\n";
-    OS << "  └─ Size:      " << LV.SizeInBytes << " bytes\n";
-    OS << "\n";
+
+  if (!LinkVars.empty()) {
+    OS << "  Link Variable Descriptors:\n";
+    OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    for (const auto &LV : LinkVars)
+      printLinkVariable(OS, LV);
   }
-  
+
   OS << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
 }
 
