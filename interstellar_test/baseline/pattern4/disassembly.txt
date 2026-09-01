@@ -1,0 +1,84 @@
+
+test_backend.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <pattern4_struct_indirect>:
+       0: 4681         	li	a3, 0x0
+       2: 02061713     	slli	a4, a2, 0x20
+       6: 0c300293     	li	t0, 0xc3
+       a: 80229073     	csrw	0x802, t0
+       e: 4321         	li	t1, 0x8
+      10: 80331073     	csrw	0x803, t1
+      14: 9301         	srli	a4, a4, 0x20
+      16: 62c1         	lui	t0, 0x10
+      18: 0c328293     	addi	t0, t0, 0xc3
+      1c: 80429073     	csrw	0x804, t0
+      20: 4321         	li	t1, 0x8
+      22: 80531073     	csrw	0x805, t1
+      26: 000402b7     	lui	t0, 0x40
+      2a: 0c328293     	addi	t0, t0, 0xc3
+      2e: 80029073     	csrw	0x800, t0
+      32: 4311         	li	t1, 0x4
+      34: 80131073     	csrw	0x801, t1
+      38: 62a1         	lui	t0, 0x8
+      3a: 0c028293     	addi	t0, t0, 0xc0
+      3e: 80629073     	csrw	0x806, t0
+      42: 6341         	lui	t1, 0x10
+      44: 80731073     	csrw	0x807, t1
+      48: 62d1         	lui	t0, 0x14
+      4a: 3c128293     	addi	t0, t0, 0x3c1
+      4e: 80829073     	csrw	0x808, t0
+      52: 4311         	li	t1, 0x4
+      54: 80931073     	csrw	0x809, t1
+      58: 000242b7     	lui	t0, 0x24
+      5c: 0c228293     	addi	t0, t0, 0xc2
+      60: 80a29073     	csrw	0x80a, t0
+      64: 4331         	li	t1, 0xc
+      66: 80b31073     	csrw	0x80b, t1
+      6a: 12345737     	lui	a4, 0x12345
+      6e: 000242b7     	lui	t0, 0x24
+      72: 0c228293     	addi	t0, t0, 0xc2
+      76: 80c29073     	csrw	0x80c, t0
+      7a: 4331         	li	t1, 0xc
+      7c: 80d31073     	csrw	0x80d, t1
+      80: 67870713     	addi	a4, a4, 0x678
+      84: 001967b7     	lui	a5, 0x196
+      88: 3c6ef837     	lui	a6, 0x3c6ef
+      8c: 60d78793     	addi	a5, a5, 0x60d
+      90: 35f80813     	addi	a6, a6, 0x35f
+      94: a001         	j	0x94 <pattern4_struct_indirect+0x94>
+
+0000000000000096 <.LBB0_1>:
+      96: 02f70733     	mul	a4, a4, a5
+      9a: 9742         	add	a4, a4, a6
+      9c: 02c778bb     	remuw	a7, a4, a2
+      a0: 00289293     	slli	t0, a7, 0x2
+      a4: 088e         	slli	a7, a7, 0x3
+      a6: 9896         	add	a7, a7, t0
+      a8: 98ae         	add	a7, a7, a1
+      aa: 0088a283     	lw	t0, 0x8(a7)
+      ae: 06428293     	addi	t0, t0, 0x64
+      b2: 0058a423     	sw	t0, 0x8(a7)
+      b6: 2685         	addiw	a3, a3, 0x1
+      b8: 0511         	addi	a0, a0, 0x4
+
+00000000000000ba <.LBB0_2>:
+      ba: 00c6d063     	bge	a3, a2, 0xba <.LBB0_2>
+      be: 00052883     	lw	a7, 0x0(a0)
+      c2: 0008c063     	bltz	a7, 0xc2 <.LBB0_2+0x8>
+      c6: 00c8d063     	bge	a7, a2, 0xc6 <.LBB0_2+0xc>
+      ca: 00289293     	slli	t0, a7, 0x2
+      ce: 088e         	slli	a7, a7, 0x3
+      d0: 9896         	add	a7, a7, t0
+      d2: 98ae         	add	a7, a7, a1
+      d4: 0008a283     	lw	t0, 0x0(a7)
+      d8: 0048a303     	lw	t1, 0x4(a7)
+      dc: 02a9         	addi	t0, t0, 0xa
+      de: 0351         	addi	t1, t1, 0x14
+      e0: 0058a023     	sw	t0, 0x0(a7)
+      e4: 0068a223     	sw	t1, 0x4(a7)
+      e8: a001         	j	0xe8 <.LBB0_2+0x2e>
+
+00000000000000ea <.LBB0_6>:
+      ea: 8082         	ret

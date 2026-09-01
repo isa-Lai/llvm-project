@@ -1,0 +1,23 @@
+warn: Base 10 memory/cache size 2GB will be cast to base 2 size 2GiB.
+Global frequency set at 1000000000000 ticks per second
+src/mem/dram_interface.cc:690: warn: DRAM device capacity (8192 Mbytes) does not match the address range assigned (2048 Mbytes)
+src/arch/riscv/isa.cc:525: info: RVV enabled, VLEN = 256 bits, ELEN = 64 bits
+src/base/statistics.hh:279: warn: One of the stats is a legacy stat. Legacy stat is a stat that does not belong to any statistics::Group. Legacy stat is deprecated.
+src/base/remote_gdb.cc:418: warn: Sockets disabled, not accepting gdb connections
+gem5 Simulator System.  https://www.gem5.org
+gem5 is copyrighted software; use the --copyright option for details.
+
+gem5 version 25.1.0.1
+gem5 compiled Jul 29 2026 12:51:50
+gem5 started Sep  1 2026 14:47:51
+gem5 executing on pc-hassan-08.ece.mcmaster.ca, pid 3567335
+command line: build/RISCV/gem5.opt configs/example/golden_siminsts.py /home/laiy24/interstelar/llvm-project/interstellar_test/complete_test.riscv
+
+info: Standard input is not a terminal, disabling listeners.
+Beginning simulation!
+src/sim/syscall_emul.cc:97: warn: ignoring syscall set_robust_list(...)
+      (further warnings will be suppressed)
+src/sim/syscall_emul.hh:1127: warn: readlink() called on '/proc/self/exe' may yield unexpected results in various settings.
+      Returning '/home/laiy24/interstelar/llvm-project/interstellar_test/complete_test.riscv'
+Sum: 9900 (expected: 9900) Errors: 0
+Exiting @ tick 160658000 because exiting with last active thread context

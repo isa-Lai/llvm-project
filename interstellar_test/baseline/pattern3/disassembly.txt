@@ -1,0 +1,97 @@
+
+test_backend.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <pattern3_struct_direct>:
+       0: 4601         	li	a2, 0x0
+       2: 00850693     	addi	a3, a0, 0x8
+       6: 01050713     	addi	a4, a0, 0x10
+       a: 0c300293     	li	t0, 0xc3
+       e: 80229073     	csrw	0x802, t0
+      12: 4321         	li	t1, 0x8
+      14: 80331073     	csrw	0x803, t1
+      18: 02059513     	slli	a0, a1, 0x20
+      1c: 000302b7     	lui	t0, 0x30
+      20: 0c328293     	addi	t0, t0, 0xc3
+      24: 80429073     	csrw	0x804, t0
+      28: 4321         	li	t1, 0x8
+      2a: 80531073     	csrw	0x805, t1
+      2e: 9101         	srli	a0, a0, 0x20
+      30: 000402b7     	lui	t0, 0x40
+      34: 0c328293     	addi	t0, t0, 0xc3
+      38: 80629073     	csrw	0x806, t0
+      3c: 4321         	li	t1, 0x8
+      3e: 80731073     	csrw	0x807, t1
+      42: 0c300293     	li	t0, 0xc3
+      46: 80029073     	csrw	0x800, t0
+      4a: 4311         	li	t1, 0x4
+      4c: 80131073     	csrw	0x801, t1
+      50: 62a1         	lui	t0, 0x8
+      52: 0c028293     	addi	t0, t0, 0xc0
+      56: 80829073     	csrw	0x808, t0
+      5a: 6341         	lui	t1, 0x10
+      5c: 80931073     	csrw	0x809, t1
+      60: 62d1         	lui	t0, 0x14
+      62: 4c128293     	addi	t0, t0, 0x4c1
+      66: 80a29073     	csrw	0x80a, t0
+      6a: 4331         	li	t1, 0xc
+      6c: 80b31073     	csrw	0x80b, t1
+      70: 000242b7     	lui	t0, 0x24
+      74: 4c128293     	addi	t0, t0, 0x4c1
+      78: 80c29073     	csrw	0x80c, t0
+      7c: 4331         	li	t1, 0xc
+      7e: 80d31073     	csrw	0x80d, t1
+      82: 000342b7     	lui	t0, 0x34
+      86: 4c128293     	addi	t0, t0, 0x4c1
+      8a: 80e29073     	csrw	0x80e, t0
+      8e: 4331         	li	t1, 0xc
+      90: 80f31073     	csrw	0x80f, t1
+      94: 00b05063     	blez	a1, 0x94 <pattern3_struct_direct+0x94>
+      98: ff86a503     	lw	a0, -0x8(a3)
+      9c: ffc6a703     	lw	a4, -0x4(a3)
+      a0: 429c         	lw	a5, 0x0(a3)
+      a2: 0505         	addi	a0, a0, 0x1
+      a4: 0709         	addi	a4, a4, 0x2
+      a6: 078d         	addi	a5, a5, 0x3
+      a8: fea6ac23     	sw	a0, -0x8(a3)
+      ac: fee6ae23     	sw	a4, -0x4(a3)
+      b0: c29c         	sw	a5, 0x0(a3)
+      b2: 2605         	addiw	a2, a2, 0x1
+      b4: 06b1         	addi	a3, a3, 0xc
+      b6: feb641e3     	blt	a2, a1, 0x98 <pattern3_struct_direct+0x98>
+
+00000000000000ba <.LBB0_2>:
+      ba: 8082         	ret
+
+00000000000000bc <main>:
+      bc: 1141         	addi	sp, sp, -0x10
+      be: e406         	sd	ra, 0x8(sp)
+      c0: e022         	sd	s0, 0x0(sp)
+      c2: 03200513     	li	a0, 0x32
+      c6: 45b1         	li	a1, 0xc
+      c8: 00000097     	auipc	ra, 0x0
+      cc: 000080e7     	jalr	ra <main+0xc>
+      d0: 842a         	mv	s0, a0
+      d2: 03200593     	li	a1, 0x32
+      d6: 00000097     	auipc	ra, 0x0
+      da: 000080e7     	jalr	ra <main+0x1a>
+      de: 8522         	mv	a0, s0
+      e0: 00000097     	auipc	ra, 0x0
+      e4: 000080e7     	jalr	ra <main+0x24>
+      e8: 06400513     	li	a0, 0x64
+      ec: 45b1         	li	a1, 0xc
+      ee: 00000097     	auipc	ra, 0x0
+      f2: 000080e7     	jalr	ra <main+0x32>
+      f6: 842a         	mv	s0, a0
+      f8: 06400593     	li	a1, 0x64
+      fc: 00000097     	auipc	ra, 0x0
+     100: 000080e7     	jalr	ra <main+0x40>
+     104: 8522         	mv	a0, s0
+     106: 00000097     	auipc	ra, 0x0
+     10a: 000080e7     	jalr	ra <main+0x4a>
+     10e: 4501         	li	a0, 0x0
+     110: 60a2         	ld	ra, 0x8(sp)
+     112: 6402         	ld	s0, 0x0(sp)
+     114: 0141         	addi	sp, sp, 0x10
+     116: 8082         	ret

@@ -1,0 +1,30 @@
+==========================================
+InterStellar Backend Pipeline Test
+==========================================
+
+Testing with: patternA_loop_types.c
+
+Step 1: Compile C to LLVM IR (RISC-V target)...
+✅ Generated test_backend_input.ll
+
+Step 2: Run Phase 1 (InterStellarAnalysis)...
+✅ Generated test_backend_phase1.ll with @llvm.interstellar.configure.* intrinsics
+
+Step 3: Verify InterStellar intrinsics in IR...
+  Found 0 link intrinsics
+  Found 0 loop intrinsics
+  Found 0 direct stream intrinsics
+  Found 0 indirect stream intrinsics
+✅ Total: 0 InterStellar configuration intrinsics
+⚠️  Warning: No InterStellar intrinsics generated!
+
+Step 4: Run Python verification script...
+
+Analyzing: test_backend_phase1.ll
+
+======================================================================
+InterStellar Descriptor Verification
+======================================================================
+
+❌ No InterStellar configuration intrinsics found!
+   Make sure Phase 1 (InterStellarAnalysis) ran successfully.

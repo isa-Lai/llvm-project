@@ -1,0 +1,404 @@
+==========================================
+InterStellar Backend Pipeline Test
+==========================================
+
+Testing with: pattern6_3d_pointer.c
+
+Step 1: Compile C to LLVM IR (RISC-V target)...
+✅ Generated test_backend_input.ll
+
+Step 2: Run Phase 1 (InterStellarAnalysis)...
+✅ Generated test_backend_phase1.ll with @llvm.interstellar.configure.* intrinsics
+
+Step 3: Verify InterStellar intrinsics in IR...
+  Found 10 link intrinsics
+  Found 7 loop intrinsics
+  Found 8 direct stream intrinsics
+  Found 3 indirect stream intrinsics
+✅ Total: 28 InterStellar configuration intrinsics
+
+Step 4: Run Python verification script...
+
+Analyzing: test_backend_phase1.ll
+⚠️  Warning: Duplicate GlobalID 3 for Link
+⚠️  Warning: Duplicate GlobalID 0 for Link
+⚠️  Warning: Duplicate GlobalID 4 for Link
+⚠️  Warning: Duplicate GlobalID 5 for Loop
+⚠️  Warning: Duplicate GlobalID 6 for Loop
+⚠️  Warning: Duplicate GlobalID 7 for DirectStream
+
+======================================================================
+InterStellar Descriptor Verification
+======================================================================
+
+✅ Found 24 descriptor(s) (within 32 CSR limit)
+✅ All GlobalIDs within valid range [0, 31]
+✅ All descriptor references are valid
+
+======================================================================
+Descriptor Details
+======================================================================
+
+Link Descriptors (9):
+  Link[0]: ptr=%2, size=4
+  Link[0]: ptr=%2, size=4
+  Link[1]: ptr=%0, size=4
+  Link[2]: ptr=%1, size=4
+  Link[3]: ptr=%A, size=8
+  Link[3]: ptr=%1, size=4
+  Link[4]: ptr=%D3A, size=8
+  Link[4]: ptr=%3, size=4
+  Link[5]: ptr=%3, size=4
+
+Loop Descriptors (6):
+  Loop[5]: parent=0, bounds=[0:0], step=1 (inc)
+  Loop[6]: parent=0, bounds=[0:0], step=1 (inc)
+  Loop[6]: parent=0, bounds=[0:4], step=1 (inc)
+  Loop[7]: parent=0, bounds=[0:1], step=1 (inc)
+  Loop[8]: parent=7, bounds=[0:2], step=1 (inc)
+  Loop[9]: parent=0, bounds=[0:5], step=1 (inc)
+
+DirectStream Descriptors (7):
+  DirectStream[7]: loop=6, base=inttoptr (i64 3 to ptr), size=4 (W)
+  DirectStream[10]: loop=9, base=inttoptr (i64 1 to ptr), size=4 (W)
+  DirectStream[11]: loop=6, base=inttoptr (i64 3 to ptr), size=4 (W)
+  DirectStream[12]: loop=8, base=inttoptr (i64 1 to ptr), size=4 (W)
+  DirectStream[13]: loop=7, base=inttoptr (i64 3 to ptr), size=4 (W)
+  DirectStream[14]: loop=8, base=inttoptr (i64 2 to ptr), size=4 (W)
+  DirectStream[15]: loop=8, base=inttoptr (i64 3 to ptr), size=4 (W)
+
+IndirectStream Descriptors (2):
+  IndirectStream[16]: source=15, base=inttoptr (i64 4 to ptr), size=4 (W)
+  IndirectStream[17]: source=0, base=inttoptr (i64 4 to ptr), size=4 (W)
+
+======================================================================
+✅ All descriptors verified successfully!
+======================================================================
+
+Step 5: Parse and display all descriptors...
+
+============================================================
+INTERSTELLAR DESCRIPTOR ANALYSIS
+============================================================
+
+Total Descriptors: 24
+  - Link:           9
+  - Loop:           6
+  - Direct Stream:  7
+  - Indirect Stream: 2
+
+============================================================
+DETAILED DESCRIPTOR INFORMATION
+============================================================
+
+LINK DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #1:
+  Type: LINK
+  GlobalID: 1
+  ElementSize: 4 bytes
+
+Descriptor #2:
+  Type: LINK
+  GlobalID: 3
+  ElementSize: 8 bytes
+
+Descriptor #3:
+  Type: LINK
+  GlobalID: 2
+  ElementSize: 4 bytes
+
+Descriptor #4:
+  Type: LINK
+  GlobalID: 4
+  ElementSize: 8 bytes
+
+Descriptor #5:
+  Type: LINK
+  GlobalID: 0
+  ElementSize: 4 bytes
+
+Descriptor #6:
+  Type: LINK
+  GlobalID: 5
+  ElementSize: 4 bytes
+
+Descriptor #7:
+  Type: LINK
+  GlobalID: 3
+  ElementSize: 4 bytes
+
+Descriptor #8:
+  Type: LINK
+  GlobalID: 0
+  ElementSize: 4 bytes
+
+Descriptor #9:
+  Type: LINK
+  GlobalID: 4
+  ElementSize: 4 bytes
+
+LOOP DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #10:
+  Type: LOOP
+  GlobalID: 6
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: True
+  TripCountKnown: 0
+  TripCount: 0
+  UnrollFactor: 1
+
+Descriptor #11:
+  Type: LOOP
+  GlobalID: 7
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: True
+  TripCountKnown: 0
+  TripCount: 1
+  UnrollFactor: 1
+
+Descriptor #12:
+  Type: LOOP
+  GlobalID: 8
+  ParentLoopID: 7
+  IsInner: False
+  IsSequential: True
+  TripCountKnown: 0
+  TripCount: 2
+  UnrollFactor: 1
+
+Descriptor #13:
+  Type: LOOP
+  GlobalID: 9
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: True
+  TripCountKnown: 0
+  TripCount: 5
+  UnrollFactor: 1
+
+Descriptor #14:
+  Type: LOOP
+  GlobalID: 5
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: True
+  TripCountKnown: 0
+  TripCount: 0
+  UnrollFactor: 1
+
+Descriptor #15:
+  Type: LOOP
+  GlobalID: 6
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: True
+  TripCountKnown: 0
+  TripCount: 4
+  UnrollFactor: 1
+
+DIRECT STREAM DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #16:
+  Type: DIRECT STREAM
+  GlobalID: 10
+  ParentLoopID: 9
+  IsLoad: True
+  Stride: 1
+  LinkID: N/A
+
+Descriptor #17:
+  Type: DIRECT STREAM
+  GlobalID: 11
+  ParentLoopID: 6
+  IsLoad: True
+  Stride: 3
+  LinkID: N/A
+
+Descriptor #18:
+  Type: DIRECT STREAM
+  GlobalID: 12
+  ParentLoopID: 8
+  IsLoad: True
+  Stride: 1
+  LinkID: N/A
+
+Descriptor #19:
+  Type: DIRECT STREAM
+  GlobalID: 13
+  ParentLoopID: 7
+  IsLoad: True
+  Stride: 3
+  LinkID: N/A
+
+Descriptor #20:
+  Type: DIRECT STREAM
+  GlobalID: 14
+  ParentLoopID: 8
+  IsLoad: True
+  Stride: 2
+  LinkID: N/A
+
+Descriptor #21:
+  Type: DIRECT STREAM
+  GlobalID: 15
+  ParentLoopID: 8
+  IsLoad: True
+  Stride: 3
+  LinkID: N/A
+
+Descriptor #22:
+  Type: DIRECT STREAM
+  GlobalID: 7
+  ParentLoopID: 6
+  IsLoad: True
+  Stride: 3
+  LinkID: N/A
+
+INDIRECT STREAM DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #23:
+  Type: INDIRECT STREAM
+  GlobalID: 16
+  SourceStreamID: 15
+  IsLinked: True
+  ElementSize: 4 bytes
+  StreamSize: 0 bytes
+
+Descriptor #24:
+  Type: INDIRECT STREAM
+  GlobalID: 17
+  SourceStreamID: 0
+  IsLinked: True
+  ElementSize: 4 bytes
+  StreamSize: 0 bytes
+
+============================================================
+GLOBALID USAGE MAP
+============================================================
+
+Used GlobalIDs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+Total Unique: 18
+Hardware Limit: 32 CSRs (0x800-0x81F)
+Available: 14 CSRs remaining
+
+✅ Within hardware CSR limit
+
+============================================================
+DESCRIPTOR RELATIONSHIPS
+============================================================
+
+Loop → Stream Hierarchy:
+
+  Loop GlobalID=6
+    └─> DIRECTSTREAM GlobalID=11
+    └─> DIRECTSTREAM GlobalID=7
+
+  Loop GlobalID=7
+    └─> LOOP GlobalID=8
+    └─> DIRECTSTREAM GlobalID=13
+
+  Loop GlobalID=8
+    └─> DIRECTSTREAM GlobalID=12
+    └─> DIRECTSTREAM GlobalID=14
+    └─> DIRECTSTREAM GlobalID=15
+
+  Loop GlobalID=9
+    └─> DIRECTSTREAM GlobalID=10
+
+  Loop GlobalID=5
+    └─> (no streams)
+
+  Loop GlobalID=6
+    └─> DIRECTSTREAM GlobalID=11
+    └─> DIRECTSTREAM GlobalID=7
+
+============================================================
+✅ Descriptor parsing complete
+============================================================
+
+
+Step 6: Generate RISC-V assembly...
+Hard-float 'd' ABI can't be used for a target that doesn't support the D instruction set extension (ignoring target-abi)
+✅ Generated test_backend.s (500 lines)
+
+Step 7: Assemble to object file...
+✅ Generated test_backend.o (4672 bytes)
+
+Step 8: Verify object file structure...
+test_backend.o: ELF 64-bit LSB relocatable, UCB RISC-V, RVC, double-float ABI, version 1 (SYSV), not stripped
+
+Object file sections:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 2] .text             PROGBITS        0000000000000000 000040 00043c 00  AX  0   0  2
+  [ 3] .rela.text        RELA            0000000000000000 000920 0003f0 18   I  9   2  8
+
+Disassemble compiled function (first 30 instructions):
+
+test_backend.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <pattern6_3d_pointer>:
+       0: 7171         	addi	sp, sp, -0xb0
+       2: f506         	sd	ra, 0xa8(sp)
+       4: f122         	sd	s0, 0xa0(sp)
+       6: ed26         	sd	s1, 0x98(sp)
+       8: e94a         	sd	s2, 0x90(sp)
+       a: e54e         	sd	s3, 0x88(sp)
+       c: e152         	sd	s4, 0x80(sp)
+       e: fcd6         	sd	s5, 0x78(sp)
+      10: f8da         	sd	s6, 0x70(sp)
+      12: f4de         	sd	s7, 0x68(sp)
+      14: f0e2         	sd	s8, 0x60(sp)
+      16: ece6         	sd	s9, 0x58(sp)
+      18: e8ea         	sd	s10, 0x50(sp)
+      1a: e4ee         	sd	s11, 0x48(sp)
+      1c: 843e         	mv	s0, a5
+      1e: 8936         	mv	s2, a3
+      20: f832         	sd	a2, 0x30(sp)
+      22: 8a2e         	mv	s4, a1
+      24: e802         	sd	zero, 0x10(sp)
+      26: 4681         	li	a3, 0x0
+      28: 02e785b3     	mul	a1, a5, a4
+      2c: fc2e         	sd	a1, 0x38(sp)
+      2e: 03258633     	mul	a2, a1, s2
+      32: e0ba         	sd	a4, 0x40(sp)
+      34: 02071593     	slli	a1, a4, 0x20
+      38: 9181         	srli	a1, a1, 0x20
+      3a: 62c1         	lui	t0, 0x10
+      3c: 0c328293     	addi	t0, t0, 0xc3
+      40: 80229073     	csrw	0x802, t0
+      44: 4311         	li	t1, 0x4
+      46: 80331073     	csrw	0x803, t1
+      4a: 02079593     	slli	a1, a5, 0x20
+      4e: 9181         	srli	a1, a1, 0x20
+      50: e42a         	sd	a0, 0x8(sp)
+      52: 0c300293     	li	t0, 0xc3
+      56: 80629073     	csrw	0x806, t0
+      5a: 4321         	li	t1, 0x8
+      5c: 80731073     	csrw	0x807, t1
+      60: 62c1         	lui	t0, 0x10
+      62: 0c328293     	addi	t0, t0, 0xc3
+      66: 80429073     	csrw	0x804, t0
+      6a: 4311         	li	t1, 0x4
+      6c: 80531073     	csrw	0x805, t1
+      70: 02091593     	slli	a1, s2, 0x20
+
+==========================================
+Output Files Generated:
+==========================================
+  test_backend_input.ll   - Initial LLVM IR from Clang
+  test_backend_phase1.ll  - After InterStellarAnalysis (with intrinsics)
+  test_backend.s          - RISC-V assembly output
+  test_backend.o          - RISC-V object file
+
+==========================================
+Backend Test: COMPLETE ✅

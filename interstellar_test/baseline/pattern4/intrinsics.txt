@@ -1,0 +1,4 @@
+link:      4
+loop:      2
+direct:    2
+indirect:  3

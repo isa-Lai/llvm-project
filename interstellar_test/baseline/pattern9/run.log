@@ -1,0 +1,286 @@
+==========================================
+InterStellar Backend Pipeline Test
+==========================================
+
+Testing with: pattern9_mixed.c
+
+Step 1: Compile C to LLVM IR (RISC-V target)...
+✅ Generated test_backend_input.ll
+
+Step 2: Run Phase 1 (InterStellarAnalysis)...
+✅ Generated test_backend_phase1.ll with @llvm.interstellar.configure.* intrinsics
+
+Step 3: Verify InterStellar intrinsics in IR...
+  Found 5 link intrinsics
+  Found 4 loop intrinsics
+  Found 4 direct stream intrinsics
+  Found 3 indirect stream intrinsics
+✅ Total: 16 InterStellar configuration intrinsics
+
+Step 4: Run Python verification script...
+
+Analyzing: test_backend_phase1.ll
+
+======================================================================
+InterStellar Descriptor Verification
+======================================================================
+
+✅ Found 12 descriptor(s) (within 32 CSR limit)
+✅ All GlobalIDs within valid range [0, 31]
+✅ All descriptor references are valid
+
+======================================================================
+Descriptor Details
+======================================================================
+
+Link Descriptors (4):
+  Link[0]: ptr=%A, size=8
+  Link[1]: ptr=%B, size=8
+  Link[2]: ptr=%points, size=8
+  Link[6]: ptr=poison, size=8
+
+Loop Descriptors (3):
+  Loop[7]: parent=0, bounds=[0:0], step=1 (dec)
+  Loop[8]: parent=0, bounds=[0:10], step=1 (dec)
+  Loop[9]: parent=0, bounds=[0:10], step=1 (dec)
+
+DirectStream Descriptors (3):
+  DirectStream[10]: loop=7, base=null, size=4 (W)
+  DirectStream[11]: loop=7, base=inttoptr (i64 2 to ptr), size=12 (W)
+  DirectStream[15]: loop=8, base=inttoptr (i64 6 to ptr), size=4 (W)
+
+IndirectStream Descriptors (2):
+  IndirectStream[16]: source=0, base=inttoptr (i64 1 to ptr), size=4 (W)
+  IndirectStream[17]: source=0, base=inttoptr (i64 2 to ptr), size=12 (W)
+
+======================================================================
+✅ All descriptors verified successfully!
+======================================================================
+
+Step 5: Parse and display all descriptors...
+
+============================================================
+INTERSTELLAR DESCRIPTOR ANALYSIS
+============================================================
+
+Total Descriptors: 12
+  - Link:           4
+  - Loop:           3
+  - Direct Stream:  3
+  - Indirect Stream: 2
+
+============================================================
+DETAILED DESCRIPTOR INFORMATION
+============================================================
+
+LINK DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #1:
+  Type: LINK
+  GlobalID: 0
+  ElementSize: 8 bytes
+
+Descriptor #2:
+  Type: LINK
+  GlobalID: 2
+  ElementSize: 8 bytes
+
+Descriptor #3:
+  Type: LINK
+  GlobalID: 6
+  ElementSize: 8 bytes
+
+Descriptor #4:
+  Type: LINK
+  GlobalID: 1
+  ElementSize: 8 bytes
+
+LOOP DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #5:
+  Type: LOOP
+  GlobalID: 7
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: False
+  TripCountKnown: 0
+  TripCount: 0
+  UnrollFactor: 1
+
+Descriptor #6:
+  Type: LOOP
+  GlobalID: 8
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: False
+  TripCountKnown: 0
+  TripCount: 10
+  UnrollFactor: 1
+
+Descriptor #7:
+  Type: LOOP
+  GlobalID: 9
+  ParentLoopID: 0
+  IsInner: False
+  IsSequential: False
+  TripCountKnown: 0
+  TripCount: 10
+  UnrollFactor: 1
+
+DIRECT STREAM DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #8:
+  Type: DIRECT STREAM
+  GlobalID: 10
+  ParentLoopID: 7
+  IsLoad: True
+  Stride: N/A
+  LinkID: N/A
+
+Descriptor #9:
+  Type: DIRECT STREAM
+  GlobalID: 11
+  ParentLoopID: 7
+  IsLoad: True
+  Stride: 2
+  LinkID: N/A
+
+Descriptor #10:
+  Type: DIRECT STREAM
+  GlobalID: 15
+  ParentLoopID: 8
+  IsLoad: True
+  Stride: 6
+  LinkID: N/A
+
+INDIRECT STREAM DESCRIPTORS:
+------------------------------------------------------------
+
+Descriptor #11:
+  Type: INDIRECT STREAM
+  GlobalID: 16
+  SourceStreamID: 0
+  IsLinked: True
+  ElementSize: 4 bytes
+  StreamSize: 0 bytes
+
+Descriptor #12:
+  Type: INDIRECT STREAM
+  GlobalID: 17
+  SourceStreamID: 0
+  IsLinked: True
+  ElementSize: 12 bytes
+  StreamSize: 0 bytes
+
+============================================================
+GLOBALID USAGE MAP
+============================================================
+
+Used GlobalIDs: [0, 1, 2, 6, 7, 8, 9, 10, 11, 15, 16, 17]
+Total Unique: 12
+Hardware Limit: 32 CSRs (0x800-0x81F)
+Available: 20 CSRs remaining
+
+✅ Within hardware CSR limit
+
+============================================================
+DESCRIPTOR RELATIONSHIPS
+============================================================
+
+Loop → Stream Hierarchy:
+
+  Loop GlobalID=7
+    └─> DIRECTSTREAM GlobalID=10
+    └─> DIRECTSTREAM GlobalID=11
+
+  Loop GlobalID=8
+    └─> DIRECTSTREAM GlobalID=15
+
+  Loop GlobalID=9
+    └─> (no streams)
+
+============================================================
+✅ Descriptor parsing complete
+============================================================
+
+
+Step 6: Generate RISC-V assembly...
+Hard-float 'd' ABI can't be used for a target that doesn't support the D instruction set extension (ignoring target-abi)
+✅ Generated test_backend.s (274 lines)
+
+Step 7: Assemble to object file...
+✅ Generated test_backend.o (3840 bytes)
+
+Step 8: Verify object file structure...
+test_backend.o: ELF 64-bit LSB relocatable, UCB RISC-V, RVC, double-float ABI, version 1 (SYSV), not stripped
+
+Object file sections:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 2] .text             PROGBITS        0000000000000000 000040 0002b2 00  AX  0   0  2
+  [ 3] .rela.text        RELA            0000000000000000 000668 000408 18   I  9   2  8
+
+Disassemble compiled function (first 30 instructions):
+
+test_backend.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <pattern9_mixed>:
+       0: 1101         	addi	sp, sp, -0x20
+       2: ec22         	sd	s0, 0x18(sp)
+       4: e826         	sd	s1, 0x10(sp)
+       6: e44a         	sd	s2, 0x8(sp)
+       8: e04e         	sd	s3, 0x0(sp)
+       a: 4781         	li	a5, 0x0
+       c: 4801         	li	a6, 0x0
+       e: 0c300293     	li	t0, 0xc3
+      12: 80029073     	csrw	0x800, t0
+      16: 4321         	li	t1, 0x8
+      18: 80131073     	csrw	0x801, t1
+      1c: 000202b7     	lui	t0, 0x20
+      20: 0c328293     	addi	t0, t0, 0xc3
+      24: 80429073     	csrw	0x804, t0
+      28: 4321         	li	t1, 0x8
+      2a: 80531073     	csrw	0x805, t1
+      2e: 0c300293     	li	t0, 0xc3
+      32: 80c29073     	csrw	0x80c, t0
+      36: 4321         	li	t1, 0x8
+      38: 80d31073     	csrw	0x80d, t1
+      3c: 62c1         	lui	t0, 0x10
+      3e: 0c328293     	addi	t0, t0, 0xc3
+      42: 80229073     	csrw	0x802, t0
+      46: 4321         	li	t1, 0x8
+      48: 80331073     	csrw	0x803, t1
+      4c: 0c000293     	li	t0, 0xc0
+      50: 80e29073     	csrw	0x80e, t0
+      54: 6341         	lui	t1, 0x10
+      56: 80f31073     	csrw	0x80f, t1
+      5a: 4295         	li	t0, 0x5
+      5c: 12c6         	slli	t0, t0, 0x31
+      5e: 0c028293     	addi	t0, t0, 0xc0
+      62: 81029073     	csrw	0x810, t0
+      66: 81131073     	csrw	0x811, t1
+      6a: 4295         	li	t0, 0x5
+      6c: 12c6         	slli	t0, t0, 0x31
+      6e: 0c028293     	addi	t0, t0, 0xc0
+      72: 81229073     	csrw	0x812, t0
+      76: 81331073     	csrw	0x813, t1
+      7a: 6291         	lui	t0, 0x4
+      7c: 7c128293     	addi	t0, t0, 0x7c1
+      80: 81429073     	csrw	0x814, t0
+      84: 4311         	li	t1, 0x4
+      86: 81531073     	csrw	0x815, t1
+
+==========================================
+Output Files Generated:
+==========================================
+  test_backend_input.ll   - Initial LLVM IR from Clang
+  test_backend_phase1.ll  - After InterStellarAnalysis (with intrinsics)
+  test_backend.s          - RISC-V assembly output
+  test_backend.o          - RISC-V object file
+
+==========================================
+Backend Test: COMPLETE ✅
