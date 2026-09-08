@@ -42,11 +42,13 @@ def parse_intrinsic_call(line):
     # Extract arguments based on descriptor type
     args = {}
     
-    # Find all integer arguments in order
+    # Find all integer arguments in order, but exclude those inside inttoptr
+    # First, remove inttoptr patterns to avoid matching their internal constants
+    line_without_inttoptr = re.sub(r'inttoptr\s*\([^)]+\)', 'ptr', line)
     int_args = []
-    for match in re.finditer(r'i(?:32|64)\s+(\d+)', line):
+    for match in re.finditer(r'i(?:32|64)\s+(\d+)', line_without_inttoptr):
         int_args.append(int(match.group(1)))
-    
+
     if descriptor_type == 'link':
         # link(i32 GlobalID, ptr base, i32 element_size)
         if len(int_args) >= 2:
@@ -85,21 +87,19 @@ def parse_intrinsic_call(line):
                 args['LinkID'] = int_args[3]
     
     elif descriptor_type == 'indirectstream':
-        # indirectstream(i32 GlobalID, i32 ParentLoopID, i1 is_load, ptr stride, i32 LinkID, i32 IndexLinkID)
+        # indirectstream(i32 GlobalID, i32 SourceStreamID, i1 BL, ptr Base, i32 ElementSize, i32 StreamSize)
+        # int_args matches all i32/i64 values: [GlobalID, SourceStreamID, ElementSize, StreamSize]
         if len(int_args) >= 4:
             args['GlobalID'] = int_args[0]
-            args['ParentLoopID'] = int_args[1]
+            args['SourceStreamID'] = int_args[1]
             # Extract boolean value
             bool_match = re.search(r'i1\s+(true|false)', line)
             if bool_match:
-                args['IsLoad'] = bool_match.group(1) == 'true'
-            stride_match = re.search(r'inttoptr\s+\(i64\s+(\d+)', line)
-            if stride_match:
-                args['Stride'] = int(stride_match.group(1))
-            if len(int_args) >= 5:
-                args['LinkID'] = int_args[3]
-                args['IndexLinkID'] = int_args[4]
-    
+                args['IsLinked'] = bool_match.group(1) == 'true'
+            # ElementSize and StreamSize are the 3rd and 4th int args (indices 2 and 3)
+            args['ElementSize'] = int_args[2]
+            args['StreamSize'] = int_args[3]
+
     return {
         'type': descriptor_type,
         'line': line.strip(),
@@ -140,12 +140,11 @@ def format_descriptor(desc):
         lines.append(f"  LinkID: {args.get('LinkID', 'N/A')}")
     
     elif desc_type == 'indirectstream':
-        lines.append(f"  ParentLoopID: {args.get('ParentLoopID', 'N/A')}")
-        lines.append(f"  IsLoad: {args.get('IsLoad', 'N/A')}")
-        lines.append(f"  Stride: {args.get('Stride', 'N/A')}")
-        lines.append(f"  LinkID: {args.get('LinkID', 'N/A')}")
-        lines.append(f"  IndexLinkID: {args.get('IndexLinkID', 'N/A')}")
-    
+        lines.append(f"  SourceStreamID: {args.get('SourceStreamID', 'N/A')}")
+        lines.append(f"  IsLinked: {args.get('IsLinked', 'N/A')}")
+        lines.append(f"  ElementSize: {args.get('ElementSize', 'N/A')} bytes")
+        lines.append(f"  StreamSize: {args.get('StreamSize', 'N/A')} bytes")
+
     return '\n'.join(lines)
 
 def main():
