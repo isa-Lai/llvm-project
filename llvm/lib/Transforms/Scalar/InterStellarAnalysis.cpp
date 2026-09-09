@@ -4028,6 +4028,37 @@ static ErasedOrphanCounts eraseOrphanConfigs(
   return Erased;
 }
 
+/// Analysis IDs of indirect streams that must not be lowered to descriptors.
+/// A stream whose target array has no statically-known bound (StreamSize == 0)
+/// would leave the hardware unable to bound the addresses it touches, so it is
+/// not emitted. Any indirect stream that consumes indices from a dropped
+/// stream is dropped too — its SourceStreamID would otherwise name a
+/// descriptor that is never emitted (A[B[C[i]]] chains).
+static DenseSet<unsigned>
+computeUnboundedIndirectDrops(
+    const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams) {
+  DenseSet<unsigned> Dropped;
+  for (const auto &IDS : IndirectStreams)
+    if (IDS.StreamSize == 0)
+      Dropped.insert(IDS.StreamID);
+
+  // Fixpoint: consumers of dropped index providers drop as well. Computed /
+  // random indices name no source stream (BaseStreamID is meaningless).
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (const auto &IDS : IndirectStreams) {
+      if (IDS.IsIndexComputed || Dropped.count(IDS.StreamID))
+        continue;
+      if (Dropped.count(IDS.BaseStreamID)) {
+        Dropped.insert(IDS.StreamID);
+        Changed = true;
+      }
+    }
+  }
+  return Dropped;
+}
+
 void injectDescriptorIR(
     Function &F,
     const SmallVectorImpl<LoopDescriptor> &Loops,
@@ -4053,6 +4084,12 @@ void injectDescriptorIR(
       M, Intrinsic::interstellar_configure_indirectstream);
   
   LLVM_DEBUG(dbgs() << "\n[IR Generation] Emitting intrinsic calls:\n");
+
+  // Unbounded indirect streams (StreamSize == 0) and their chained consumers
+  // are never lowered; they must not reach the grouping below, or their link
+  // variables would be emitted as orphans.
+  DenseSet<unsigned> DroppedIndirectIDs =
+      computeUnboundedIndirectDrops(IndirectStreams);
 
   // Precompute lookup tables to avoid repeated O(N^2) scans.
   DenseMap<unsigned, const LoopDescriptor *> LoopDescByID;
@@ -4137,6 +4174,11 @@ void injectDescriptorIR(
   
   // Collect indirect stream descriptors per anchor loop.
   for (const auto &IDS : IndirectStreams) {
+    if (DroppedIndirectIDs.count(IDS.StreamID)) {
+      LLVM_DEBUG(dbgs() << "    Skipping Indirect Stream #" << IDS.StreamID
+                        << ": unknown array bound (StreamSize=0)\n");
+      continue;
+    }
     auto LDIt = LoopDescByID.find(IDS.LoopID);
     if (LDIt == LoopDescByID.end())
       continue;
