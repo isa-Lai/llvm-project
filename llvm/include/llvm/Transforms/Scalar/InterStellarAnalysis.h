@@ -30,11 +30,10 @@ class Instruction;
 class Value;
 
 /// InterStellar Analysis Pass for New Pass Manager
-class InterStellarAnalysisPass : public PassInfoMixin<InterStellarAnalysisPass> {
+class InterStellarAnalysisPass
+    : public RequiredPassInfoMixin<InterStellarAnalysisPass> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
-
-  static bool isRequired() { return true; }
 };
 
 /// InterStellar Analysis Pass for Legacy Pass Manager
