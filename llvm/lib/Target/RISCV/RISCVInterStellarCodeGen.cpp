@@ -71,13 +71,18 @@ private:
   /// Extract physical register number from a machine operand
   unsigned getPhysRegNumber(const MachineOperand &MO);
 
-  /// Generate CSR write instructions for a binary descriptor
+  /// Generate CSR write instructions for a binary descriptor.
+  /// SnapshotRegNum (optional): architectural register number the hardware
+  /// snapshots when the LOW CSR write lands (Link descriptors). The low-word
+  /// scratch must never be that register, or the snapshot reads the
+  /// descriptor constant instead of the linked value.
   void emitDescriptorCSRWrites(MachineBasicBlock &MBB,
                                MachineBasicBlock::iterator MBBI,
                                const DebugLoc &DL,
                                unsigned GlobalID,
                                uint64_t DescriptorHigh,
-                               uint64_t DescriptorLow);
+                               uint64_t DescriptorLow,
+                               unsigned SnapshotRegNum = 0);
 
   /// Process pseudo-instructions (post-RA)
   bool processLinkPseudo(MachineBasicBlock &MBB, MachineInstr &MI);
@@ -105,22 +110,19 @@ unsigned RISCVInterStellarCodeGen::getPhysRegNumber(const MachineOperand &MO) {
   if (!Reg.isPhysical())
     return 0;
 
-  unsigned Enc = TRI->getEncodingValue(Reg);
-
-  // Use compact argument-register indexing for link payload compatibility:
-  // a0..a7 -> 0..7.
-  if (Enc >= 10 && Enc <= 17)
-    return Enc - 10;
-
-  // Fallback to architectural register index.
-  return Enc;
+  // Always return the architectural encoding so the gem5 CPU side can index
+  // the integer register file unambiguously when it snapshots a Link
+  // descriptor's base at CSR-write time (0 = x0 = null/invalid base,
+  // 1..31 = x1..x31). The previous compact remap (a0..a7 -> 0..7) collided
+  // with the x0 sentinel and with architectural x1..x7.
+  return TRI->getEncodingValue(Reg);
 }
 
 void RISCVInterStellarCodeGen::emitDescriptorCSRWrites(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
     const DebugLoc &DL, unsigned GlobalID, uint64_t DescriptorHigh,
-    uint64_t DescriptorLow) {
-  
+    uint64_t DescriptorLow, unsigned SnapshotRegNum) {
+
   // InterStellar CSRs use RV64 pair mapping per GlobalID:
   //   base = 0x800 + (2 * GlobalID)
   //   base + 0 : bits [63:0]   (becomes desc_word[0], contains type at bits [5:0])
@@ -136,6 +138,14 @@ void RISCVInterStellarCodeGen::emitDescriptorCSRWrites(
     // FIXME: Replace fixed registers with register scavenging.
     Register TempRegLow = RISCV::X5;
     Register TempRegHigh = RISCV::X6;
+
+    // The LOW CSR write triggers the hardware snapshot of SnapshotRegNum
+    // (Link descriptors). If RA happened to allocate the linked value to our
+    // low-word scratch (X5 is attractive: the pseudos declare it as a Def),
+    // materializing the descriptor word into it destroys the value before
+    // the CSR write can snapshot it — steer the scratch away from it.
+    if (SnapshotRegNum == TRI->getEncodingValue(RISCV::X5))
+      TempRegLow = RISCV::X6;
 
     // Materialize and write low 64 bits first.
     TII->movImm(MBB, MBBI, DL, TempRegLow, DescriptorLow);
@@ -195,8 +205,11 @@ bool RISCVInterStellarCodeGen::processLinkPseudo(MachineBasicBlock &MBB,
                                    (0x0ULL << 16);               // Reserved in bits [63:16]
 
   auto MBBI = MachineBasicBlock::iterator(MI);
-  emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);
-  
+  // RegNum is the register the hardware snapshots for the linked value —
+  // keep it intact through the LOW write (see emitDescriptorCSRWrites).
+  emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow,
+                          RegNum);
+
   return true;
 }
 
@@ -285,7 +298,14 @@ bool RISCVInterStellarCodeGen::processDirectStreamPseudo(MachineBasicBlock &MBB,
   // DescriptorLow (becomes desc_word[0]): [5:0]=Type(1), [6]=Valid(1), [7]=Active(1),
   //                                      [13:8]=LoopID(6), [14]=BL, [15]=S(0),
   //                                      [79:16]=BaseAddress(64)
-  // DescriptorHigh (becomes desc_word[1]): [15:0]=Stride(16), [63:16]=Reserved(0)
+  // DescriptorHigh (becomes desc_word[1]): [15:0]=BaseAddress[63:48] (0 for
+  //                                        canonical VAs), [31:16]=Stride(16),
+  //                                        [63:32]=Reserved(0)
+  // The stride occupies descriptor bits [80:95] = desc_word[1][31:16], per the
+  // MISA_DirStreamDesc_t ABI (base_metaisa.hpp / metaisa.hpp): baseAddr is a
+  // uint64 at descriptor bytes [2:9], stride a uint16 at bytes [10:11]. The
+  // previous emission placed the stride at desc_word[1][15:0], which the engine
+  // reads as the top 16 bits of baseAddr, and left the ABI stride field 0.
   uint64_t DescriptorLow = ((0x01ULL & 0x3FULL) << 0) |  // Type=1 in bits [5:0]
                            (0x1ULL << 6) |                 // Valid in bit [1]
                            (0x1ULL << 7) |                 // Active in bit [0]
@@ -294,8 +314,8 @@ bool RISCVInterStellarCodeGen::processDirectStreamPseudo(MachineBasicBlock &MBB,
                            (0x0ULL << 15) |                // S in bit [15] (unsupported)
                            (maskN(BaseAddress, 64) << 16); // BaseAddress in bits [79:16]
 
-  uint64_t DescriptorHigh = maskN(Stride, 16) |   // Stride in bits [15:0]
-                           (0x0ULL << 16);       // Reserved in bits [63:16]
+  uint64_t DescriptorHigh = (maskN(Stride, 16) << 16) | // Stride in bits [31:16]
+                            (0x0ULL << 0);              // BaseAddress[63:48] = 0
 
   auto MBBI = MachineBasicBlock::iterator(MI);
   emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);
@@ -338,8 +358,14 @@ bool RISCVInterStellarCodeGen::processIndirectStreamPseudo(MachineBasicBlock &MB
   // DescriptorLow (becomes desc_word[0]): [5:0]=Type(2), [6]=Valid(1), [7]=Active(1),
   //                                      [13:8]=SourceStreamID(6), [14]=BL, [15]=S(0),
   //                                      [79:16]=BaseAddress(64)
-  // DescriptorHigh (becomes desc_word[1]): [15:0]=ElementSize(16), [47:16]=StreamSize(32),
-  //                                       [63:48]=Reserved(0)
+  // DescriptorHigh (becomes desc_word[1]): [15:0]=BaseAddress[63:48] (0 for
+  //                                        canonical VAs), [31:16]=Stride
+  //                                        (=ElementSize), [63:32]=StreamSize(32)
+  // Same ABI mapping as the direct stream (MISA_IndirStreamDesc_t): the engine
+  // reads the stride at descriptor bits [80:95] = desc_word[1][31:16]; the
+  // previous emission put ElementSize at desc_word[1][15:0], i.e. the top 16
+  // bits of baseAddr. StreamSize has no v20 ABI slot; it lives in reserved
+  // bits [95:64] for future engine-side consumption.
   uint64_t DescriptorLow = ((0x02ULL & 0x3FULL) << 0) |  // Type=2 in bits [5:0]
                            (0x1ULL << 6) |                 // Valid in bit [1]
                            (0x1ULL << 7) |                 // Active in bit [0]
@@ -348,9 +374,9 @@ bool RISCVInterStellarCodeGen::processIndirectStreamPseudo(MachineBasicBlock &MB
                            (0x0ULL << 15) |                // S in bit [15] (unsupported)
                            (maskN(BaseAddress, 64) << 16); // BaseAddress in bits [79:16]
 
-  uint64_t DescriptorHigh = maskN(ElementSize, 16) |   // ElementSize in bits [15:0]
-                            (maskN(StreamSize, 32) << 16) | // StreamSize in bits [47:16]
-                            (0x0ULL << 48);                 // Reserved in bits [63:48]
+  uint64_t DescriptorHigh = (maskN(ElementSize, 16) << 16) | // Stride=ElementSize [31:16]
+                            (maskN(StreamSize, 32) << 32) |  // StreamSize in bits [63:32]
+                            (0x0ULL << 0);                   // BaseAddress[63:48] = 0
 
   auto MBBI = MachineBasicBlock::iterator(MI);
   emitDescriptorCSRWrites(MBB, MBBI, DL, GlobalID, DescriptorHigh, DescriptorLow);

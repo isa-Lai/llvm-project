@@ -306,9 +306,10 @@ private:
   bool isEffectivelyLoopInvariant(const SCEV *S, Loop *L);
   Value *extractDynamicValue(const SCEV *S, Loop *L);
   int64_t getTypeSizeInBytes(Type *Ty);
-  void createDirectStream(const SCEV *Base, int64_t Stride, Loop *L, 
+  void createDirectStream(const SCEV *Base, int64_t Stride, Loop *L,
                          Instruction *MemInst, int64_t ConstantOffset = 0,
                          Value *ExplicitBaseValue = nullptr);
+  void dropBaseDeliveryLoadStream(LoadInst *BaseLoad);
 };
 
 bool InterStellarStreamAnalyzer::analyze() {
@@ -2258,6 +2259,12 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
     unsigned Size = sizeInBytesForLink(BaseVal->getType(), F.getDataLayout());
     DS.LinkID = getOrCreateLinkID(BaseVal, Size);
     ++NumDynamicBases;
+
+    // This stream claims the load's value as its linked base; if the load was
+    // itself raised into a stream, that stream describes the pointer array
+    // the load walks, not the data (see dropBaseDeliveryLoadStream).
+    if (auto *BaseLoad = dyn_cast<LoadInst>(BaseVal))
+      dropBaseDeliveryLoadStream(BaseLoad);
   } else if (isa<SCEVAddExpr>(AdjustedBase)) {
     // A non-linked composite base such as (20 + @GlobalArray) still needs a
     // concrete IR value for emission; materialize it where links live.
@@ -2274,7 +2281,6 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
   DirectStreams.push_back(DS);
   InstToStreamIDMap[MemInst] = DS.StreamID;
   ++NumDirectStreams;
-  
   LLVM_DEBUG({
     dbgs() << "  Created Direct Stream:\n";
     dbgs() << "    Stream ID: " << DS.StreamID << "\n";
@@ -2289,6 +2295,56 @@ void InterStellarStreamAnalyzer::createDirectStream(const SCEV *Base,
     dbgs() << "    Stride: " << Stride << " bytes\n";
     dbgs() << "    Base Linked: " << DS.IsBaseLinked << "\n";
   });
+}
+
+/// Drop the direct stream of a pointer-load that exists only to deliver the
+/// base of another stream (called with the consumer's linked base value).
+/// The canonical shape is A[i][j] over double **A: the row-pointer load A[i]
+/// feeds the inner store stream's link, so the data reaches the engine
+/// through that link -- a stream of its own would describe the pointer-array
+/// walk, not the data. Fires only when the loaded pointers never surface as
+/// data: every use of the load must be a GEP pointer operand and every use
+/// of those GEPs a load/store pointer operand. The consumer keeps the link,
+/// so nothing is lost. Requires the load's stream to already exist (loops
+/// are analyzed outermost-first, so the base-delivery load is seen first).
+void InterStellarStreamAnalyzer::dropBaseDeliveryLoadStream(
+    LoadInst *BaseLoad) {
+  for (User *U : BaseLoad->users()) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(U);
+    if (!GEP || GEP->getPointerOperand() != BaseLoad)
+      return;
+    for (User *GU : GEP->users()) {
+      Instruction *Mem = dyn_cast<Instruction>(GU);
+      if (!Mem)
+        return;
+      if (auto *MemLoad = dyn_cast<LoadInst>(Mem)) {
+        if (MemLoad->getPointerOperand() != GEP)
+          return;
+      } else if (auto *MemStore = dyn_cast<StoreInst>(Mem)) {
+        if (MemStore->getPointerOperand() != GEP)
+          return;
+      } else {
+        return;
+      }
+    }
+  }
+
+  auto MapIt = InstToStreamIDMap.find(BaseLoad);
+  if (MapIt == InstToStreamIDMap.end())
+    return;  // the load never got a stream of its own
+
+  auto DSIt = llvm::find_if(DirectStreams, [&](const DirectStreamDescriptor &D) {
+    return D.StreamID == MapIt->second;
+  });
+  if (DSIt == DirectStreams.end())
+    return;  // the load backs an indirect stream (index source) -- keep it
+
+  LLVM_DEBUG(dbgs() << "  Dropping base-delivery load stream #" << MapIt->second
+                    << ": load only feeds the consumer's link: " << *BaseLoad
+                    << "\n");
+  DirectStreams.erase(DSIt);
+  InstToStreamIDMap.erase(MapIt);
+  --NumDirectStreams;
 }
 
 void InterStellarStreamAnalyzer::print(raw_ostream &OS) const {
@@ -2537,7 +2593,8 @@ static void generateHardwareDescriptorIR(
     const SmallVectorImpl<LoopDescriptor> &Loops,
     const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
     const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
-    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars);
+    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
+    DominatorTree &DT);
 
 //===----------------------------------------------------------------------===//
 // InterStellarAnalysisPass Implementation (New Pass Manager)
@@ -3065,6 +3122,32 @@ for (const auto &DS : Ctx.Streams) {
       }
     }
 
+    // Type-normalized retry: the trip count usually arrives in i32 while the
+    // parent pointer step is i64 (GEP arithmetic widens indices), so
+    // `8 * %m` (i32) never pointer-equals `8 * zext(i32 %m to i64)` (i64)
+    // even for a perfectly contiguous runtime-bound nest (double A[n][m]).
+    // Rebuild the span in the step's integer type — zext first: array
+    // dimensions are non-negative, which is the extension the pointer
+    // arithmetic itself used.
+    if (!IsPotentiallyLinearizable && BaseStep) {
+      auto *StepTy = dyn_cast<IntegerType>(BaseStep->getType());
+      if (StepTy && InnerTripCount->getType() != StepTy) {
+        for (bool ZeroExt : {true, false}) {
+          const SCEV *WidenedTrip =
+              ZeroExt ? Ctx.SE.getZeroExtendExpr(InnerTripCount, StepTy)
+                      : Ctx.SE.getSignExtendExpr(InnerTripCount, StepTy);
+          const SCEV *WidenedSpan =
+              Ctx.SE.getMulExpr(WidenedTrip, Ctx.SE.getConstant(StepTy, DS.Stride));
+          if (WidenedSpan == BaseStep) {
+            IsPotentiallyLinearizable = true;
+            LLVM_DEBUG(dbgs() << "    ✓ " << (ZeroExt ? "zext" : "sext")
+                              << "-normalized span matches step - linearizable!\n");
+            break;
+          }
+        }
+      }
+    }
+
     if (IsPotentiallyLinearizable) {
       StreamMergeCandidate Candidate;
       Candidate.StreamID = DS.StreamID;
@@ -3521,9 +3604,37 @@ if (!Ctx.MergeCandidates.empty()) {
             // address is no longer needed and may not even correspond to the
             // flattened base. Partially flattened bases keep their link.
             if (isa<SCEVUnknown>(Flat)) {
-              DS.BaseAddressValue = nullptr; // re-derive from SCEV in IR-gen
-              DS.IsBaseLinked = false;
-              DS.LinkID = 0;
+              // A runtime pointer base (e.g. a malloc'd pointer parameter)
+              // cannot be materialized into a constant descriptor word — it
+              // must travel as a BL=1 link. Point that link at the ARRAY
+              // START (loop-invariant: linked once at the preheader) instead
+              // of the outer-variant row GEP the old link carried.
+              Value *ArrayStart = cast<SCEVUnknown>(Flat)->getValue();
+              if (ArrayStart->getType()->isPointerTy()) {
+                DS.IsBaseLinked = true;
+                DS.BaseAddressValue = ArrayStart;
+                unsigned ExistingLinkID = 0;
+                for (const auto &LV : Ctx.LinkVars)
+                  if (LV.DynamicValue == ArrayStart)
+                    ExistingLinkID = LV.LinkID;
+                if (ExistingLinkID) {
+                  DS.LinkID = ExistingLinkID;
+                } else {
+                  LinkVariableDescriptor LVD;
+                  LVD.LinkID = Ctx.NextLinkID++;
+                  LVD.DynamicValue = ArrayStart;
+                  LVD.SizeInBytes = 8; // a pointer
+                  Ctx.LinkVars.push_back(LVD);
+                  DS.LinkID = LVD.LinkID;
+                }
+                LLVM_DEBUG(dbgs()
+                           << "      → Array-start base linked via Link #"
+                           << DS.LinkID << "\n");
+              } else {
+                DS.BaseAddressValue = nullptr; // re-derive from SCEV in IR-gen
+                DS.IsBaseLinked = false;
+                DS.LinkID = 0;
+              }
             }
             LLVM_DEBUG(dbgs() << "      → Base flattened to " << *Flat << "\n");
           }
@@ -3790,7 +3901,7 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
   if (!Ctx.LinkVars.empty() || !Ctx.Loops.empty() ||
       !Ctx.Streams.empty() || !Ctx.IndirectStreams.empty()) {
     generateHardwareDescriptorIR(F, Ctx.Loops, Ctx.Streams,
-                                 Ctx.IndirectStreams, Ctx.LinkVars);
+                                 Ctx.IndirectStreams, Ctx.LinkVars, Ctx.DT);
   } else {
     LLVM_DEBUG(dbgs() << "No descriptors to generate IR for\n");
   }
@@ -3805,9 +3916,27 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
 
 namespace {
 
+/// First GlobalID available to compiler-discovered descriptors.
+///
+/// CSR slots 0-31 (0x800-0x81F) are reserved for hand-written
+/// `write_csr(0x800..)` descriptors that benchmarks compile into the same
+/// binary. The pass cannot see those inline-asm writes at IR level, so
+/// allocating auto IDs from 0 collided with them: the auto setup executed
+/// after the manual block and last-write-wins in the engine's parseCSR
+/// silently disabled the manual streams (atax: 3 of 4 direct streams lost,
+/// 86 vs 4138 iBatches, +4.0% -> -0.2% IPC; fixed 2026-09-12).
+///
+/// Upper bound: descriptor ID fields are 6 bits and the engine encodes
+/// NO_PARENT as 63, so GlobalIDs must stay in [0, 62]. Auto range is
+/// 32-62 => at most 31 auto descriptors when manual descriptors occupy
+/// 0-31. The CSR range itself (0x800-0x8C7 = 100 slots, DescTable
+/// MAX_ENTRIES=100) is wider and not the binding constraint.
+static constexpr unsigned AUTO_DESC_ID_BASE = 32;
+static constexpr unsigned MAX_DESC_GLOBALID = 63;  // exclusive: 6-bit fields, 63 = NO_PARENT
+
 /// Build ID remapping tables: Analysis IDs → Unified GlobalIDs
-/// Assigns sequential GlobalIDs starting from 0 across all descriptor types.
-/// Order: Links → Loops → DirectStreams → IndirectStreams
+/// Assigns sequential GlobalIDs starting from AUTO_DESC_ID_BASE across all
+/// descriptor types. Order: Links → Loops → DirectStreams → IndirectStreams
 void buildIDRemappingTables(
     const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
     const SmallVectorImpl<LoopDescriptor> &Loops,
@@ -3819,7 +3948,7 @@ void buildIDRemappingTables(
     DenseMap<unsigned, unsigned> &IndirectIDMap,
     unsigned &TotalDescriptorCount) {
   
-  unsigned NextGlobalID = 0;  // Single global counter starting from 0
+  unsigned NextGlobalID = AUTO_DESC_ID_BASE;  // 0-31 reserved for manual write_csr descriptors
   
   LLVM_DEBUG(dbgs() << "\n[ID Remapping] Assigning unified GlobalIDs:\n");
   
@@ -3858,11 +3987,15 @@ void buildIDRemappingTables(
   TotalDescriptorCount = NextGlobalID;
   LLVM_DEBUG(dbgs() << "\nTotal descriptors: " << TotalDescriptorCount << "\n");
   
-  // Validate: Must not exceed hardware limit (32 CSRs: 0x800-0x81F)
-  if (TotalDescriptorCount > 32) {
-    report_fatal_error("InterStellar: Total descriptors (" + 
-                       Twine(TotalDescriptorCount) + 
-                       ") exceeds hardware limit (32)");
+  // Validate: highest GlobalID must stay below the 6-bit ID field limit
+  // (63 doubles as the engine's NO_PARENT sentinel). Slots 0-31 belong to
+  // manual write_csr descriptors, so the pass has 32-62 available.
+  if (NextGlobalID > MAX_DESC_GLOBALID) {
+    report_fatal_error("InterStellar: Total descriptors (" +
+                       Twine(TotalDescriptorCount) +
+                       ") exceed the auto-ID range 32-62 (slots 0-31 are "
+                       "reserved for manual write_csr descriptors; GlobalIDs "
+                       "must stay below 63 = NO_PARENT sentinel)");
   }
 }
 
@@ -4059,6 +4192,76 @@ computeUnboundedIndirectDrops(
   return Dropped;
 }
 
+/// True for instructions that can be cloned to an earlier point without
+/// changing semantics: pure address/index arithmetic. Deliberately excludes
+/// loads/calls (side effects, speculation risk) and PHIs (loop-carried).
+static bool isHoistableForBase(const Instruction *I) {
+  if (isa<PHINode>(I))
+    return false;
+  return I->isBinaryOp() || isa<GetElementPtrInst>(I) || isa<CastInst>(I) ||
+         isa<SelectInst>(I);
+}
+
+/// Clone the computation of \p V to just before \p InsertPt so the link's
+/// base value is materialized at that site. Instructions that already dominate
+/// the insertion point are used directly (roots); the rest of the chain is
+/// cloned through hoistable pure ops (address/index arithmetic). Returns the
+/// cloned computation of \p V, or nullptr when the chain depends on something
+/// that can neither be used directly nor hoisted (loop-carried PHI, load,
+/// call). The clone re-executes every time \p InsertPt's block runs — once per
+/// iteration of the consumer loop — so the hardware's per-execution link
+/// snapshot always sees the current base (PER_ROW_LINK_EMISSION_PLAN.md
+/// Phase 2).
+static Instruction *tryHoistValueToSite(Value *V, Instruction *InsertPt,
+                                        DominatorTree &DT) {
+  SmallPtrSet<Instruction *, 16> Visited;
+  SmallVector<std::pair<Instruction *, bool>, 16> DFS; // inst, operands done
+  SmallVector<Instruction *, 16> Chain;                // operands before users
+  bool OK = true;
+  auto Push = [&](Value *X) {
+    auto *I = dyn_cast<Instruction>(X);
+    if (!I || Visited.count(I) || !OK)
+      return;
+    Visited.insert(I);
+    if (DT.dominates(I, InsertPt))
+      return; // already available at the site — root, use directly
+    if (!isHoistableForBase(I)) {
+      OK = false; // loop-carried PHI, load, call: cannot materialize here
+      return;
+    }
+    DFS.push_back({I, false});
+  };
+  Push(V);
+  while (!DFS.empty() && OK) {
+    auto &[I, OperandsDone] = DFS.back();
+    if (!OperandsDone) {
+      OperandsDone = true;
+      for (Value *Op : I->operands())
+        Push(Op);
+      continue;
+    }
+    Chain.push_back(I);
+    DFS.pop_back();
+  }
+  if (!OK)
+    return nullptr;
+  // Clone operands-first, rewiring uses to the fresh clones.
+  DenseMap<Value *, Value *> Rewire;
+  Instruction *Result = nullptr;
+  for (Instruction *I : Chain) {
+    Instruction *New = I->clone();
+    for (unsigned K = 0; K < New->getNumOperands(); ++K)
+      if (auto *Old = dyn_cast<Instruction>(New->getOperand(K)))
+        if (auto It = Rewire.find(Old); It != Rewire.end())
+          New->setOperand(K, It->second);
+    New->insertBefore(InsertPt->getIterator());
+    New->setName(I->getName() + ".ista");
+    Rewire[I] = New;
+    Result = New;
+  }
+  return Result;
+}
+
 void injectDescriptorIR(
     Function &F,
     const SmallVectorImpl<LoopDescriptor> &Loops,
@@ -4068,7 +4271,8 @@ void injectDescriptorIR(
     const DenseMap<unsigned, unsigned> &LoopIDMap,
     const DenseMap<unsigned, unsigned> &StreamIDMap,
     const DenseMap<unsigned, unsigned> &IndirectIDMap,
-    const DenseMap<unsigned, unsigned> &LinkIDMap) {
+    const DenseMap<unsigned, unsigned> &LinkIDMap,
+    DominatorTree &DT) {
   
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
@@ -4215,6 +4419,30 @@ void injectDescriptorIR(
     }
   }
   
+  // LinkID -> loop whose stream consumes it as a linked base (first consumer).
+  // For loop-variant link values the per-row delivery site is that loop's
+  // preheader: it re-executes once per consumer iteration (once per row), so
+  // the hardware's per-execution register snapshot always sees the current base.
+  DenseMap<unsigned, Loop *> ConsumerLoopByLink;
+  for (const auto &Entry : StreamsByLoop)
+    for (const auto *DS : Entry.second)
+      if (DS->IsBaseLinked && !ConsumerLoopByLink.count(DS->LinkID))
+        if (auto It = LoopDescByID.find(DS->LoopID); It != LoopDescByID.end())
+          ConsumerLoopByLink[DS->LinkID] = It->second->L;
+  for (const auto &Entry : IndirectByLoop)
+    for (const auto *IDS : Entry.second)
+      if (IDS->IsBaseLinked && !ConsumerLoopByLink.count(IDS->LinkID))
+        if (auto It = LoopDescByID.find(IDS->LoopID); It != LoopDescByID.end())
+          ConsumerLoopByLink[IDS->LinkID] = It->second->L;
+
+  // Per-row link delivery: LinkID -> the emitted link call for a link whose
+  // value is computed inside the loop. The hardware re-snapshots a link's
+  // register at every execution of the link instruction and re-binds BASEVA
+  // on every BL=1 stream insert, so such links are valid -- and required for
+  // row coverage -- when the pair executes per iteration at the value's site
+  // (PER_ROW_LINK_EMISSION_PLAN.md Phase 2). Consumer streams are emitted at
+  // the recorded call so the snapshot is fresh at insert.
+  DenseMap<unsigned, CallInst *> PerRowLinkSites;
   // Track which descriptors we've already emitted (to avoid duplicates)
   DenseSet<unsigned> EmittedLinkIDs;
   DenseSet<unsigned> EmittedLoopIDs;
@@ -4250,34 +4478,67 @@ void injectDescriptorIR(
       // Check if the dynamic value dominates the preheader insertion point
       // This is critical: the value must be available before we use it
       Value *ValueArg = LV->DynamicValue;
+      Instruction *PerRowDef = nullptr;
+      Instruction *HoistSite = nullptr;
       if (Instruction *ValueInst = dyn_cast<Instruction>(ValueArg)) {
         // Check if instruction is in the loop (not preheader)
         if (L->contains(ValueInst->getParent())) {
-          // The instruction is inside the loop, so it doesn't dominate the preheader
-          // We need to materialize a loop-invariant version
-          LLVM_DEBUG(dbgs() << "    Warning: Link value is loop-variant, skipping: " 
-                            << *ValueArg << "\n");
-          // Skip this link - the stream should use non-linked mode
-          continue;
+          // Loop-variant value. The hardware re-snapshots the link's register
+          // at every execution of the link L-word, so the link is valid — and
+          // required for row coverage — as long as the link executes at a
+          // site that sees the current base. Preference order:
+          //   1. hoist a pure clone of the computation to the consumer
+          //      stream's loop preheader (re-executes once per row);
+          //   2. emit right after the value's own definition, if that block
+          //      dominates the loop header (site runs every iteration);
+          //   3. otherwise the site may not run every iteration — skip.
+          Loop *ConsumerLoop = ConsumerLoopByLink.lookup(LV->LinkID);
+          Instruction *Target = nullptr;
+          if (ConsumerLoop && ConsumerLoop->getLoopPreheader())
+            Target = ConsumerLoop->getLoopPreheader()->getTerminator();
+          Instruction *Hoisted =
+              Target ? tryHoistValueToSite(ValueInst, Target, DT) : nullptr;
+          if (Hoisted) {
+            ValueArg = Hoisted;
+            HoistSite = Hoisted; // link belongs at the hoist site, not the anchor
+          } else if (DT.dominates(ValueInst->getParent(), L->getHeader())) {
+            PerRowDef = ValueInst;
+          } else {
+            LLVM_DEBUG(dbgs()
+                       << "    Warning: Link value is loop-variant and cannot be "
+                       << "hoisted or placed per-row; skipping: "
+                       << *ValueArg << "\n");
+            continue;
+          }
         }
       }
-      
-      LLVM_DEBUG(dbgs() << "    Link GlobalID=" << GlobalID 
-                        << " (Analysis ID=" << LV->LinkID << ")\n");
-      
+
+      // Site-placed links (per-row defs, hoisted clones) emit right after the
+      // value they snapshot; everything else lands at the anchor preheader,
+      // before its terminator.
+      IRBuilder<> LinkBuilder(PerRowDef ? PerRowDef->getNextNode()
+                              : HoistSite ? HoistSite->getNextNode()
+                                          : Preheader->getTerminator());
+
+      LLVM_DEBUG(dbgs() << "    Link GlobalID=" << GlobalID
+                        << " (Analysis ID=" << LV->LinkID << ")"
+                        << (PerRowDef ? " [per-row]\n" : "\n"));
+
       // Prepare the value argument - must be a pointer type
       if (!ValueArg->getType()->isPointerTy()) {
         // If not already a pointer, cast it to pointer
-        ValueArg = Builder.CreateIntToPtr(ValueArg, PointerType::getUnqual(Ctx));
+        ValueArg = LinkBuilder.CreateIntToPtr(ValueArg, PointerType::getUnqual(Ctx));
       }
-      
+
       // Emit: call void @llvm.interstellar.configure.link(i32 GlobalID, ptr value, i32 size)
-      CallInst *LinkCall = Builder.CreateCall(ConfigLinkFn, {
-        Builder.getInt32(GlobalID),
+      CallInst *LinkCall = LinkBuilder.CreateCall(ConfigLinkFn, {
+        LinkBuilder.getInt32(GlobalID),
         ValueArg,
-        Builder.getInt32(LV->SizeInBytes)
+        LinkBuilder.getInt32(LV->SizeInBytes)
       });
       LinkCalls.push_back({LinkCall, LV->LinkID});
+      if (PerRowDef || HoistSite)
+        PerRowLinkSites[LV->LinkID] = LinkCall;
 
       EmittedLinkIDs.insert(LV->LinkID);
     }
@@ -4349,37 +4610,50 @@ void injectDescriptorIR(
     // 3. Emit Direct Stream Descriptor configurations
     for (const auto *DS : StreamsByLoop[L]) {
       if (EmittedStreamIDs.count(DS->StreamID)) continue;  // Skip duplicates
-      
+
       unsigned GlobalID = StreamIDMap.lookup(DS->StreamID);
       unsigned LoopGlobalID = LoopIDMap.lookup(DS->LoopID);
-      
+
+      // Per-row delivery: when this stream's base link is emitted inside the
+      // loop (loop-variant base re-snapshotted per iteration), the stream
+      // pair must execute at the same site so BASEVA re-binds on every pass.
+      Instruction *SiteCall = nullptr;
+      if (DS->IsBaseLinked) {
+        auto It = PerRowLinkSites.find(DS->LinkID);
+        if (It != PerRowLinkSites.end())
+          SiteCall = It->second;
+      }
+      IRBuilder<> StreamBuilder(SiteCall ? SiteCall->getNextNode()
+                                         : Preheader->getTerminator());
+
       // Check if this stream references a link that wasn't emitted (loop-variant)
       bool ActuallyLinked = resolveActuallyLinked(DS->IsBaseLinked, DS->LinkID,
                                                   EmittedLinkIDs, DS->StreamID,
                                                   "Stream");
 
       std::optional<Value *> BaseArg = prepareStreamBaseArg(
-          Builder, L, ActuallyLinked, DS->LinkID, LinkIDMap,
+          StreamBuilder, L, ActuallyLinked, DS->LinkID, LinkIDMap,
           DS->BaseAddressValue, DS->BaseAddress, DS->StreamID);
       if (!BaseArg)
         continue; // loop-variant base - skip this stream entirely
-      
-      LLVM_DEBUG(dbgs() << "    DirectStream GlobalID=" << GlobalID 
+
+      LLVM_DEBUG(dbgs() << "    DirectStream GlobalID=" << GlobalID
                         << " (Analysis ID=" << DS->StreamID << ")"
                         << " Loop=" << LoopGlobalID
                         << " BL=" << ActuallyLinked
                         << " BaseAddr=" << **BaseArg
-                        << " Stride=" << DS->Stride << "\n");
-      
+                        << " Stride=" << DS->Stride
+                        << (SiteCall ? " [per-row]\n" : "\n"));
+
       // Emit: call void @llvm.interstellar.configure.directstream(globalid, loop, BL, base, stride)
-      Builder.CreateCall(ConfigDirectStreamFn, {
-        Builder.getInt32(GlobalID),
-        Builder.getInt32(LoopGlobalID),
-        Builder.getInt1(ActuallyLinked),
+      StreamBuilder.CreateCall(ConfigDirectStreamFn, {
+        StreamBuilder.getInt32(GlobalID),
+        StreamBuilder.getInt32(LoopGlobalID),
+        StreamBuilder.getInt1(ActuallyLinked),
         *BaseArg,
-        Builder.getInt32(DS->Stride)
+        StreamBuilder.getInt32(DS->Stride)
       });
-      
+
       EmittedStreamIDs.insert(DS->StreamID);
     }
     
@@ -4401,32 +4675,43 @@ void injectDescriptorIR(
           SourceStreamGlobalID = IndirectIDMap.lookup(IDS->BaseStreamID);
       }
       
+      // Per-row delivery (same rule as direct streams above).
+      Instruction *SiteCall = nullptr;
+      if (IDS->IsBaseLinked) {
+        auto It = PerRowLinkSites.find(IDS->LinkID);
+        if (It != PerRowLinkSites.end())
+          SiteCall = It->second;
+      }
+      IRBuilder<> StreamBuilder(SiteCall ? SiteCall->getNextNode()
+                                         : Preheader->getTerminator());
+
       // Check if this stream references a link that wasn't emitted (loop-variant)
       bool ActuallyLinked = resolveActuallyLinked(IDS->IsBaseLinked, IDS->LinkID,
                                                   EmittedLinkIDs, IDS->StreamID,
                                                   "Indirect stream");
 
       std::optional<Value *> BaseArg = prepareStreamBaseArg(
-          Builder, L, ActuallyLinked, IDS->LinkID, LinkIDMap,
+          StreamBuilder, L, ActuallyLinked, IDS->LinkID, LinkIDMap,
           IDS->BaseAddressValue, IDS->BaseAddress, IDS->StreamID);
       if (!BaseArg)
         continue; // loop-variant base - skip this stream entirely
-      
-      LLVM_DEBUG(dbgs() << "    IndirectStream GlobalID=" << GlobalID 
+
+      LLVM_DEBUG(dbgs() << "    IndirectStream GlobalID=" << GlobalID
                         << " (Analysis ID=" << IDS->StreamID << ")"
                         << " SourceStream=" << SourceStreamGlobalID
                         << " BL=" << ActuallyLinked
                         << " BaseAddr=" << **BaseArg
-                        << " ElemSize=" << IDS->ElementSize << "\n");
-      
+                        << " ElemSize=" << IDS->ElementSize
+                        << (SiteCall ? " [per-row]\n" : "\n"));
+
       // Emit: call void @llvm.interstellar.configure.indirectstream(globalid, source, BL, base, elemsize, streamsize)
-      Builder.CreateCall(ConfigIndirectStreamFn, {
-        Builder.getInt32(GlobalID),
-        Builder.getInt32(SourceStreamGlobalID),
-        Builder.getInt1(ActuallyLinked),
+      StreamBuilder.CreateCall(ConfigIndirectStreamFn, {
+        StreamBuilder.getInt32(GlobalID),
+        StreamBuilder.getInt32(SourceStreamGlobalID),
+        StreamBuilder.getInt1(ActuallyLinked),
         *BaseArg,
-        Builder.getInt32(IDS->ElementSize),
-        Builder.getInt32(IDS->StreamSize)  // Stream size (0 = unknown)
+        StreamBuilder.getInt32(IDS->ElementSize),
+        StreamBuilder.getInt32(IDS->StreamSize)  // Stream size (0 = unknown)
       });
       
       EmittedIndirectIDs.insert(IDS->StreamID);
@@ -4455,7 +4740,8 @@ static void generateHardwareDescriptorIR(
     const SmallVectorImpl<LoopDescriptor> &Loops,
     const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
     const SmallVectorImpl<IndirectStreamDescriptor> &IndirectStreams,
-    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars) {
+    const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
+    DominatorTree &DT) {
   
   // Step 1: Build ID remapping tables (Analysis IDs → GlobalIDs)
   DenseMap<unsigned, unsigned> LinkIDMap;
@@ -4470,7 +4756,7 @@ static void generateHardwareDescriptorIR(
   
   // Step 2: Inject intrinsic calls into loop preheaders
   injectDescriptorIR(F, Loops, DirectStreams, IndirectStreams, LinkVars,
-                    LoopIDMap, StreamIDMap, IndirectIDMap, LinkIDMap);
+                    LoopIDMap, StreamIDMap, IndirectIDMap, LinkIDMap, DT);
 }
 
 //===----------------------------------------------------------------------===//

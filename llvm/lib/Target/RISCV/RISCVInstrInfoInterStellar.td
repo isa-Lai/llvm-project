@@ -23,7 +23,14 @@
 // use GPR for all operands.
 //===----------------------------------------------------------------------===//
 
-let hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1 in {
+// Defs = [X5, X6]: the post-RA expander (RISCVInterStellarCodeGen.cpp
+// emitDescriptorCSRWrites) materializes descriptor words in t0 (X5) / t1 (X6)
+// and CSRRWs them to the descriptor CSRs (rd = x0). Declaring the clobber
+// makes RA keep live values out of t0/t1 across every config point. Without
+// this, an expansion landing between a lui+addi constant-materialization pair
+// corrupts the constant (bicg kernel_bicg A-row-stride bug: loop walked with
+// a garbage stride -> SE page-table fault).
+let Defs = [X5, X6], hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1 in {
 
 // InterStellar Link Configuration
 // configure.link(GlobalID, ptr, Size)
