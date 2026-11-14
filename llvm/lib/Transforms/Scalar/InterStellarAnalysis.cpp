@@ -506,10 +506,17 @@ void InterStellarStreamAnalyzer::analyzeLoop(Loop *L) {
             }
           } else if (!isa<SCEVCouldNotCompute>(BTC)) {
             // No compare captured; derive End = Start + BTC * Step.
-            if (LD.StepValue)
+            if (LD.StepValue) {
+              Type *WiderTy =
+                  SE.getWiderType(BTC->getType(), LD.StepValue->getType());
+              const SCEV *CastedBTC = SE.getNoopOrZeroExtend(BTC, WiderTy);
+              const SCEV *CastedStep =
+                  SE.getNoopOrSignExtend(LD.StepValue, WiderTy);
+              const SCEV *CastedStart =
+                  SE.getNoopOrZeroExtend(LD.StartValue, WiderTy);
               LD.EndValue = SE.getAddExpr(
-                  LD.StartValue, SE.getMulExpr(BTC, LD.StepValue));
-            else
+                  CastedStart, SE.getMulExpr(CastedBTC, CastedStep));
+            } else
               LD.EndValue = SE.getAddExpr(LD.StartValue, BTC);
           }
 
@@ -2685,109 +2692,123 @@ static const SCEVAddRecExpr *findAddRecForLoop(const SCEV *S,
   return nullptr;
 }
 
-/// Stage 1.1 (direct): group same-signature streams (LoopID, base SCEV,
-/// stride) and keep only the dominating instruction's stream.
+/// Stage 1.1 (direct): group streams accessing the same underlying array,
+/// merge overlapping and continuous stencil access patterns, and eliminate
+/// subsumed/inclusive redundant streams.
 static void deduplicateDirectStreams(InterstellarPipelineContext &Ctx) {
-  LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Redundancy Analysis\n");
+  LLVM_DEBUG(dbgs() << "\n[Stage 1.1] Direct Stream Merging & Redundancy Analysis\n");
 
-  SmallVector<SmallVector<unsigned, 2>, 4> StreamGroups;
-  SmallVector<bool, 8> Processed(Ctx.Streams.size(), false);
+  if (Ctx.Streams.empty())
+    return;
 
-for (size_t i = 0; i < Ctx.Streams.size(); ++i) {
-  if (Processed[i])
-    continue;
+  SmallPtrSet<const DirectStreamDescriptor *, 8> StreamsToRemove;
+  DenseMap<unsigned, unsigned> RemovedToPrimary; // duplicate StreamID -> primary
 
-  const auto &DS_i = Ctx.Streams[i];
-  SmallVector<unsigned, 2> Group;
-  Group.push_back(i);
-  Processed[i] = true;
+  // Iteratively find pairs or groups of streams that can be merged or subsumed
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
 
-  // Find all streams with matching signature
-  for (size_t j = i + 1; j < Ctx.Streams.size(); ++j) {
-    if (Processed[j])
-      continue;
+    for (size_t i = 0; i < Ctx.Streams.size(); ++i) {
+      if (StreamsToRemove.count(&Ctx.Streams[i]))
+        continue;
+      auto &DS_i = Ctx.Streams[i];
 
-    const auto &DS_j = Ctx.Streams[j];
-    if (DS_i.LoopID == DS_j.LoopID &&
-        DS_i.BaseAddress == DS_j.BaseAddress &&
-        DS_i.Stride == DS_j.Stride) {
-      Group.push_back(j);
-      Processed[j] = true;
+      for (size_t j = i + 1; j < Ctx.Streams.size(); ++j) {
+        if (StreamsToRemove.count(&Ctx.Streams[j]))
+          continue;
+        auto &DS_j = Ctx.Streams[j];
+
+        // Only compare streams with matching Stride in the same loop
+        if (DS_i.Stride != DS_j.Stride || DS_i.Stride == 0)
+          continue;
+        if (DS_i.LoopID != DS_j.LoopID)
+          continue;
+
+        // Check if both streams access the same underlying array (constant difference in SCEV)
+        const SCEV *Diff = Ctx.SE.getMinusSCEV(DS_j.BaseAddress, DS_i.BaseAddress);
+        if (!isa<SCEVConstant>(Diff))
+          continue;
+
+        int64_t OffsetBytes = cast<SCEVConstant>(Diff)->getAPInt().getSExtValue();
+        int64_t Stride = DS_i.Stride;
+
+        // 1. Exact Duplicate (OffsetBytes == 0)
+        if (OffsetBytes == 0) {
+          Instruction *Inst_i = DS_i.MemInst;
+          Instruction *Inst_j = DS_j.MemInst;
+          bool KeepI = true;
+          if (Inst_i && Inst_j && Ctx.DT.dominates(Inst_j, Inst_i))
+            KeepI = false;
+
+          if (KeepI) {
+            StreamsToRemove.insert(&DS_j);
+            RemovedToPrimary[DS_j.StreamID] = DS_i.StreamID;
+            LLVM_DEBUG(dbgs() << "  [Exact Duplicate] Removing Stream #" << DS_j.StreamID
+                              << " -> keeping Primary #" << DS_i.StreamID << "\n");
+          } else {
+            StreamsToRemove.insert(&DS_i);
+            RemovedToPrimary[DS_i.StreamID] = DS_j.StreamID;
+            LLVM_DEBUG(dbgs() << "  [Exact Duplicate] Removing Stream #" << DS_i.StreamID
+                              << " -> keeping Primary #" << DS_j.StreamID << "\n");
+            Changed = true;
+            break; // DS_i removed, move to next i
+          }
+          Changed = true;
+          continue;
+        }
+
+        // 2. Overlapping / Expanding Merge and Inclusivity Elimination
+        // Check if the offset indicates accesses to the same array
+        // (same loop stencil neighborhood: |OffsetBytes| <= 64 * |Stride| or exact stride multiple)
+        bool StrideAligned = (OffsetBytes % Stride == 0);
+        bool InStencilNeighborhood = (std::abs(OffsetBytes) <= 64 * std::abs(Stride));
+        if (StrideAligned || InStencilNeighborhood) {
+          // If OffsetBytes > 0: DS_i starts earlier in memory.
+          // DS_j is either completely inclusive in DS_i, or extends DS_i forward.
+          // Merge: DS_i is kept as primary; DS_j is merged into DS_i.
+          if (OffsetBytes > 0) {
+            StreamsToRemove.insert(&DS_j);
+            RemovedToPrimary[DS_j.StreamID] = DS_i.StreamID;
+            LLVM_DEBUG(dbgs() << "  [Overlapping/Inclusive Merge] Merging Stream #"
+                              << DS_j.StreamID << " (+ " << OffsetBytes
+                              << "B) into Primary #" << DS_i.StreamID << "\n");
+            Changed = true;
+            continue;
+          }
+          // If OffsetBytes < 0: DS_j starts earlier in memory (e.g. A[i][j-1]).
+          // Merge: DS_j is kept as primary with earlier base; DS_i is merged into DS_j.
+          else if (OffsetBytes < 0) {
+            StreamsToRemove.insert(&DS_i);
+            RemovedToPrimary[DS_i.StreamID] = DS_j.StreamID;
+            LLVM_DEBUG(dbgs() << "  [Overlapping/Inclusive Merge] Merging Stream #"
+                              << DS_i.StreamID << " into lower-base Primary #"
+                              << DS_j.StreamID << " (" << OffsetBytes << "B)\n");
+            Changed = true;
+            break; // DS_i removed, move to next i
+          }
+        }
+      }
     }
   }
 
-  if (Group.size() > 1) {
-    StreamGroups.push_back(std::move(Group));
-  }
-}
-
-// Track which streams should be removed (redundant streams)
-SmallPtrSet<const DirectStreamDescriptor *, 8> StreamsToRemove;
-DenseMap<unsigned, unsigned> RemovedToPrimary; // duplicate StreamID -> primary
-
-for (const auto &Group : StreamGroups) {
-  LLVM_DEBUG(dbgs() << "  Found " << Group.size() 
-                    << " duplicate streams:\n");
-
-  // Find dominating instruction
-  Instruction *DominatingInst = nullptr;
-  unsigned PrimaryIdx = Group[0];
-
-  for (unsigned Idx : Group) {
-    LLVM_DEBUG(dbgs() << "    Stream #" << Ctx.Streams[Idx].StreamID);
-    // Print source location if available
-    if (Ctx.Streams[Idx].Loc) {
-      LLVM_DEBUG(dbgs() << " at ");
-      LLVM_DEBUG(Ctx.Streams[Idx].Loc.print(dbgs()));
-    }
-    LLVM_DEBUG(dbgs() << "\n");
-
-    Instruction *CurrentInst = Ctx.Streams[Idx].MemInst;
-    if (!CurrentInst)
-      continue;
-
-    if (!DominatingInst || Ctx.DT.dominates(CurrentInst, DominatingInst)) {
-      DominatingInst = CurrentInst;
-      PrimaryIdx = Idx;
+  // Filter out redundant streams - keep only primary streams
+  SmallVector<DirectStreamDescriptor, 8> FilteredStreams;
+  for (const auto &DS : Ctx.Streams) {
+    if (!StreamsToRemove.count(&DS)) {
+      FilteredStreams.push_back(DS);
     }
   }
 
-  LLVM_DEBUG(dbgs() << "    → Primary stream: #" << Ctx.Streams[PrimaryIdx].StreamID);
-  if (Ctx.Streams[PrimaryIdx].Loc) {
-    LLVM_DEBUG(dbgs() << " at ");
-    LLVM_DEBUG(Ctx.Streams[PrimaryIdx].Loc.print(dbgs()));
+  // Replace Ctx.Streams with the filtered list for subsequent stages
+  Ctx.Streams = std::move(FilteredStreams);
+
+  // Remap indirect streams citing removed streams
+  for (auto &IDS : Ctx.IndirectStreams) {
+    auto It = RemovedToPrimary.find(IDS.BaseStreamID);
+    if (It != RemovedToPrimary.end())
+      IDS.BaseStreamID = It->second;
   }
-  LLVM_DEBUG(dbgs() << "\n");
-
-  // Mark all non-primary streams for removal
-  for (unsigned Idx : Group) {
-    if (Idx != PrimaryIdx) {
-      StreamsToRemove.insert(&Ctx.Streams[Idx]);
-      RemovedToPrimary[Ctx.Streams[Idx].StreamID] =
-          Ctx.Streams[PrimaryIdx].StreamID;
-    }
-  }
-}
-
-// Filter out redundant streams - keep only primary streams
-SmallVector<DirectStreamDescriptor, 8> FilteredStreams;
-for (const auto &DS : Ctx.Streams) {
-  if (!StreamsToRemove.count(&DS)) {
-    FilteredStreams.push_back(DS);
-  }
-}
-
-// Replace Ctx.Streams with the filtered list for subsequent stages
-Ctx.Streams = std::move(FilteredStreams);
-
-// Indirect streams cite their index source by StreamID. A removed duplicate
-// fed the same indices as its primary, so citations follow the primary —
-// otherwise emission cannot translate them and leaks SourceID=0.
-for (auto &IDS : Ctx.IndirectStreams) {
-  auto It = RemovedToPrimary.find(IDS.BaseStreamID);
-  if (It != RemovedToPrimary.end())
-    IDS.BaseStreamID = It->second;
-}
 }
 
 /// Stage 1.1 (indirect): same-signature grouping with load-over-store
@@ -3106,6 +3127,13 @@ for (const auto &DS : Ctx.Streams) {
       if (SpanExtended == StepExtended) {
         IsPotentiallyLinearizable = true;
         LLVM_DEBUG(dbgs() << "    ✓ Constants match - linearizable!\n");
+      } else {
+        int64_t Diff = (StepExtended - SpanExtended).getSExtValue();
+        if (Diff > 0 && Diff <= 32 * std::abs(DS.Stride)) {
+          IsPotentiallyLinearizable = true;
+          LLVM_DEBUG(dbgs() << "    ✓ Constants match within continuous block margin ("
+                            << Diff << "B) - linearizable!\n");
+        }
       }
     }
     // Try matching against stride×tripcount pattern
@@ -3117,6 +3145,17 @@ for (const auto &DS : Ctx.Streams) {
             IsPotentiallyLinearizable = true;
             LLVM_DEBUG(dbgs() << "    ✓ Stride×tripcount match - linearizable!\n");
             break;
+          } else {
+            const SCEV *StepDiff = Ctx.SE.getMinusSCEV(BaseStep, ExpectedStep);
+            if (const SCEVConstant *CDiff = dyn_cast<SCEVConstant>(StepDiff)) {
+              int64_t DiffVal = CDiff->getAPInt().getSExtValue();
+              if (DiffVal > 0 && DiffVal <= 32 * std::abs(DS.Stride)) {
+                IsPotentiallyLinearizable = true;
+                LLVM_DEBUG(dbgs() << "    ✓ Stride×tripcount near-match ("
+                                  << DiffVal << "B) - linearizable!\n");
+                break;
+              }
+            }
           }
         }
       }
@@ -3143,6 +3182,18 @@ for (const auto &DS : Ctx.Streams) {
             LLVM_DEBUG(dbgs() << "    ✓ " << (ZeroExt ? "zext" : "sext")
                               << "-normalized span matches step - linearizable!\n");
             break;
+          } else {
+            const SCEV *StepDiff = Ctx.SE.getMinusSCEV(BaseStep, WidenedSpan);
+            if (const SCEVConstant *CDiff = dyn_cast<SCEVConstant>(StepDiff)) {
+              int64_t DiffVal = CDiff->getAPInt().getSExtValue();
+              if (DiffVal > 0 && DiffVal <= 32 * std::abs(DS.Stride)) {
+                IsPotentiallyLinearizable = true;
+                LLVM_DEBUG(dbgs() << "    ✓ " << (ZeroExt ? "zext" : "sext")
+                                  << "-normalized near-match (" << DiffVal
+                                  << "B) - linearizable!\n");
+                break;
+              }
+            }
           }
         }
       }
@@ -3878,6 +3929,7 @@ PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
   // Stage 3: merge transformation; Stage 3.1: unused-loop cleanup;
   // Stage 3.2: unreferenced-link cleanup
   applyLoopMerges(Ctx);
+  deduplicateDirectStreams(Ctx);
   removeUnusedLoops(Ctx);
   removeUnusedLinkVars(Ctx);
 
@@ -3926,18 +3978,37 @@ namespace {
 /// silently disabled the manual streams (atax: 3 of 4 direct streams lost,
 /// 86 vs 4138 iBatches, +4.0% -> -0.2% IPC; fixed 2026-09-12).
 ///
-/// Upper bound: descriptor ID fields are 6 bits and the engine encodes
-/// NO_PARENT as 63, so GlobalIDs must stay in [0, 62]. Auto range is
-/// 32-62 => at most 31 auto descriptors when manual descriptors occupy
-/// 0-31. The CSR range itself (0x800-0x8C7 = 100 slots, DescTable
-/// MAX_ENTRIES=100) is wider and not the binding constraint.
-static constexpr unsigned AUTO_DESC_ID_BASE = 32;
-static constexpr unsigned MAX_DESC_GLOBALID = 63;  // exclusive: 6-bit fields, 63 = NO_PARENT
+/// Hardware descriptor table capacity: 100 slots (DescTable MAX_ENTRIES=100 in compass,
+/// CSR range 0x800-0x8C9).
+/// When compiling code that has manual write_csr descriptors (slots 0-31),
+/// auto descriptors start at AUTO_DESC_ID_BASE = 32.
+/// When compiling unmodified code with no manual descriptors, auto descriptors
+/// start at 0, making all 100 slots available.
+static constexpr unsigned DEFAULT_AUTO_DESC_ID_BASE = 0;
+static constexpr unsigned MANUAL_RESERVED_DESC_ID_BASE = 32;
+static constexpr unsigned MAX_DESC_GLOBALID = 100;
+
+static bool functionHasManualCSR(const Function &F) {
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &I : BB) {
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        if (CB->isInlineAsm()) {
+          StringRef AsmStr =
+              cast<InlineAsm>(CB->getCalledOperand())->getAsmString();
+          if (AsmStr.contains("0x8") || AsmStr.contains("csr"))
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
 
 /// Build ID remapping tables: Analysis IDs → Unified GlobalIDs
 /// Assigns sequential GlobalIDs starting from AUTO_DESC_ID_BASE across all
-/// descriptor types. Order: Links → Loops → DirectStreams → IndirectStreams
+/// descriptor types. Order: Loops → Links → DirectStreams → IndirectStreams
 void buildIDRemappingTables(
+    const Function &F,
     const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
     const SmallVectorImpl<LoopDescriptor> &Loops,
     const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
@@ -3947,55 +4018,56 @@ void buildIDRemappingTables(
     DenseMap<unsigned, unsigned> &StreamIDMap,
     DenseMap<unsigned, unsigned> &IndirectIDMap,
     unsigned &TotalDescriptorCount) {
-  
-  unsigned NextGlobalID = AUTO_DESC_ID_BASE;  // 0-31 reserved for manual write_csr descriptors
-  
-  LLVM_DEBUG(dbgs() << "\n[ID Remapping] Assigning unified GlobalIDs:\n");
-  
-  // 1. Assign GlobalIDs to Link Variables first (they are referenced by others)
-  for (const auto &Link : LinkVars) {
-    LinkIDMap[Link.LinkID] = NextGlobalID;
-    LLVM_DEBUG(dbgs() << "  Link Analysis ID " << Link.LinkID 
-                      << " → GlobalID " << NextGlobalID << "\n");
-    NextGlobalID++;
-  }
-  
-  // 2. Assign GlobalIDs to Loop Descriptors
+
+  unsigned NextGlobalID = functionHasManualCSR(F) ? MANUAL_RESERVED_DESC_ID_BASE
+                                                  : DEFAULT_AUTO_DESC_ID_BASE;
+
+  LLVM_DEBUG(dbgs() << "\n[ID Remapping] Assigning unified GlobalIDs (base="
+                    << NextGlobalID << ", max=" << MAX_DESC_GLOBALID << "):\n");
+
+  // 1. Assign GlobalIDs to Loop Descriptors first.
+  // Loops must have IDs < 63 because ParentLoopID:6 and LoopDescID:6 are 6-bit
+  // fields and 63 is the NO_PARENT sentinel.
   for (const auto &Loop : Loops) {
     LoopIDMap[Loop.LoopID] = NextGlobalID;
-    LLVM_DEBUG(dbgs() << "  Loop Analysis ID " << Loop.LoopID 
+    LLVM_DEBUG(dbgs() << "  Loop Analysis ID " << Loop.LoopID
                       << " → GlobalID " << NextGlobalID << "\n");
     NextGlobalID++;
   }
-  
+
+  // 2. Assign GlobalIDs to Link Variables
+  for (const auto &Link : LinkVars) {
+    LinkIDMap[Link.LinkID] = NextGlobalID;
+    LLVM_DEBUG(dbgs() << "  Link Analysis ID " << Link.LinkID
+                      << " → GlobalID " << NextGlobalID << "\n");
+    NextGlobalID++;
+  }
+
   // 3. Assign GlobalIDs to Direct Stream Descriptors
   for (const auto &Stream : DirectStreams) {
     StreamIDMap[Stream.StreamID] = NextGlobalID;
-    LLVM_DEBUG(dbgs() << "  DirectStream Analysis ID " << Stream.StreamID 
+    LLVM_DEBUG(dbgs() << "  DirectStream Analysis ID " << Stream.StreamID
                       << " → GlobalID " << NextGlobalID << "\n");
     NextGlobalID++;
   }
-  
+
   // 4. Assign GlobalIDs to Indirect Stream Descriptors
   for (const auto &Indirect : IndirectStreams) {
     IndirectIDMap[Indirect.StreamID] = NextGlobalID;
-    LLVM_DEBUG(dbgs() << "  IndirectStream Analysis ID " << Indirect.StreamID 
+    LLVM_DEBUG(dbgs() << "  IndirectStream Analysis ID " << Indirect.StreamID
                       << " → GlobalID " << NextGlobalID << "\n");
     NextGlobalID++;
   }
-  
+
   TotalDescriptorCount = NextGlobalID;
   LLVM_DEBUG(dbgs() << "\nTotal descriptors: " << TotalDescriptorCount << "\n");
-  
-  // Validate: highest GlobalID must stay below the 6-bit ID field limit
-  // (63 doubles as the engine's NO_PARENT sentinel). Slots 0-31 belong to
-  // manual write_csr descriptors, so the pass has 32-62 available.
+
+  // Validate: highest GlobalID must stay below hardware descriptor table capacity (MAX_ENTRIES=100)
   if (NextGlobalID > MAX_DESC_GLOBALID) {
     report_fatal_error("InterStellar: Total descriptors (" +
                        Twine(TotalDescriptorCount) +
-                       ") exceed the auto-ID range 32-62 (slots 0-31 are "
-                       "reserved for manual write_csr descriptors; GlobalIDs "
-                       "must stay below 63 = NO_PARENT sentinel)");
+                       ") exceed hardware capacity of " +
+                       Twine(MAX_DESC_GLOBALID) + " slots (range 0x800-0x8C9)");
   }
 }
 
@@ -4750,7 +4822,7 @@ static void generateHardwareDescriptorIR(
   DenseMap<unsigned, unsigned> IndirectIDMap;
   unsigned TotalDescriptorCount = 0;
   
-  buildIDRemappingTables(LinkVars, Loops, DirectStreams, IndirectStreams,
+  buildIDRemappingTables(F, LinkVars, Loops, DirectStreams, IndirectStreams,
                         LinkIDMap, LoopIDMap, StreamIDMap, IndirectIDMap,
                         TotalDescriptorCount);
   
