@@ -44,6 +44,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
@@ -51,6 +52,23 @@
 #define DEBUG_TYPE "interstellar-analysis"
 
 using namespace llvm;
+
+static cl::list<std::string> OnlyFuncs(
+    "interstellar-only-funcs",
+    cl::desc("Comma-separated list of function names to instrument with "
+             "InterStellar descriptors (default: all functions)"),
+    cl::CommaSeparated, cl::ZeroOrMore);
+
+static bool shouldInstrumentFunction(const Function &F) {
+  if (OnlyFuncs.getNumOccurrences() == 0)
+    return true;
+  StringRef Name = F.getName();
+  for (const std::string &Allowed : OnlyFuncs) {
+    if (!Allowed.empty() && Name == Allowed)
+      return true;
+  }
+  return false;
+}
 
 STATISTIC(NumDirectStreams, "Number of direct streams identified");
 STATISTIC(NumDynamicBases, "Number of dynamic base addresses detected");
@@ -4274,6 +4292,9 @@ static bool unrollSmallPointerDispatchLoops(Function &F,
 
 PreservedAnalyses InterStellarAnalysisPass::run(Function &F,
                                                  FunctionAnalysisManager &AM) {
+  if (!shouldInstrumentFunction(F))
+    return PreservedAnalyses::all();
+
   bool IRModified = specializeInternalConstantArgs(F);
   if (IRModified)
     AM.invalidate(F, PreservedAnalyses::none());
@@ -5334,6 +5355,9 @@ InterStellarAnalysisLegacyPass::InterStellarAnalysisLegacyPass()
 }
 
 bool InterStellarAnalysisLegacyPass::runOnFunction(Function &F) {
+  if (!shouldInstrumentFunction(F))
+    return false;
+
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   
