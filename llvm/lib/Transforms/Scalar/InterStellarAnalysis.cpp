@@ -4614,45 +4614,16 @@ namespace {
 
 /// First GlobalID available to compiler-discovered descriptors.
 ///
-/// CSR slots 0-31 (0x800-0x81F) are reserved for hand-written
-/// `write_csr(0x800..)` descriptors that benchmarks compile into the same
-/// binary. The pass cannot see those inline-asm writes at IR level, so
-/// allocating auto IDs from 0 collided with them: the auto setup executed
-/// after the manual block and last-write-wins in the engine's parseCSR
-/// silently disabled the manual streams (atax: 3 of 4 direct streams lost,
-/// 86 vs 4138 iBatches, +4.0% -> -0.2% IPC; fixed 2026-09-12).
-///
-/// Hardware descriptor table capacity: 100 slots (DescTable MAX_ENTRIES=100 in compass,
-/// CSR range 0x800-0x8C9).
-/// When compiling code that has manual write_csr descriptors (slots 0-31),
-/// auto descriptors start at AUTO_DESC_ID_BASE = 32.
-/// When compiling unmodified code with no manual descriptors, auto descriptors
-/// start at 0, making all 100 slots available.
+/// Hardware descriptor table capacity: 16 slots per core
+/// (GlobalIDs 0-15, CSR range 0x800-0x81F).
+/// Auto descriptors always start at 0, making all 16 slots available.
 static constexpr unsigned DEFAULT_AUTO_DESC_ID_BASE = 0;
-static constexpr unsigned MANUAL_RESERVED_DESC_ID_BASE = 32;
-static constexpr unsigned MAX_DESC_GLOBALID = 100;
-
-static bool functionHasManualCSR(const Function &F) {
-  for (const BasicBlock &BB : F) {
-    for (const Instruction &I : BB) {
-      if (auto *CB = dyn_cast<CallBase>(&I)) {
-        if (CB->isInlineAsm()) {
-          StringRef AsmStr =
-              cast<InlineAsm>(CB->getCalledOperand())->getAsmString();
-          if (AsmStr.contains("0x8") || AsmStr.contains("csr"))
-            return true;
-        }
-      }
-    }
-  }
-  return false;
-}
+static constexpr unsigned MAX_DESC_GLOBALID = 16;
 
 /// Build ID remapping tables: Analysis IDs → Unified GlobalIDs
-/// Assigns sequential GlobalIDs starting from AUTO_DESC_ID_BASE across all
-/// descriptor types. Order: Loops → Links → DirectStreams → IndirectStreams
+/// Assigns sequential GlobalIDs starting from DEFAULT_AUTO_DESC_ID_BASE across
+/// all descriptor types. Order: Loops → Links → DirectStreams → IndirectStreams
 void buildIDRemappingTables(
-    const Function &F,
     const SmallVectorImpl<LinkVariableDescriptor> &LinkVars,
     const SmallVectorImpl<LoopDescriptor> &Loops,
     const SmallVectorImpl<DirectStreamDescriptor> &DirectStreams,
@@ -4664,8 +4635,7 @@ void buildIDRemappingTables(
     DenseMap<unsigned, unsigned> &IndirectIDMap,
     unsigned &TotalDescriptorCount) {
 
-  unsigned NextGlobalID = functionHasManualCSR(F) ? MANUAL_RESERVED_DESC_ID_BASE
-                                                  : DEFAULT_AUTO_DESC_ID_BASE;
+  unsigned NextGlobalID = DEFAULT_AUTO_DESC_ID_BASE;
 
   LLVM_DEBUG(dbgs() << "\n[ID Remapping] Assigning unified GlobalIDs (base="
                     << NextGlobalID << ", max=" << MAX_DESC_GLOBALID << "):\n");
@@ -4709,12 +4679,12 @@ void buildIDRemappingTables(
   TotalDescriptorCount = NextGlobalID;
   LLVM_DEBUG(dbgs() << "\nTotal descriptors: " << TotalDescriptorCount << "\n");
 
-  // Validate: highest GlobalID must stay below hardware descriptor table capacity (MAX_ENTRIES=100)
+  // Validate: highest GlobalID must stay within hardware descriptor table capacity (16 slots)
   if (NextGlobalID > MAX_DESC_GLOBALID) {
     report_fatal_error("InterStellar: Total descriptors (" +
                        Twine(TotalDescriptorCount) +
                        ") exceed hardware capacity of " +
-                       Twine(MAX_DESC_GLOBALID) + " slots (range 0x800-0x8C9)");
+                       Twine(MAX_DESC_GLOBALID) + " slots (range 0x800-0x81F)");
   }
 }
 
@@ -5346,7 +5316,7 @@ static void generateHardwareDescriptorIR(
   DenseMap<unsigned, unsigned> IndirectIDMap;
   unsigned TotalDescriptorCount = 0;
   
-  buildIDRemappingTables(F, LinkVars, Loops, DirectStreams, IndirectStreams,
+  buildIDRemappingTables(LinkVars, Loops, DirectStreams, IndirectStreams,
                         DroppedIndirectIDs, LinkIDMap, LoopIDMap, StreamIDMap,
                         IndirectIDMap, TotalDescriptorCount);
   
