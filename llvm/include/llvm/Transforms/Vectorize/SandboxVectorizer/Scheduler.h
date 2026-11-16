@@ -307,7 +307,7 @@ class Scheduler {
   /// The dependency graph is used by the scheduler to determine the legal
   /// ordering of instructions.
   DependencyGraph DAG;
-  friend class SchedulerInternalsAttorney; // For DAG.
+  friend class SchedulerInternalsAttorney; // For DAG and ReadyList.
   Context &Ctx;
   /// This is the top of the schedule during bottom-up scheduling and the bottom
   /// of the schedule during top-down. It points to the position of the last
@@ -319,12 +319,25 @@ class Scheduler {
   DenseMap<SchedBundle *, std::unique_ptr<SchedBundle>> Bndls;
   /// The BB that we are currently scheduling.
   BasicBlock *ScheduledBB = nullptr;
-  /// The ID of the callback we register with Sandbox IR.
-  std::optional<Context::CallbackID> CreateInstrCB;
-  /// Called by Sandbox IR's callback system, after \p I has been created.
-  /// NOTE: This should run after DAG's callback has run.
-  // TODO: Perhaps call DAG's notify function from within this one?
-  LLVM_ABI void notifyCreateInstr(Instruction *I);
+  /// The IDs of the callbacks we register with Sandbox IR.
+  std::optional<Context::CallbackID> MoveInstrCB;
+  std::optional<Context::CallbackID> SetUseCB;
+  /// Called by DependencyGraph::notifyCreateInstr(), and not directly by the
+  /// Context because updating the scheduler is tightly coupled with the
+  /// update of the DAG. The update needs to happen in two parts: before the
+  /// bulk of the DAG updates and after it.
+  LLVM_ABI void notifyCreateInstrBeforeDAGUpdates(DGNode *N);
+  LLVM_ABI void notifyCreateInstrAfterDAGUpdates(DGNode *N);
+  friend class DependencyGraph; // for notifyCreateInstrPart*()
+
+  /// Called by the callbacks when instruction \p I is about to get
+  /// deleted.
+  LLVM_ABI void notifyEraseInstr(Instruction *I);
+  /// Called by the callbacks when instruction \p I is about to be moved to
+  /// \p To.
+  LLVM_ABI void notifyMoveInstr(Instruction *I, const BBIterator &To);
+  /// Called by the callbacks when \p U's source is about to be set to \p NewSrc
+  LLVM_ABI void notifySetUse(const Use &U, Value *NewSrc);
 
   /// \Returns a scheduling bundle containing \p Instrs.
   SchedBundle *createBundle(ArrayRef<Instruction *> Instrs);
@@ -365,22 +378,26 @@ class Scheduler {
 
 public:
   Scheduler(AAResults &AA, Context &Ctx, SchedDirection Dir)
-      : DAG(Dir, AA, Ctx), Ctx(Ctx), Dir(Dir) {
-    // NOTE: The scheduler's callback depends on the DAG's callback running
-    // before it and updating the DAG accordingly.
-    CreateInstrCB = Ctx.registerCreateInstrCallback(
-        [this](Instruction *I) { notifyCreateInstr(I); });
+      : DAG(Dir, AA, Ctx, this), Ctx(Ctx), Dir(Dir) {
+    MoveInstrCB = Ctx.registerMoveInstrCallback(
+        [this](Instruction *I, const BBIterator &To) {
+          notifyMoveInstr(I, To);
+        });
+    SetUseCB = Ctx.registerSetUseCallback(
+        [this](const Use &U, Value *NewSrc) { notifySetUse(U, NewSrc); });
   }
   ~Scheduler() {
-    if (CreateInstrCB)
-      Ctx.unregisterCreateInstrCallback(*CreateInstrCB);
+    if (MoveInstrCB)
+      Ctx.unregisterMoveInstrCallback(*MoveInstrCB);
+    if (SetUseCB)
+      Ctx.unregisterSetUseCallback(*SetUseCB);
   }
   /// Tries to build a schedule that includes all of \p Instrs scheduled at the
   /// same scheduling cycle. This essentially checks that there are no
   /// dependencies among \p Instrs. This function may involve scheduling
   /// intermediate instructions or canceling and re-scheduling if needed.
   /// \Returns true on success, false otherwise.
-  LLVM_ABI bool trySchedule(ArrayRef<Instruction *> Instrs);
+  LLVM_ABI bool trySchedule(BndlRef<Instruction *> Instrs);
   /// Clear the scheduler's state, including the DAG.
   void clear() {
     Bndls.clear();

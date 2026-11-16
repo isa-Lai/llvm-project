@@ -16,14 +16,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
-#include "mlir/Interfaces/CallInterfaces.h"
-#include "mlir/Interfaces/ControlFlowInterfaces.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
-#include "mlir/Interfaces/InferTypeOpInterface.h"
-#include "mlir/Interfaces/LoopLikeInterface.h"
-#include "mlir/Interfaces/MemorySlotInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
@@ -33,6 +26,10 @@
 #include "clang/CIR/Interfaces/CIRLoopOpInterface.h"
 #include "clang/CIR/Interfaces/CIROpInterfaces.h"
 #include "clang/CIR/MissingFeatures.h"
+
+#include "llvm/TargetParser/Triple.h"
+
+#include <optional>
 
 using BuilderCallbackRef =
     llvm::function_ref<void(mlir::OpBuilder &, mlir::Location)>;
@@ -81,6 +78,17 @@ private:
   }
 };
 
+/// The properties of \p Op with every ODS-declared default applied.  The
+/// aggregate op builders that take a `Properties` struct do not apply those
+/// defaults themselves, so callers of those builders have to do it here.
+template <typename Op>
+typename Op::Properties getDefaultProperties(mlir::MLIRContext *context) {
+  typename Op::Properties properties{};
+  Op::populateDefaultProperties(
+      mlir::OperationName(Op::getOperationName(), context), properties);
+  return properties;
+}
+
 /// Look up the RecordLayoutAttr for a named record in the module's
 /// cir.record_layouts dictionary.  Asserts if the entry is missing.
 RecordLayoutAttr getRecordLayout(mlir::ModuleOp mod, mlir::StringAttr name);
@@ -88,6 +96,9 @@ RecordLayoutAttr getRecordLayout(mlir::ModuleOp mod, mlir::StringAttr name);
 /// Same lookup as getRecordLayout, but returns a null attribute instead of
 /// asserting when the record has no layout entry.
 RecordLayoutAttr tryGetRecordLayout(mlir::ModuleOp mod, mlir::StringAttr name);
+
+/// Attempts to construct an llvm::Triple from a module's cir.triple attribute.
+std::optional<llvm::Triple> getTripleFromModule(mlir::ModuleOp mod);
 } // namespace cir
 
 // TableGen'erated files for MLIR dialects require that a macro be defined when
