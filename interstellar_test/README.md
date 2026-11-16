@@ -25,6 +25,43 @@ void test(int *A, int *B, int N) {
 
 **Note:** This is a nostdio version that doesn't require RISC-V libc headers. Original version backed up as `pattern1_direct_streams_original.c.bak`.
 
+### Pattern D: Stream Base-Address Resolvability (patternD_base_resolvability.c)
+**Description:** Reduced unit test for the study-binary failure where pass-emitted
+descriptors carried stub bases and no LLC miss ever matched. Three cases:
+- `direct_static` — static global accessed directly → base emitted via `%hi/%lo(G)` (WORKS)
+- `direct_malloc` — malloc'd base → constant stub base 0x206000, pointer never fed to a csrw
+- `direct_param` — pointer parameter (atax/bicg shape) → same stub, param never fed to a csrw
+
+Run: `./test_backend.sh D`. Oracle is in the .s/.o (relocation feeding the csrw in case 1,
+constant stubs in cases 2-3) and end-to-end in gem5 (case 1 matches, cases 2-3 never).
+
+### Pattern E: Outer-Variant (Row-Walking) Stream Bases (patternE_outer_variant_base.c)
+**Description:** Reduced unit test for the atax `A[i][j]` gap: the inner loop's base
+`A + i*N*8` varies with the outer induction variable, so a single entry-time bind
+cannot cover the matrix. Four cases:
+- `rows_static` — 2D static global → flat constant-base stream (base `@G2`, stride 8,
+  merged loop M×N) — **works today**, matches the manual's linearized descriptor
+- `rows_param` — 2D pointer parameter → pass linearizes (merged loop `64*n` via a
+  bound link) but ships the base **BL=0 symbolic**; the backend lowers it to the
+  base register's *number* (x11 → `0xB`), which the engine reads as an address → inert
+- `rows_malloc` — `double **A` → base is a loop-variant row-pointer **load**; the IR
+  generator skips loop-variant links (entry-only emission) → **0 descriptors emitted**
+- `rows_flat_malloc` — flat `A[i*N+j]` form (commented out; see 2026-09-16 session notes)
+
+**Hardware contract (gem5 link-base-resolution):** a Link's register is re-snapshotted
+at *every* execution of its L-word instruction, and every BL=1 stream insert re-binds
+BASEVA to the latest snapshot. A **loop-variant link is therefore a valid descriptor**
+provided the link instruction executes where the register holds the current base.
+Placing the link+stream pair inside the outer loop gives: base = A[i] re-bound per
+row, stride 8, N iterations — the hardware walks each row. Cost: 4 serialized csrw
+per outer iteration. The manual's alternative is flat linearization (base = A,
+span M×N, one-time).
+
+Run: `./test_backend.sh E` (asm oracle) and `sh test_summary.sh E` (pass decision
+log). Oracle: `rows_param` must ship BL=1 link delivery (flat M×N or per-row),
+`rows_malloc` must emit the per-row link+stream pair; end-to-end in gem5 shows
+INSERT lines with advancing BaseVA and per-row matches.
+
 ## Running Tests
 
 ```bash
@@ -96,6 +133,12 @@ Backend Test: COMPLETE ✅
 1. **Duplicate GlobalIDs**: When multiple functions are analyzed, GlobalIDs may be reused across functions. This is expected behavior - GlobalIDs are function-local.
 
 2. **CSR Writes Not Generated**: Phase 3 (CSR write generation) is not yet implemented. Intrinsics are currently removed before codegen. See TODO in output.
+
+3. **Stream bases must be static globals at the annotation point**: the pass emits
+   a real base only for static globals accessed directly in the annotated
+   function. Malloc'd pointers and pointer-parameter bases get a constant stub
+   (0x206000) and the engine can never match those streams — see Pattern D. This
+   is why all 8 study auto-binaries were stream-inert (2026-09-13).
 
 ## File Naming
 
