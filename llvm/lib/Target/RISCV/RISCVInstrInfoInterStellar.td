@@ -11,8 +11,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+// Direct CSR write pseudo for InterStellar descriptors whose fields are
+// packed at compile/run time in SelectionDAG (no post-RA link resolution).
+let hasSideEffects = 1, mayLoad = 0, mayStore = 0 in
+def PseudoInterStellarCSRWrite : Pseudo<(outs), (ins csr_sysreg:$csr, GPR:$val), []>,
+                                 PseudoInstExpansion<(CSRRW X0, csr_sysreg:$csr, GPR:$val)>,
+                                 Sched<[WriteCSR, ReadCSR]>;
+
 //===----------------------------------------------------------------------===//
-// Pseudo-instructions for InterStellar configuration
+// Pseudo-instructions for InterStellar configuration (legacy linked path)
 //
 // These pseudo-instructions carry the configuration information through
 // instruction selection and register allocation. They are expanded to actual

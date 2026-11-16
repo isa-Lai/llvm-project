@@ -13,9 +13,11 @@ InterStellar Intrinsics (Phase 1 Output):
 
 This tool verifies that:
 1. All intrinsics are well-formed
-2. GlobalIDs are unique and within range [0, 31]
+2. GlobalIDs are within range [0, 62] (0-31 manual write_csr, 32-62 pass-emitted;
+   63 is the NO_PARENT sentinel). Cross-function ID reuse (each function
+   renumbers from 32) is expected and only warned about.
 3. References between descriptors are valid (loop IDs, link IDs)
-4. No more than 32 total descriptors (hardware limit)
+4. No more than 63 total descriptors (descriptor-table capacity)
 
 Usage:
     ./verify_descriptors.py test_backend_phase1.ll
@@ -106,15 +108,17 @@ def parse_intrinsics(ir_content: str) -> Tuple[List[Descriptor], Set[int]]:
         
         descriptors.append(LinkDescriptor(global_id, ptr_value, size))
     
-    # Pattern for configure.loop
-    loop_pattern = r'call void @llvm\.interstellar\.configure\.loop\(i32 (\d+), i32 (\d+), i1 (true|false), i1 (true|false), i32 (-?\d+), i32 (-?\d+), i32 (-?\d+)\)'
+    # Pattern for configure.loop (LowerBound / UpperBound may be integer constants or runtime SSA values)
+    loop_pattern = r'call void @llvm\.interstellar\.configure\.loop\(i32 (\d+), i32 (\d+), i1 (true|false), i1 (true|false), i32 ([^,]+), i32 ([^,]+), i32 (-?\d+)\)'
     for match in re.finditer(loop_pattern, ir_content):
         global_id = int(match.group(1))
         parent_id = int(match.group(2))
         is_nested = match.group(3) == 'true'
         is_inc = match.group(4) == 'true'
-        lower_bound = int(match.group(5))
-        upper_bound = int(match.group(6))
+        lb_raw = match.group(5).strip()
+        ub_raw = match.group(6).strip()
+        lower_bound = int(lb_raw) if re.fullmatch(r'-?\d+', lb_raw) else lb_raw
+        upper_bound = int(ub_raw) if re.fullmatch(r'-?\d+', ub_raw) else ub_raw
         step = int(match.group(7))
         
         if global_id in global_ids:
@@ -170,20 +174,20 @@ def verify_descriptors(descriptors: List[Descriptor], global_ids: Set[int]) -> b
         print("   Make sure Phase 1 (InterStellarAnalysis) ran successfully.")
         return False
     
-    # Check hardware limit
-    if len(descriptors) > 32:
-        print(f"\n❌ ERROR: Too many descriptors ({len(descriptors)} > 32 hardware limit)")
+    # Check hardware limit: 63 usable table slots (IDs 0-62)
+    if len(descriptors) > 63:
+        print(f"\n❌ ERROR: Too many descriptors ({len(descriptors)} > 63 table capacity)")
         return False
-    
-    print(f"\n✅ Found {len(descriptors)} descriptor(s) (within 32 CSR limit)")
-    
-    # Verify GlobalID range
-    invalid_ids = [gid for gid in global_ids if gid < 0 or gid > 31]
+
+    print(f"\n✅ Found {len(descriptors)} descriptor(s) (within 63-slot table capacity)")
+
+    # Verify GlobalID range: 0-31 manual, 32-62 pass-emitted, 63 = NO_PARENT sentinel
+    invalid_ids = [gid for gid in global_ids if gid < 0 or gid > 62]
     if invalid_ids:
-        print(f"\n❌ ERROR: GlobalIDs out of range [0, 31]: {invalid_ids}")
+        print(f"\n❌ ERROR: GlobalIDs out of range [0, 62]: {invalid_ids}")
         return False
-    
-    print(f"✅ All GlobalIDs within valid range [0, 31]")
+
+    print(f"✅ All GlobalIDs within valid range [0, 62]")
     
     # Check for reference integrity
     loop_ids = {d.global_id for d in descriptors if isinstance(d, LoopDescriptor)}
