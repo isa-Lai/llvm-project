@@ -915,6 +915,18 @@ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::CLEAR_CACHE, MVT::Other, Custom);
   }
 
+  // InterStellar configuration intrinsics are side-effecting void intrinsics
+  // that carry mixed-width operands (e.g. i32 + pointer) and need target
+  // custom lowering on both RV32 and RV64, regardless of RVV support.
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::i1, Custom);
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::i8, Custom);
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::i16, Custom);
+  if (Subtarget.is64Bit())
+    setOperationAction(ISD::INTRINSIC_VOID, MVT::i32, Custom);
+  else
+    setOperationAction(ISD::INTRINSIC_VOID, MVT::i64, Custom);
+  setOperationAction(ISD::INTRINSIC_VOID, MVT::Other, Custom);
+
   if (Subtarget.hasVInstructions()) {
     setBooleanVectorContents(ZeroOrNegativeOneBooleanContent);
 
@@ -932,8 +944,7 @@ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
       setOperationAction({ISD::INTRINSIC_WO_CHAIN, ISD::INTRINSIC_W_CHAIN},
                          MVT::i64, Custom);
 
-    setOperationAction({ISD::INTRINSIC_W_CHAIN, ISD::INTRINSIC_VOID},
-                       MVT::Other, Custom);
+    setOperationAction(ISD::INTRINSIC_W_CHAIN, MVT::Other, Custom);
 
     static const unsigned IntegerVPOps[] = {
         ISD::VP_SDIV,        ISD::VP_UDIV,        ISD::VP_SREM,
@@ -14466,6 +14477,185 @@ SDValue RISCVTargetLowering::LowerINTRINSIC_VOID(SDValue Op,
     return getVCIXISDNodeVOID(Op, DAG, RISCVISD::SF_VC_VVW_SE);
   case Intrinsic::riscv_sf_vc_fvw_se:
     return getVCIXISDNodeVOID(Op, DAG, RISCVISD::SF_VC_FVW_SE);
+  
+  // InterStellar hardware configuration intrinsics
+  // When SL=0/EL=0/BL=0 on RV64, pack the 128-bit descriptor directly into two
+  // 64-bit GPR values (folding static fields and shifting/ORing runtime values)
+  // and emit CSR writes to 0x800 + 2*GlobalID (+0 low, +1 high). Legacy linked
+  // IR (SL/EL/BL=1 or configure.link) falls back to the post-RA pseudos.
+  case Intrinsic::interstellar_configure_link:
+  case Intrinsic::interstellar_configure_loop:
+  case Intrinsic::interstellar_configure_directstream:
+  case Intrinsic::interstellar_configure_indirectstream: {
+    SDLoc DL(Op);
+    MVT XLenVT = Subtarget.getXLenVT();
+    SDValue Chain = Op.getOperand(0);
+
+    auto ToTargetImm = [&](SDValue V) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V))
+        return DAG.getTargetConstant(C->getZExtValue(), DL, XLenVT);
+      LLVM_DEBUG(dbgs() << "InterStellar legacy pseudo expects constant immediate\n");
+      return DAG.getTargetConstant(0, DL, XLenVT);
+    };
+
+    auto ZeroExt64 = [&](SDValue V) {
+      if (V.getValueType() == MVT::i64)
+        return V;
+      if (V.getValueType().bitsLT(MVT::i64))
+        return DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i64, V);
+      return DAG.getNode(ISD::TRUNCATE, DL, MVT::i64, V);
+    };
+
+    auto OrInto = [&](SDValue Acc, SDValue Val) {
+      return Acc ? DAG.getNode(ISD::OR, DL, MVT::i64, Acc, Val) : Val;
+    };
+
+    auto PackField = [&](uint64_t &StaticWord, SDValue &DynWord, SDValue V,
+                         unsigned Shift, unsigned WidthBits) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V)) {
+        uint64_t Mask = (WidthBits >= 64) ? ~0ULL : ((1ULL << WidthBits) - 1);
+        StaticWord |= (C->getZExtValue() & Mask) << Shift;
+        return;
+      }
+      SDValue V64 = ZeroExt64(V);
+      unsigned ValBits = V.getValueType().getScalarSizeInBits();
+      if (WidthBits < 64 && WidthBits + Shift < 64 && ValBits > WidthBits) {
+        uint64_t Mask = (1ULL << WidthBits) - 1;
+        V64 = DAG.getNode(ISD::AND, DL, MVT::i64, V64,
+                          DAG.getConstant(Mask, DL, MVT::i64));
+      }
+      if (Shift > 0)
+        V64 = DAG.getNode(ISD::SHL, DL, MVT::i64, V64,
+                          DAG.getConstant(Shift, DL, MVT::i64));
+      DynWord = OrInto(DynWord, V64);
+    };
+
+    auto PackSplitField = [&](uint64_t &StaticLow, SDValue &DynLow,
+                              uint64_t &StaticHigh, SDValue &DynHigh,
+                              SDValue V, unsigned LowBits, unsigned HighBits,
+                              unsigned LowShift) {
+      if (auto *C = dyn_cast<ConstantSDNode>(V)) {
+        uint64_t Val = C->getZExtValue();
+        uint64_t LowMask = (1ULL << LowBits) - 1;
+        uint64_t HighMask = (1ULL << HighBits) - 1;
+        StaticLow |= (Val & LowMask) << LowShift;
+        StaticHigh |= (Val >> LowBits) & HighMask;
+        return;
+      }
+      SDValue V64 = ZeroExt64(V);
+      DynLow = OrInto(DynLow, DAG.getNode(ISD::SHL, DL, MVT::i64, V64,
+                                          DAG.getConstant(LowShift, DL, MVT::i64)));
+      SDValue VHi = DAG.getNode(ISD::SRL, DL, MVT::i64, V64,
+                                DAG.getConstant(LowBits, DL, MVT::i64));
+      unsigned ValBits = V.getValueType().getScalarSizeInBits();
+      if (LowBits + HighBits < 64 && ValBits > LowBits + HighBits) {
+        uint64_t HighMask = (1ULL << HighBits) - 1;
+        VHi = DAG.getNode(ISD::AND, DL, MVT::i64, VHi,
+                          DAG.getConstant(HighMask, DL, MVT::i64));
+      }
+      DynHigh = OrInto(DynHigh, VHi);
+    };
+
+    auto FinalizeWord = [&](uint64_t S, SDValue D) {
+      if (!D)
+        return DAG.getConstant(S, DL, MVT::i64);
+      if (S == 0)
+        return D;
+      return DAG.getNode(ISD::OR, DL, MVT::i64, D,
+                         DAG.getConstant(S, DL, MVT::i64));
+    };
+
+    auto EmitCSRPair = [&](unsigned GlobalID, uint64_t StaticLow, SDValue DynLow,
+                           uint64_t StaticHigh, SDValue DynHigh) {
+      unsigned CSRLow = 0x800 + 2 * GlobalID;
+      unsigned CSRHigh = CSRLow + 1;
+      SDValue DescLow = FinalizeWord(StaticLow, DynLow);
+      SDValue DescHigh = FinalizeWord(StaticHigh, DynHigh);
+      SDValue LowNode(DAG.getMachineNode(
+          RISCV::PseudoInterStellarCSRWrite, DL, MVT::Other,
+          {DAG.getTargetConstant(CSRLow, DL, XLenVT), DescLow, Chain}), 0);
+      return SDValue(DAG.getMachineNode(
+          RISCV::PseudoInterStellarCSRWrite, DL, MVT::Other,
+          {DAG.getTargetConstant(CSRHigh, DL, XLenVT), DescHigh, LowNode}), 0);
+    };
+
+    if (IntNo == Intrinsic::interstellar_configure_link) {
+      SDValue Ops[] = {ToTargetImm(Op.getOperand(2)), Op.getOperand(3),
+                       ToTargetImm(Op.getOperand(4)), Chain};
+      return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarLink, DL,
+                                        MVT::Other, Ops), 0);
+    }
+
+    if (IntNo == Intrinsic::interstellar_configure_loop) {
+      auto *GlobalIDC = dyn_cast<ConstantSDNode>(Op.getOperand(2));
+      auto *ParentC = dyn_cast<ConstantSDNode>(Op.getOperand(3));
+      auto *SLC = dyn_cast<ConstantSDNode>(Op.getOperand(4));
+      auto *ELC = dyn_cast<ConstantSDNode>(Op.getOperand(5));
+      uint64_t SL = SLC ? SLC->getZExtValue() : 0;
+      uint64_t EL = ELC ? ELC->getZExtValue() : 0;
+      if (Subtarget.is64Bit() && SL == 0 && EL == 0 && GlobalIDC && ParentC &&
+          0x800 + 2 * GlobalIDC->getZExtValue() + 1 < 4096) {
+        uint64_t StaticLow = 0xC0ULL | ((ParentC->getZExtValue() & 0x3FULL) << 8);
+        uint64_t StaticHigh = 0ULL;
+        SDValue DynLow, DynHigh;
+        PackField(StaticLow, DynLow, Op.getOperand(6), 16, 32);              // Start
+        PackSplitField(StaticLow, DynLow, StaticHigh, DynHigh,
+                       Op.getOperand(7), 16, 16, 48);                        // End
+        PackField(StaticHigh, DynHigh, Op.getOperand(8), 16, 16);            // Step
+        return EmitCSRPair(GlobalIDC->getZExtValue(), StaticLow, DynLow,
+                           StaticHigh, DynHigh);
+      }
+      SmallVector<SDValue, 8> Ops;
+      for (unsigned i = 2; i < Op.getNumOperands(); ++i)
+        Ops.push_back(ToTargetImm(Op.getOperand(i)));
+      Ops.push_back(Chain);
+      return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarLoop, DL,
+                                        MVT::Other, Ops), 0);
+    }
+
+    auto *GlobalIDC = dyn_cast<ConstantSDNode>(Op.getOperand(2));
+    auto *IDC = dyn_cast<ConstantSDNode>(Op.getOperand(3));
+    auto *IsLinkedC = dyn_cast<ConstantSDNode>(Op.getOperand(4));
+    uint64_t BL = IsLinkedC ? IsLinkedC->getZExtValue() : 0;
+
+    if (Subtarget.is64Bit() && BL == 0 && GlobalIDC && IDC &&
+        0x800 + 2 * GlobalIDC->getZExtValue() + 1 < 4096) {
+      uint64_t TypeByte =
+          (IntNo == Intrinsic::interstellar_configure_directstream) ? 0xC1ULL
+                                                                    : 0xC2ULL;
+      uint64_t StaticLow = TypeByte | ((IDC->getZExtValue() & 0x3FULL) << 8);
+      uint64_t StaticHigh = 0ULL;
+      SDValue DynLow, DynHigh;
+      PackSplitField(StaticLow, DynLow, StaticHigh, DynHigh,
+                     Op.getOperand(5), 48, 16, 16);                          // BasePtr
+      PackField(StaticHigh, DynHigh, Op.getOperand(6), 16, 16);              // Stride / ElemSize
+      if (IntNo == Intrinsic::interstellar_configure_indirectstream)
+        PackField(StaticHigh, DynHigh, Op.getOperand(7), 32, 32);            // StreamSize
+      return EmitCSRPair(GlobalIDC->getZExtValue(), StaticLow, DynLow,
+                         StaticHigh, DynHigh);
+    }
+
+    SDValue GlobalID = ToTargetImm(Op.getOperand(2));
+    SDValue LoopOrSrcID = ToTargetImm(Op.getOperand(3));
+    SDValue IsLinked = ToTargetImm(Op.getOperand(4));
+    SDValue Ptr = Op.getOperand(5);
+    SDValue BaseID = DAG.getTargetConstant(0, DL, XLenVT);
+    if (IsLinkedC && IsLinkedC->getZExtValue() != 0) {
+      BaseID = ToTargetImm(Op.getOperand(5));
+      Ptr = DAG.getRegister(RISCV::X0, XLenVT);
+    }
+    if (IntNo == Intrinsic::interstellar_configure_directstream) {
+      SDValue Ops[] = {GlobalID, LoopOrSrcID, IsLinked, Ptr, BaseID,
+                       ToTargetImm(Op.getOperand(6)), Chain};
+      return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarDirectStream,
+                                        DL, MVT::Other, Ops), 0);
+    }
+    SDValue Ops[] = {GlobalID, LoopOrSrcID, IsLinked, Ptr, BaseID,
+                     ToTargetImm(Op.getOperand(6)),
+                     ToTargetImm(Op.getOperand(7)), Chain};
+    return SDValue(DAG.getMachineNode(RISCV::PseudoInterStellarIndirectStream,
+                                      DL, MVT::Other, Ops), 0);
+  }
   }
 
   return lowerVectorIntrinsicScalars(Op, DAG, Subtarget);

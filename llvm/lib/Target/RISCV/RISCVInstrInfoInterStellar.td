@@ -1,0 +1,87 @@
+//===-- RISCVInstrInfoInterStellar.td - InterStellar Instr -*- tablegen -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file describes the RISC-V InterStellar hardware prefetch configuration
+// pseudo-instructions.
+//
+//===----------------------------------------------------------------------===//
+
+// Direct CSR write pseudo for InterStellar descriptors whose fields are
+// packed at compile/run time in SelectionDAG (no post-RA link resolution).
+let hasSideEffects = 1, mayLoad = 0, mayStore = 0 in
+def PseudoInterStellarCSRWrite : Pseudo<(outs), (ins csr_sysreg:$csr, GPR:$val), []>,
+                                 PseudoInstExpansion<(CSRRW X0, csr_sysreg:$csr, GPR:$val)>,
+                                 Sched<[WriteCSR, ReadCSR]>;
+
+//===----------------------------------------------------------------------===//
+// Pseudo-instructions for InterStellar configuration (legacy linked path)
+//
+// These pseudo-instructions carry the configuration information through
+// instruction selection and register allocation. They are expanded to actual
+// CSR write instructions in a post-RA pass when physical register numbers
+// are known.
+//
+// Note: i1 types are automatically legalized to i32 by SelectionDAG, so we
+// use GPR for all operands.
+//===----------------------------------------------------------------------===//
+
+// Defs = [X5, X6]: the post-RA expander (RISCVInterStellarCodeGen.cpp
+// emitDescriptorCSRWrites) materializes descriptor words in t0 (X5) / t1 (X6)
+// and CSRRWs them to the descriptor CSRs (rd = x0). Declaring the clobber
+// makes RA keep live values out of t0/t1 across every config point. Without
+// this, an expansion landing between a lui+addi constant-materialization pair
+// corrupts the constant (bicg kernel_bicg A-row-stride bug: loop walked with
+// a garbage stride -> SE page-table fault).
+let Defs = [X5, X6], hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1 in {
+
+// InterStellar Link Configuration
+// configure.link(GlobalID, ptr, Size)
+def PseudoInterStellarLink : Pseudo<(outs), 
+                                    (ins uimm8:$globalid, GPR:$ptr,
+                                         uimm32:$size),
+                                    []>, 
+                             Sched<[]>;
+
+// InterStellar Loop Configuration
+// configure.loop(GlobalID, Parent, IsParallel, IsReduction, Start, End, Step)
+def PseudoInterStellarLoop : Pseudo<(outs),
+                                    (ins uimm8:$globalid, uimm16:$parent,
+                                         uimm1:$isparallel, uimm1:$isreduction,
+                                         uimm32:$start, uimm32:$end,
+                                         uimm32:$step),
+                                    []>, 
+                             Sched<[]>;
+
+// InterStellar Direct Stream Configuration
+// configure.directstream(GlobalID, LoopID, IsLinked, ptr, Stride)
+// If IsLinked=1, baseid carries the remapped Link GlobalID.
+def PseudoInterStellarDirectStream : Pseudo<(outs),
+                                            (ins uimm8:$globalid,
+                                                 uimm16:$loopid,
+                                                 uimm1:$islinked,
+                                                 GPR:$ptr,
+                                                 uimm32:$baseid,
+                                                 uimm32:$stride),
+                                            []>, 
+                                     Sched<[]>;
+
+// InterStellar Indirect Stream Configuration
+// configure.indirectstream(GlobalID, LoopID, IsLinked, BasePtr, ElementSize, IndexArraySize)
+// If IsLinked=1, baseid carries the remapped Link GlobalID.
+def PseudoInterStellarIndirectStream : Pseudo<(outs),
+                                              (ins uimm8:$globalid,
+                                                   uimm16:$loopid,
+                                                   uimm1:$islinked,
+                                                   GPR:$baseptr,
+                                                   uimm32:$baseid,
+                                                   uimm32:$elementsize,
+                                                   uimm32:$indexarraysize),
+                                              []>, 
+                                       Sched<[]>;
+
+} // hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1

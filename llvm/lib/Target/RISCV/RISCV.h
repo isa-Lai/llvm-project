@@ -204,6 +204,14 @@ FunctionPass *createRISCVInsertVSETVLILegacyPass();
 void initializeRISCVInsertVSETVLILegacyPass(PassRegistry &);
 extern char &RISCVInsertVSETVLILegacyID;
 
+FunctionPass *createRISCVInterStellarCodeGenPass();
+void initializeRISCVInterStellarCodeGenPass(PassRegistry &);
+
+// DEPRECATED: InterStellar intrinsics are now lowered in the post-RA pass
+// (createRISCVInterStellarCodeGenPass) where we can extract register numbers
+// FunctionPass *createRISCVRemoveInterStellarIntrinsicsPass();
+// void initializeRISCVRemoveInterStellarIntrinsicsPass(PassRegistry &);
+
 class RISCVInsertReadWriteCSRPass
     : public RequiredPassInfoMixin<RISCVInsertReadWriteCSRPass> {
 public:

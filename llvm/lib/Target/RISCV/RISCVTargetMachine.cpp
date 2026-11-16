@@ -420,6 +420,10 @@ void RISCVPassConfig::addIRPasses() {
     addPass(createRISCVCodeGenPrepareLegacyPass());
   }
 
+  // NOTE: InterStellar intrinsics are now lowered POST-register-allocation
+  // in addPostRegAlloc() where we can extract physical register numbers.
+  // The old createRISCVRemoveInterStellarIntrinsicsPass() is deprecated.
+
   TargetPassConfig::addIRPasses();
 
   if (getOptLevel() == CodeGenOptLevel::Aggressive && CLOpts.select_opt)
@@ -595,6 +599,10 @@ void RISCVPassConfig::addFastRegAlloc() {
 
 
 void RISCVPassConfig::addPostRegAlloc() {
+  // InterStellar code generation must run after register allocation
+  // so we can extract physical register numbers for descriptor packing
+  addPass(createRISCVInterStellarCodeGenPass());
+
   if (TM->getOptLevel() != CodeGenOptLevel::None && CLOpts.enable_copyelim)
     addPass(createRISCVRedundantCopyEliminationLegacyPass());
 }
